@@ -1,0 +1,139 @@
+import crypto from 'crypto';
+import { env } from '../env';
+
+const MAX_SKEW_SECONDS = 300;
+
+export interface TelnyxSignatureInput {
+  rawBody: Buffer;
+  signature: string;
+  timestamp: string;
+  scheme?: 'ed25519' | 'hmac-sha256';
+}
+
+export interface TelnyxEventMeta {
+  eventType?: string;
+  callControlId?: string;
+  tenantId?: string;
+}
+
+function isHex(value: string): boolean {
+  return /^[0-9a-f]+$/i.test(value);
+}
+
+function parsePublicKey(publicKey: string): crypto.KeyObject {
+  if (publicKey.includes('BEGIN PUBLIC KEY')) {
+    return crypto.createPublicKey(publicKey);
+  }
+
+  const keyBuffer = Buffer.from(publicKey, isHex(publicKey) ? 'hex' : 'base64');
+  return crypto.createPublicKey({ key: keyBuffer, format: 'der', type: 'spki' });
+}
+
+function getString(value: unknown): string | undefined {
+  return typeof value === 'string' && value.trim() !== '' ? value : undefined;
+}
+
+function extractTenantIdFromClientState(clientState?: string): string | undefined {
+  if (!clientState) {
+    return undefined;
+  }
+
+  try {
+    const decoded = Buffer.from(clientState, 'base64').toString('utf8');
+    const parsed = JSON.parse(decoded) as { tenant_id?: unknown };
+    return getString(parsed.tenant_id);
+  } catch {
+    return undefined;
+  }
+}
+
+export function extractTelnyxEventMetaFromPayload(payload: unknown): TelnyxEventMeta {
+  if (!payload || typeof payload !== 'object') {
+    return {};
+  }
+
+  const data = (payload as { data?: unknown }).data;
+  if (!data || typeof data !== 'object') {
+    return {};
+  }
+
+  const eventType = getString((data as { event_type?: unknown }).event_type);
+  const payloadObj = (data as { payload?: unknown }).payload;
+  if (!payloadObj || typeof payloadObj !== 'object') {
+    return { eventType };
+  }
+
+  const callControlId = getString((payloadObj as { call_control_id?: unknown }).call_control_id);
+  const tenantId =
+    getString((payloadObj as { tenant_id?: unknown }).tenant_id) ||
+    extractTenantIdFromClientState(getString((payloadObj as { client_state?: unknown }).client_state));
+
+  return { eventType, callControlId, tenantId };
+}
+
+export function extractTelnyxEventMetaFromRawBody(rawBody: Buffer): TelnyxEventMeta {
+  if (!rawBody || rawBody.length === 0) {
+    return {};
+  }
+
+  try {
+    const parsed = JSON.parse(rawBody.toString('utf8')) as unknown;
+    return extractTelnyxEventMetaFromPayload(parsed);
+  } catch {
+    return {};
+  }
+}
+
+function verifyHmacSignature(message: Buffer, signature: string, secret: string): boolean {
+  const digest = crypto.createHmac('sha256', secret).update(message).digest();
+  const signatureBuffer = Buffer.from(signature, isHex(signature) ? 'hex' : 'base64');
+
+  if (signatureBuffer.length !== digest.length) {
+    return false;
+  }
+
+  return crypto.timingSafeEqual(digest, signatureBuffer);
+}
+
+export function verifyTelnyxSignature({
+  rawBody,
+  signature,
+  timestamp,
+  scheme,
+}: TelnyxSignatureInput): boolean {
+  if (!signature || !timestamp) {
+    return false;
+  }
+
+  const parsedTimestamp = Number.parseInt(timestamp, 10);
+  if (!Number.isFinite(parsedTimestamp)) {
+    return false;
+  }
+
+  const now = Math.floor(Date.now() / 1000);
+  const normalizedTimestamp = parsedTimestamp > 1_000_000_000_000 ? Math.floor(parsedTimestamp / 1000) : parsedTimestamp;
+  if (Math.abs(now - normalizedTimestamp) > MAX_SKEW_SECONDS) {
+    return false;
+  }
+
+  const message = Buffer.concat([
+    Buffer.from(timestamp, 'utf8'),
+    Buffer.from('.', 'utf8'),
+    rawBody,
+  ]);
+
+  const secret = process.env.TELNYX_WEBHOOK_SECRET;
+  const shouldUseHmac = scheme === 'hmac-sha256' || (!!secret && scheme !== 'ed25519');
+
+  try {
+    if (shouldUseHmac && secret) {
+      return verifyHmacSignature(message, signature, secret);
+    }
+
+    const publicKey = parsePublicKey(env.TELNYX_PUBLIC_KEY);
+    const signatureBuffer = Buffer.from(signature, isHex(signature) ? 'hex' : 'base64');
+    return crypto.verify(null, message, publicKey, signatureBuffer);
+  } catch {
+    return false;
+  }
+}
