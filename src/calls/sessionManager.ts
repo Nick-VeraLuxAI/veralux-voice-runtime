@@ -6,7 +6,11 @@ import { CallSessionConfig, CallSessionId } from './types';
 const DEFAULT_IDLE_TTL_MINUTES = 10;
 const DEFAULT_SWEEP_INTERVAL_MS = 60_000;
 
-type WorkItem = () => Promise<void> | void;
+interface WorkItem {
+  name: string;
+  run: () => Promise<void> | void;
+  requiresActive?: boolean;
+}
 
 interface QueueState {
   items: WorkItem[];
@@ -29,6 +33,7 @@ export class SessionManager {
   private readonly queues = new Map<CallSessionId, QueueState>();
   private readonly mediaConnections = new Map<CallSessionId, Set<MediaConnection>>();
   private readonly capacityRelease: (params: ReleaseParams) => Promise<void>;
+  private readonly inactiveCalls = new Map<CallSessionId, number>();
 
   constructor(
     options: {
@@ -116,9 +121,19 @@ export class SessionManager {
     );
   }
 
+  public isCallActive(callControlId: CallSessionId): boolean {
+    if (this.inactiveCalls.has(callControlId)) {
+      return false;
+    }
+
+    const session = this.sessions.get(callControlId);
+    return session ? session.isActive() : true;
+  }
+
   public onHangup(callControlId: CallSessionId, reason?: string, context: SessionLogContext = {}): void {
     const session = this.sessions.get(callControlId);
     if (!session) {
+      this.inactiveCalls.set(callControlId, Date.now());
       log.warn(
         {
           event: 'call_session_hangup_missing',
@@ -132,6 +147,8 @@ export class SessionManager {
       return;
     }
 
+    session.markEnded(reason ?? 'hangup');
+    this.inactiveCalls.set(callControlId, Date.now());
     const changed = session.end();
 
     log.info(
@@ -152,6 +169,7 @@ export class SessionManager {
   public teardown(callControlId: CallSessionId, reason?: string, context: SessionLogContext = {}): void {
     const session = this.sessions.get(callControlId);
     if (!session) {
+      this.inactiveCalls.set(callControlId, Date.now());
       this.closeMediaConnections(callControlId, reason ?? 'teardown');
       this.clearQueue(callControlId);
       if (context.tenantId) {
@@ -164,6 +182,8 @@ export class SessionManager {
       return;
     }
 
+    session.markEnded(reason ?? 'teardown');
+    this.inactiveCalls.set(callControlId, Date.now());
     session.end();
     this.sessions.delete(callControlId);
     this.closeMediaConnections(callControlId, reason ?? 'teardown');
@@ -217,7 +237,7 @@ export class SessionManager {
       return false;
     }
 
-    if (session.getState() === 'ENDED') {
+    if (!session.isActive() || session.getState() === 'ENDED') {
       log.warn(
         {
           event: 'call_session_audio_ended',
@@ -258,7 +278,26 @@ export class SessionManager {
       }
 
       try {
-        await task();
+        const session = this.sessions.get(callControlId);
+        const requiresActive = task.requiresActive !== false;
+        if (requiresActive) {
+          const inactive =
+            this.inactiveCalls.has(callControlId) || (session ? !session.isActive() : false);
+          if (inactive) {
+            log.warn(
+              {
+                event: 'call_session_task_skipped_inactive',
+                task: task.name,
+                call_control_id: callControlId,
+                tenant_id: session?.tenantId,
+              },
+              'skipping queued task - call inactive',
+            );
+            continue;
+          }
+        }
+
+        await task.run();
       } catch (error) {
         log.error(
           { err: error, call_control_id: callControlId, event: 'call_session_task_failed' },
@@ -315,6 +354,15 @@ export class SessionManager {
       }
 
       this.teardown(callControlId, 'idle_timeout');
+    }
+
+    for (const [callControlId, endedAt] of this.inactiveCalls.entries()) {
+      if (this.sessions.has(callControlId) || this.queues.has(callControlId)) {
+        continue;
+      }
+      if (nowMs - endedAt > this.idleTtlMs) {
+        this.inactiveCalls.delete(callControlId);
+      }
     }
   }
 }

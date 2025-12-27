@@ -23,6 +23,14 @@ Required:
 - CAPACITY_TTL_SECONDS
 
 Optional (defaults shown):
+- BRAIN_URL
+- BRAIN_TIMEOUT_MS (8000)
+- BRAIN_STREAMING_ENABLED (true)
+- BRAIN_STREAM_PATH (/reply/stream)
+- BRAIN_STREAM_PING_MS (15000)
+- BRAIN_STREAM_FIRST_AUDIO_MAX_MS (2000)
+- BRAIN_STREAM_SEGMENT_MIN_CHARS (120)
+- BRAIN_STREAM_SEGMENT_NEXT_CHARS (180)
 - TENANTMAP_PREFIX (tenantmap)
 - CAP_PREFIX (cap)
 - AUDIO_CLEANUP_HOURS (24)
@@ -47,6 +55,24 @@ npm install
 ```bash
 npm run dev
 ```
+
+## Streaming (Brain SSE)
+
+Brain:
+- Start the Brain server with a POST `/reply/stream` SSE endpoint (`text/event-stream`).
+
+Runtime (dev defaults shown):
+```bash
+export BRAIN_URL=http://localhost:4000
+export BRAIN_STREAMING_ENABLED=true
+export BRAIN_STREAM_PATH=/reply/stream
+export BRAIN_STREAM_PING_MS=15000
+export BRAIN_STREAM_FIRST_AUDIO_MAX_MS=2000
+export BRAIN_STREAM_SEGMENT_MIN_CHARS=120
+export BRAIN_STREAM_SEGMENT_NEXT_CHARS=180
+```
+
+If the stream endpoint is unavailable or does not return `text/event-stream`, the runtime falls back to `POST /reply`.
 
 ## Test Webhooks
 
