@@ -121,6 +121,34 @@ export class SessionManager {
     );
   }
 
+  public onPlaybackEnded(callControlId: CallSessionId, context: SessionLogContext = {}): void {
+    const session = this.sessions.get(callControlId);
+    if (!session) {
+      log.warn(
+        {
+          event: 'call_session_playback_end_missing',
+          call_control_id: callControlId,
+          requestId: context.requestId,
+        },
+        'call session missing on playback end',
+      );
+      return;
+    }
+
+    session.onPlaybackEnded();
+
+    log.info(
+      {
+        event: 'call_session_playback_end',
+        call_control_id: session.callControlId,
+        tenant_id: session.tenantId,
+        state: session.getState(),
+        requestId: context.requestId,
+      },
+      'call session playback ended',
+    );
+  }
+
   public isCallActive(callControlId: CallSessionId): boolean {
     if (this.inactiveCalls.has(callControlId)) {
       return false;

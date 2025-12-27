@@ -20,6 +20,7 @@ type RequestWithRawBody = Request & { rawBody?: Buffer; id?: string };
 
 export function createTelnyxWebhookRouter(sessionManager: SessionManager): Router {
   const router = Router();
+  const streamingStarted = new Set<string>();
   const tenantDebugEnabled = (): boolean => {
     const value = process.env.TENANT_DEBUG;
     if (!value) {
@@ -50,6 +51,37 @@ export function createTelnyxWebhookRouter(sessionManager: SessionManager): Route
     return `${wsBase}/v1/telnyx/media/${callControlId}?token=${encodeURIComponent(
       env.MEDIA_STREAM_TOKEN,
     )}`;
+  }
+
+  async function startStreamingOnce(callControlId: string, tenantId?: string, requestId?: string): Promise<void> {
+    if (streamingStarted.has(callControlId)) {
+      return;
+    }
+
+    const streamUrl = buildMediaStreamUrl(callControlId);
+    if (mediaDebugEnabled()) {
+      log.info(
+        { event: 'streaming_start_requested', call_control_id: callControlId, stream_url: streamUrl, requestId },
+        'streaming start requested',
+      );
+    }
+
+    const telnyx = new TelnyxClient({
+      call_control_id: callControlId,
+      tenant_id: tenantId,
+      requestId,
+    });
+    if (shouldSkipTelnyxAction('streaming_start', callControlId, tenantId, requestId)) {
+      return;
+    }
+
+    streamingStarted.add(callControlId);
+    try {
+      await telnyx.startStreaming(callControlId, streamUrl);
+    } catch (error) {
+      streamingStarted.delete(callControlId);
+      throw error;
+    }
   }
 
   function determineAction(eventType?: string, callControlId?: string): string {
@@ -356,46 +388,22 @@ export function createTelnyxWebhookRouter(sessionManager: SessionManager): Route
             );
           }
 
-          const tenantId = fallbackTenantId;
-          let tenantConfig: RuntimeTenantConfig | null = null;
-          if (tenantId) {
-            tenantConfig = await loadTenantConfig(tenantId);
-            if (!tenantConfig) {
-              log.warn(
-                { tenant_id: tenantId, call_control_id: callControlId, requestId },
-                'tenant config missing or invalid for playback end',
+          sessionManager.onPlaybackEnded(callControlId, { requestId });
+
+          if (!streamingStarted.has(callControlId)) {
+            if (debugEnabled) {
+              log.info(
+                { event: 'listen_start', call_control_id: callControlId, tenant_id: fallbackTenantId, requestId },
+                'listen start',
               );
             }
+            await startStreamingOnce(callControlId, fallbackTenantId, requestId);
           }
-
-          if (debugEnabled) {
-            log.info(
-              { event: 'listen_start', call_control_id: callControlId, tenant_id: tenantId, requestId },
-              'listen start',
-            );
-          }
-
-          const streamUrl = buildMediaStreamUrl(callControlId);
-          if (debugEnabled) {
-            log.info(
-              { event: 'streaming_start_requested', call_control_id: callControlId, stream_url: streamUrl, requestId },
-              'streaming start requested',
-            );
-          }
-
-          const telnyx = new TelnyxClient({
-            call_control_id: callControlId,
-            tenant_id: tenantId,
-            requestId,
-          });
-          if (shouldSkipTelnyxAction('streaming_start', callControlId, tenantId, requestId)) {
-            return;
-          }
-          await telnyx.startStreaming(callControlId, streamUrl);
           break;
         }
         case 'call.answered':
           sessionManager.onAnswered(callControlId, { requestId });
+          await startStreamingOnce(callControlId, fallbackTenantId, requestId);
           break;
         case 'call.hangup':
         case 'call.ended':
@@ -403,6 +411,7 @@ export function createTelnyxWebhookRouter(sessionManager: SessionManager): Route
             requestId,
             tenantId: fallbackTenantId,
           });
+          streamingStarted.delete(callControlId);
           break;
         default:
           break;

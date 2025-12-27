@@ -351,6 +351,18 @@ export class TelnyxClient {
     );
   }
 
+  public async stopPlayback(callControlId: string): Promise<void> {
+    await telnyxCallControl(callControlId, 'playback_stop', undefined, this.logContext);
+    log.info(
+      {
+        event: 'telnyx_playback_stop',
+        call_control_id: callControlId,
+        ...this.logContext,
+      },
+      'telnyx playback stop requested',
+    );
+  }
+
   public async startStreaming(callControlId: string, streamUrl: string): Promise<void> {
     const requestBody = {
       stream_url: streamUrl,

@@ -44,6 +44,12 @@ export class CallSession {
   private readonly logPreviewChars = 160;
   private ttsSegmentChain: Promise<void> = Promise.resolve();
   private ttsSegmentQueueDepth = 0;
+  private playbackState: { active: boolean; interrupted: boolean; segmentId?: string } = {
+    active: false,
+    interrupted: false,
+  };
+  private playbackStopSignal?: { promise: Promise<void>; resolve: () => void };
+  private transcriptHandlingToken = 0;
 
   constructor(config: CallSessionConfig) {
     this.callControlId = config.callControlId;
@@ -74,11 +80,14 @@ export class CallSession {
       silenceMs: env.STT_SILENCE_MS,
       whisperUrl: this.sttConfig?.whisperUrl,
       language: this.sttConfig?.language,
-      onTranscript: async ({ text, isFinal }) => {
+      onTranscript: async ({ text, isFinal, source }) => {
         if (!isFinal) {
           return;
         }
-        await this.handleTranscript(text);
+        await this.handleTranscript(text, source);
+      },
+      onSpeechStart: () => {
+        void this.handleSpeechStart();
       },
       logContext: this.logContext,
     });
@@ -126,9 +135,7 @@ export class CallSession {
 
     this.metrics.lastHeardAt = new Date();
 
-    if (this.state === 'LISTENING') {
-      this.stt.ingest(frame);
-    }
+    this.stt.ingest(frame);
   }
 
   public end(): boolean {
@@ -201,6 +208,108 @@ export class CallSession {
     this.metrics.turns += 1;
   }
 
+  public onPlaybackEnded(): void {
+    if (this.playbackState.interrupted) {
+      log.info(
+        { event: 'playback_ended_ignored', reason: 'barge_in', ...this.logContext },
+        'playback ended after barge-in',
+      );
+      return;
+    }
+
+    if (!this.playbackState.active) {
+      return;
+    }
+
+    this.playbackState.active = false;
+    this.playbackState.segmentId = undefined;
+    this.playbackStopSignal = undefined;
+
+    if (this.active && this.state === 'SPEAKING') {
+      this.enterListeningState();
+    }
+  }
+
+  private createPlaybackStopSignal(): { promise: Promise<void>; resolve: () => void } {
+    let resolve: () => void;
+    const promise = new Promise<void>((resolver) => {
+      resolve = resolver;
+    });
+    return { promise, resolve: resolve! };
+  }
+
+  private beginPlayback(segmentId?: string): void {
+    if (!this.playbackState.active) {
+      this.playbackStopSignal = this.createPlaybackStopSignal();
+    }
+    this.playbackState.active = true;
+    this.playbackState.interrupted = false;
+    this.playbackState.segmentId = segmentId;
+    this.state = 'SPEAKING';
+    this.clearDeadAirTimer();
+  }
+
+  private resolvePlaybackStopSignal(): void {
+    if (this.playbackStopSignal) {
+      this.playbackStopSignal.resolve();
+      this.playbackStopSignal = undefined;
+    }
+  }
+
+  private clearTtsQueue(): void {
+    this.ttsSegmentChain = Promise.resolve();
+    this.ttsSegmentQueueDepth = 0;
+  }
+
+  private invalidateTranscriptHandling(): void {
+    this.transcriptHandlingToken += 1;
+    this.isHandlingTranscript = false;
+  }
+
+  private handleSpeechStart(): void {
+    if (!this.active || this.state === 'ENDED') {
+      return;
+    }
+
+    const playbackActive =
+      this.playbackState.active || this.state === 'SPEAKING' || this.ttsSegmentQueueDepth > 0;
+    if (!playbackActive || this.playbackState.interrupted) {
+      return;
+    }
+
+    log.info(
+      {
+        event: 'barge_in',
+        reason: 'speech_start',
+        state: this.state,
+        ...this.logContext,
+      },
+      'barge in',
+    );
+
+    this.playbackState.active = false;
+    this.playbackState.interrupted = true;
+    this.playbackState.segmentId = undefined;
+    this.resolvePlaybackStopSignal();
+    this.clearTtsQueue();
+    this.invalidateTranscriptHandling();
+    this.enterListeningState();
+
+    void this.stopPlayback();
+  }
+
+  private async stopPlayback(): Promise<void> {
+    if (this.shouldSkipTelnyxAction('playback_stop')) {
+      return;
+    }
+
+    try {
+      await this.telnyx.stopPlayback(this.callControlId);
+    } catch (error) {
+      log.warn({ err: error, ...this.logContext }, 'telnyx playback stop failed');
+    }
+  }
+
   private enterListeningState(): void {
     if (!this.active || this.state === 'ENDED') {
       return;
@@ -253,12 +362,13 @@ export class CallSession {
     }
   }
 
-  private async handleTranscript(text: string): Promise<void> {
+  private async handleTranscript(text: string, transcriptSource?: 'partial_fallback'): Promise<void> {
     if (!this.active || this.state !== 'LISTENING' || this.isHandlingTranscript) {
       return;
     }
 
     this.isHandlingTranscript = true;
+    const handlingToken = (this.transcriptHandlingToken += 1);
     this.clearDeadAirTimer();
 
     try {
@@ -271,15 +381,16 @@ export class CallSession {
         trimmed.length <= this.logPreviewChars
           ? trimmed
           : `${trimmed.slice(0, this.logPreviewChars - 3)}...`;
-      log.info(
-        {
-          event: 'transcript_received',
-          transcript_length: trimmed.length,
-          transcript_preview: transcriptPreview,
-          ...this.logContext,
-        },
-        'transcript received',
-      );
+      const transcriptLog: Record<string, unknown> = {
+        event: 'transcript_received',
+        transcript_length: trimmed.length,
+        transcript_preview: transcriptPreview,
+        ...this.logContext,
+      };
+      if (transcriptSource) {
+        transcriptLog.transcript_source = transcriptSource;
+      }
+      log.info(transcriptLog, 'transcript received');
 
       this.state = 'THINKING';
       this.appendTranscriptSegment(trimmed);
@@ -290,7 +401,7 @@ export class CallSession {
       let playbackDone: Promise<void> | undefined;
       try {
         if (env.BRAIN_STREAMING_ENABLED) {
-          const streamResult = await this.streamAssistantReply(trimmed);
+          const streamResult = await this.streamAssistantReply(trimmed, handlingToken);
           response = streamResult.reply.text;
           replySource = streamResult.reply.source;
           playbackDone = streamResult.playbackDone;
@@ -313,6 +424,10 @@ export class CallSession {
         );
       }
 
+      if (handlingToken !== this.transcriptHandlingToken) {
+        return;
+      }
+
       const replyPreview =
         response.length <= this.logPreviewChars
           ? response
@@ -328,6 +443,10 @@ export class CallSession {
         'assistant reply text',
       );
 
+      if (handlingToken !== this.transcriptHandlingToken) {
+        return;
+      }
+
       this.appendHistory({ role: 'assistant', content: response, timestamp: new Date() });
 
       if (env.BRAIN_STREAMING_ENABLED) {
@@ -340,14 +459,17 @@ export class CallSession {
     } catch (error) {
       log.error({ err: error, ...this.logContext }, 'call session transcript handling failed');
     } finally {
-      // FIX (TS2367): call unconditionally; enterListeningState guards ENDED internally.
-      this.enterListeningState();
-      this.isHandlingTranscript = false;
+      if (handlingToken === this.transcriptHandlingToken) {
+        // FIX (TS2367): call unconditionally; enterListeningState guards ENDED internally.
+        this.enterListeningState();
+        this.isHandlingTranscript = false;
+      }
     }
   }
 
   private async streamAssistantReply(
     transcript: string,
+    handlingToken: number,
   ): Promise<{ reply: AssistantReplyResult; playbackDone?: Promise<void> }> {
     let bufferedText = '';
     let firstTokenAt: number | undefined;
@@ -361,6 +483,9 @@ export class CallSession {
     const firstAudioMaxMs = env.BRAIN_STREAM_FIRST_AUDIO_MAX_MS;
 
     const queueSegment = (segment: string): void => {
+      if (handlingToken !== this.transcriptHandlingToken) {
+        return;
+      }
       const trimmed = segment.trim();
       if (!trimmed) {
         return;
@@ -370,7 +495,7 @@ export class CallSession {
       segmentIndex += 1;
       queuedSegments += 1;
       const segmentId = `${resolvedTurnId}-${segmentIndex}`;
-      this.queueTtsSegment(trimmed, segmentId);
+      this.queueTtsSegment(trimmed, segmentId, handlingToken);
     };
 
     const maybeQueueSegments = (force: boolean): void => {
@@ -455,7 +580,14 @@ export class CallSession {
       },
     );
 
+    if (handlingToken !== this.transcriptHandlingToken) {
+      return { reply };
+    }
+
     if (reply.source !== 'brain_http_stream') {
+      if (handlingToken !== this.transcriptHandlingToken) {
+        return { reply };
+      }
       return { reply, playbackDone: this.playAssistantTurn(reply.text) };
     }
 
@@ -465,6 +597,9 @@ export class CallSession {
     maybeQueueSegments(true);
 
     if (queuedSegments === 0) {
+      if (handlingToken !== this.transcriptHandlingToken) {
+        return { reply };
+      }
       return { reply, playbackDone: this.playAssistantTurn(reply.text) };
     }
 
@@ -494,6 +629,7 @@ export class CallSession {
       if (this.shouldSkipTelnyxAction('playback_start')) {
         return;
       }
+      this.beginPlayback('greeting');
       await this.telnyx.playAudio(this.callControlId, greetingUrl);
 
       log.info(
@@ -515,8 +651,7 @@ export class CallSession {
       return;
     }
 
-    this.clearDeadAirTimer();
-    this.state = 'SPEAKING';
+    this.beginPlayback(turnId);
 
     try {
       const ttsStart = Date.now();
@@ -540,8 +675,16 @@ export class CallSession {
         'tts synthesized',
       );
 
+      if (!this.active || this.playbackState.interrupted) {
+        return;
+      }
+
       // Signature in your repo: storeWav(callControlId, turnId, wavBuffer)
       const publicUrl = await storeWav(this.callControlId, turnId, result.audio);
+
+      if (this.playbackState.interrupted) {
+        return;
+      }
 
       if (this.shouldSkipTelnyxAction('playback_start')) {
         return;
@@ -567,16 +710,18 @@ export class CallSession {
     }
   }
 
-  private queueTtsSegment(segmentText: string, segmentId: string): void {
+  private queueTtsSegment(segmentText: string, segmentId: string, handlingToken?: number): void {
     if (!segmentText.trim()) {
       return;
     }
     if (!this.active || this.state === 'ENDED') {
       return;
     }
+    if (handlingToken !== undefined && handlingToken !== this.transcriptHandlingToken) {
+      return;
+    }
 
-    this.clearDeadAirTimer();
-    this.state = 'SPEAKING';
+    this.beginPlayback(segmentId);
     this.ttsSegmentQueueDepth += 1;
     const queueDepth = this.ttsSegmentQueueDepth;
 
@@ -604,7 +749,8 @@ export class CallSession {
   }
 
   private async playTtsSegment(segmentText: string, segmentId: string): Promise<void> {
-    if (!this.active || this.state === 'ENDED') {
+    const shouldAbort = !this.active || this.state === 'ENDED' || this.playbackState.interrupted;
+    if (shouldAbort) {
       return;
     }
 
@@ -628,13 +774,13 @@ export class CallSession {
       'tts synthesized',
     );
 
-    if (!this.active || this.state === 'ENDED') {
+    if (!this.active || this.state === 'ENDED' || this.playbackState.interrupted) {
       return;
     }
 
     const publicUrl = await storeWav(this.callControlId, segmentId, result.audio);
 
-    if (this.shouldSkipTelnyxAction('playback_start')) {
+    if (this.playbackState.interrupted || this.shouldSkipTelnyxAction('playback_start')) {
       return;
     }
 
@@ -667,7 +813,10 @@ export class CallSession {
   }
 
   private waitForTtsSegmentQueue(): Promise<void> {
-    return this.ttsSegmentChain;
+    if (!this.playbackStopSignal) {
+      return this.ttsSegmentChain;
+    }
+    return Promise.race([this.ttsSegmentChain, this.playbackStopSignal.promise]);
   }
 
   private findSentenceBoundary(text: string): number | null {
@@ -700,8 +849,9 @@ export class CallSession {
       return false;
     }
 
+    const event = action === 'playback_stop' ? 'playback_stop_skipped' : 'telnyx_action_skipped_inactive';
     log.warn(
-      { event: 'telnyx_action_skipped_inactive', action, ...this.logContext },
+      { event, action, ...this.logContext },
       'skipping telnyx action - call inactive',
     );
     return true;
