@@ -2,8 +2,14 @@ import { env } from '../env';
 import { log } from '../log';
 import { getRedisClient, RedisClient } from '../redis/client';
 
+const E164_REGEX = /^\+[1-9]\d{1,14}$/;
+
 export function normalizeE164(toNumber: string): string {
-  return toNumber.trim().replace(/\s+/g, '');
+  const normalized = toNumber.trim().replace(/\s+/g, '');
+  if (!E164_REGEX.test(normalized)) {
+    return '';
+  }
+  return normalized;
 }
 
 export async function resolveTenantId(
@@ -12,6 +18,7 @@ export async function resolveTenantId(
 ): Promise<string | null> {
   const normalized = normalizeE164(toNumber);
   if (!normalized) {
+    log.debug({ did: toNumber }, 'invalid did');
     return null;
   }
 

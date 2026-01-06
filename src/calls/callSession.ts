@@ -1,10 +1,16 @@
 import { env } from '../env';
 import { log } from '../log';
+import { describeWavHeader, parseWavInfo } from '../audio/wavInfo';
+import { runPlaybackPipeline } from '../audio/playbackPipeline';
 import { MediaFrame } from '../media/types';
 import { storeWav } from '../storage/audioStore';
-import { ChunkedSTT } from '../stt/chunkedSTT';
-import { TelnyxClient } from '../telnyx/telnyxClient';
+import { ChunkedSTT, type STTProvider as ChunkedSttProvider } from '../stt/chunkedSTT';
+import { getProvider } from '../stt/registry';
+import { PstnTelnyxTransportSession } from '../transport/pstnTelnyxTransport';
+import type { TransportSession } from '../transport/types';
 import { synthesizeSpeech } from '../tts/kokoroTTS';
+import { attachAudioMeta, getAudioMeta, markAudioSpan, probeWav } from '../diagnostics/audioProbe';
+import type { TTSResult } from '../tts/types';
 import type { RuntimeTenantConfig } from '../tenants/tenantConfig';
 import { generateAssistantReply, generateAssistantReplyStream, type AssistantReplyResult } from '../ai/brainClient';
 import {
@@ -14,6 +20,14 @@ import {
   ConversationTurn,
   TranscriptBuffer,
 } from './types';
+import { startStageTimer, incStageError, observeStageDuration, incSttFramesFed } from '../metrics';
+
+const PARTIAL_FAST_PATH_MIN_CHARS = 18;
+
+function getErrorMessage(error: unknown): string {
+  if (error instanceof Error) return error.message;
+  return 'unknown_error';
+}
 
 export class CallSession {
   public readonly callControlId: string;
@@ -27,7 +41,7 @@ export class CallSession {
   private readonly conversationHistory: ConversationTurn[] = [];
   private readonly metrics: CallSessionMetrics;
   private readonly stt: ChunkedSTT;
-  private readonly telnyx: TelnyxClient;
+  private readonly transport: TransportSession;
   private readonly logContext: Record<string, unknown>;
   private readonly deadAirMs = env.DEAD_AIR_MS;
   private readonly sttConfig?: RuntimeTenantConfig['stt'];
@@ -41,6 +55,7 @@ export class CallSession {
   private turnSequence = 0;
   private deadAirTimer?: NodeJS.Timeout;
   private repromptInFlight = false;
+  private ingestFailurePrompted = false;
   private readonly logPreviewChars = 160;
   private ttsSegmentChain: Promise<void> = Promise.resolve();
   private ttsSegmentQueueDepth = 0;
@@ -50,6 +65,9 @@ export class CallSession {
   };
   private playbackStopSignal?: { promise: Promise<void>; resolve: () => void };
   private transcriptHandlingToken = 0;
+  private transcriptAcceptedForUtterance = false;
+  private deferredTranscript?: { text: string; source?: 'partial_fallback' | 'final' };
+  private firstPartialAt?: number;
 
   constructor(config: CallSessionConfig) {
     this.callControlId = config.callControlId;
@@ -73,17 +91,37 @@ export class CallSession {
       requestId: this.requestId,
     };
 
-    this.telnyx = new TelnyxClient(this.logContext);
+    this.transport =
+      config.transportSession ??
+      new PstnTelnyxTransportSession({
+        callControlId: this.callControlId,
+        tenantId: this.tenantId,
+        requestId: this.requestId,
+        isActive: () => this.active && this.state !== 'ENDED',
+      });
+
+    // ✅ Ensure this is ALWAYS a string (tenant override → env fallback)
+    const sttEndpointUrl =
+      this.sttConfig?.config?.url ??
+      this.sttConfig?.whisperUrl ??
+      env.WHISPER_URL;
+
+    const sttMode = this.sttConfig?.mode ?? 'whisper_http';
+    const provider = getProvider(sttMode) as unknown as ChunkedSttProvider;
+    const sttAudioInput =
+      this.transport.mode === 'pstn'
+        ? { codec: 'pcm16le' as const, sampleRateHz: env.TELNYX_TARGET_SAMPLE_RATE }
+        : this.transport.audioInput;
 
     this.stt = new ChunkedSTT({
-      chunkMs: this.sttConfig?.chunkMs ?? env.STT_CHUNK_MS,
-      silenceMs: env.STT_SILENCE_MS,
-      whisperUrl: this.sttConfig?.whisperUrl,
+      provider,
+      whisperUrl: sttEndpointUrl,
       language: this.sttConfig?.language,
-      onTranscript: async ({ text, isFinal, source }) => {
-        if (!isFinal) {
-          return;
-        }
+      frameMs: this.sttConfig?.chunkMs ?? env.STT_CHUNK_MS,
+      silenceEndMs: env.STT_SILENCE_MS,
+      inputCodec: sttAudioInput.codec,
+      sampleRate: sttAudioInput.sampleRateHz,
+      onTranscript: async (text, source) => {
         await this.handleTranscript(text, source);
       },
       onSpeechStart: () => {
@@ -92,6 +130,7 @@ export class CallSession {
       logContext: this.logContext,
     });
   }
+
 
   public start(options: { autoAnswer?: boolean } = {}): boolean {
     if (!this.active || this.state === 'ENDED' || this.hasStarted) {
@@ -135,7 +174,39 @@ export class CallSession {
 
     this.metrics.lastHeardAt = new Date();
 
+    // Never gate STT audio feed on playback state; transcript handling is gated separately.
+    incSttFramesFed();
     this.stt.ingest(frame);
+  }
+
+  public notifyIngestFailure(reason: string): void {
+    if (!this.active || this.state === 'ENDED') {
+      return;
+    }
+    if (this.ingestFailurePrompted || this.repromptInFlight) {
+      return;
+    }
+
+    this.ingestFailurePrompted = true;
+    this.repromptInFlight = true;
+    this.stt.stop();
+
+    const turnId = `ingest-${this.nextTurnId()}`;
+    log.warn(
+      { event: 'call_session_ingest_failure_prompt', reason, ...this.logContext },
+      'ingest failure prompt',
+    );
+
+    void this.playText("I'm having trouble hearing you. Please try again.", turnId)
+      .catch((error) => {
+        log.warn({ err: error, ...this.logContext }, 'ingest failure reprompt failed');
+      })
+      .finally(() => {
+        this.repromptInFlight = false;
+        if (this.state === 'LISTENING') {
+          this.scheduleDeadAirTimer();
+        }
+      });
   }
 
   public end(): boolean {
@@ -154,6 +225,10 @@ export class CallSession {
 
   public getState(): CallSessionState {
     return this.state;
+  }
+
+  public getTransport(): TransportSession {
+    return this.transport;
   }
 
   public isActive(): boolean {
@@ -228,6 +303,10 @@ export class CallSession {
     if (this.active && this.state === 'SPEAKING') {
       this.enterListeningState();
     }
+
+    if (this.active && this.state === 'LISTENING') {
+      this.flushDeferredTranscript();
+    }
   }
 
   private createPlaybackStopSignal(): { promise: Promise<void>; resolve: () => void } {
@@ -266,10 +345,116 @@ export class CallSession {
     this.isHandlingTranscript = false;
   }
 
+  private flushDeferredTranscript(): void {
+    if (!this.deferredTranscript) {
+      return;
+    }
+    if (!this.active || this.state !== 'LISTENING' || this.isHandlingTranscript) {
+      return;
+    }
+
+    const deferred = this.deferredTranscript;
+    this.deferredTranscript = undefined;
+    void this.handleTranscript(deferred.text, deferred.source);
+  }
+
+  private logTtsBytesReady(
+    id: string,
+    audio: Buffer,
+    contentType: string | undefined,
+  ): void {
+    const header = describeWavHeader(audio);
+    log.info(
+      {
+        event: 'tts_bytes_ready',
+        id,
+        bytes: audio.length,
+        riff: header.riff,
+        wave: header.wave,
+        ...this.logContext,
+      },
+      'tts bytes ready',
+    );
+
+    if (!header.riff || !header.wave) {
+      log.warn(
+        {
+          event: 'tts_non_wav_warning',
+          id,
+          content_type: contentType,
+          first16_hex: header.first16Hex,
+          bytes: audio.length,
+          ...this.logContext,
+        },
+        'tts bytes are not wav',
+      );
+    }
+
+    const audioLogContext = { ...this.logContext, tts_id: id };
+    const baseMeta = {
+      callId: this.callControlId,
+      tenantId: this.tenantId,
+      format: 'wav' as const,
+      logContext: audioLogContext,
+      lineage: ['tts:output'],
+      kind: id,
+    };
+    attachAudioMeta(audio, baseMeta);
+    probeWav('tts.out.raw', audio, baseMeta);
+
+    this.logWavInfo('kokoro', id, audio);
+  }
+
+  private logWavInfo(source: 'kokoro' | 'pipeline_output', id: string, audio: Buffer): void {
+    try {
+      const info = parseWavInfo(audio);
+      log.info(
+        {
+          event: 'wav_info',
+          source,
+          id,
+          sample_rate_hz: info.sampleRateHz,
+          channels: info.channels,
+          bits_per_sample: info.bitsPerSample,
+          data_bytes: info.dataBytes,
+          duration_ms: info.durationMs,
+          ...this.logContext,
+        },
+        'wav info',
+      );
+    } catch (error) {
+      log.warn(
+        {
+          event: 'wav_info_parse_failed',
+          source,
+          id,
+          reason: getErrorMessage(error),
+          ...this.logContext,
+        },
+        'wav info parse failed',
+      );
+    }
+  }
+
+  private resetTranscriptTracking(): void {
+    this.transcriptAcceptedForUtterance = false;
+    this.deferredTranscript = undefined;
+    this.firstPartialAt = undefined;
+  }
+
+  private shouldTriggerPartialFastPath(text: string): boolean {
+    const trimmed = text.trim();
+    if (!trimmed) return false;
+    if (/[.!?]$/.test(trimmed)) return true;
+    return trimmed.length >= PARTIAL_FAST_PATH_MIN_CHARS;
+  }
+
   private handleSpeechStart(): void {
     if (!this.active || this.state === 'ENDED') {
       return;
     }
+
+    this.resetTranscriptTracking();
 
     const playbackActive =
       this.playbackState.active || this.state === 'SPEAKING' || this.ttsSegmentQueueDepth > 0;
@@ -299,14 +484,10 @@ export class CallSession {
   }
 
   private async stopPlayback(): Promise<void> {
-    if (this.shouldSkipTelnyxAction('playback_stop')) {
-      return;
-    }
-
     try {
-      await this.telnyx.stopPlayback(this.callControlId);
+      await this.transport.playback.stop();
     } catch (error) {
-      log.warn({ err: error, ...this.logContext }, 'telnyx playback stop failed');
+      log.warn({ err: error, ...this.logContext }, 'playback stop failed');
     }
   }
 
@@ -362,20 +543,83 @@ export class CallSession {
     }
   }
 
-  private async handleTranscript(text: string, transcriptSource?: 'partial_fallback'): Promise<void> {
-    if (!this.active || this.state !== 'LISTENING' || this.isHandlingTranscript) {
+  private async handleTranscript(
+    text: string,
+    transcriptSource?: 'partial_fallback' | 'final',
+  ): Promise<void> {
+    if (!this.active || this.state === 'ENDED' || this.isHandlingTranscript) {
       return;
     }
 
+    const trimmed = text.trim();
+    if (trimmed === '') {
+      return;
+    }
+
+    const isPartial = transcriptSource === 'partial_fallback';
+    const trigger = isPartial ? 'partial' : 'final';
+    if (this.transcriptAcceptedForUtterance) {
+      return;
+    }
+
+    if (isPartial && !this.firstPartialAt) {
+      this.firstPartialAt = Date.now();
+    }
+
+    if (isPartial && !this.shouldTriggerPartialFastPath(trimmed)) {
+      return;
+    }
+
+    const playbackActive = this.playbackState.active || this.ttsSegmentQueueDepth > 0;
+    if (playbackActive && !this.playbackState.interrupted) {
+      const existing = this.deferredTranscript;
+      if (!existing || trigger === 'final' || existing.source !== 'final') {
+        this.deferredTranscript = { text: trimmed, source: transcriptSource };
+      }
+      log.info(
+        {
+          event: 'transcript_deferred_playback',
+          trigger,
+          transcript_length: trimmed.length,
+          state: this.state,
+          playback_active: this.playbackState.active,
+          tts_queue_depth: this.ttsSegmentQueueDepth,
+          ...this.logContext,
+        },
+        'transcript deferred during playback',
+      );
+      return;
+    }
+
+    const tenantLabel = this.tenantId ?? 'unknown';
+    const responseStartAt = Date.now();
+
+    if (isPartial && this.firstPartialAt) {
+      observeStageDuration(
+        'stt_first_partial_to_response_ms',
+        tenantLabel,
+        responseStartAt - this.firstPartialAt,
+      );
+    } else if (!isPartial) {
+      observeStageDuration('stt_final_to_response_ms', tenantLabel, 0);
+    }
+
+    log.info(
+      {
+        event: 'turn_trigger',
+        trigger,
+        transcript_length: trimmed.length,
+        ...this.logContext,
+      },
+      'turn trigger',
+    );
+
+    this.transcriptAcceptedForUtterance = true;
     this.isHandlingTranscript = true;
     const handlingToken = (this.transcriptHandlingToken += 1);
     this.clearDeadAirTimer();
 
     try {
-      const trimmed = text.trim();
-      if (trimmed === '') {
-        return;
-      }
 
       const transcriptPreview =
         trimmed.length <= this.logPreviewChars
@@ -387,7 +631,7 @@ export class CallSession {
         transcript_preview: transcriptPreview,
         ...this.logContext,
       };
-      if (transcriptSource) {
+      if (transcriptSource === 'partial_fallback') {
         transcriptLog.transcript_source = transcriptSource;
       }
       log.info(transcriptLog, 'transcript received');
@@ -401,19 +645,29 @@ export class CallSession {
       let playbackDone: Promise<void> | undefined;
       try {
         if (env.BRAIN_STREAMING_ENABLED) {
+          // LLM stage timing for streaming is handled inside streamAssistantReply()
           const streamResult = await this.streamAssistantReply(trimmed, handlingToken);
           response = streamResult.reply.text;
           replySource = streamResult.reply.source;
           playbackDone = streamResult.playbackDone;
         } else {
-          const reply = await generateAssistantReply({
-            tenantId: this.tenantId,
-            callControlId: this.callControlId,
-            transcript: trimmed,
-            history: this.conversationHistory,
-          });
-          response = reply.text;
-          replySource = reply.source;
+          const endLlm = startStageTimer('llm', tenantLabel);
+          try {
+            const reply = await generateAssistantReply({
+              tenantId: this.tenantId,
+              callControlId: this.callControlId,
+              transcript: trimmed,
+              history: this.conversationHistory,
+            });
+            endLlm();
+
+            response = reply.text;
+            replySource = reply.source;
+          } catch (error) {
+            incStageError('llm', tenantLabel);
+            endLlm();
+            throw error; // let your existing outer catch handle fallback response/logging
+          }
         }
       } catch (error) {
         response = 'Acknowledged.';
@@ -427,6 +681,12 @@ export class CallSession {
       if (handlingToken !== this.transcriptHandlingToken) {
         return;
       }
+
+      markAudioSpan('llm_result', {
+        callId: this.callControlId,
+        tenantId: this.tenantId,
+        logContext: this.logContext,
+      });
 
       const replyPreview =
         response.length <= this.logPreviewChars
@@ -464,6 +724,7 @@ export class CallSession {
         this.enterListeningState();
         this.isHandlingTranscript = false;
       }
+      
     }
   }
 
@@ -561,24 +822,32 @@ export class CallSession {
       }
     };
 
-    const reply = await generateAssistantReplyStream(
-      {
-        tenantId: this.tenantId,
-        callControlId: this.callControlId,
-        transcript,
-        history: this.conversationHistory,
-      },
-      (chunk) => {
-        if (!chunk) {
-          return;
-        }
-        if (!firstTokenAt) {
-          firstTokenAt = Date.now();
-        }
-        bufferedText += chunk;
-        maybeQueueSegments(false);
-      },
-    );
+    const tenantLabel = this.tenantId ?? 'unknown';
+    const endLlm = startStageTimer('llm', tenantLabel);
+
+    let reply: AssistantReplyResult;
+    try {
+      reply = await generateAssistantReplyStream(
+        {
+          tenantId: this.tenantId,
+          callControlId: this.callControlId,
+          transcript,
+          history: this.conversationHistory,
+        },
+        (chunk) => {
+          if (!chunk) return;
+          if (!firstTokenAt) firstTokenAt = Date.now();
+          bufferedText += chunk;
+          maybeQueueSegments(false);
+        },
+      );
+      endLlm();
+    } catch (error) {
+      incStageError('llm', tenantLabel);
+      endLlm();
+      throw error;
+    }
+
 
     if (handlingToken !== this.transcriptHandlingToken) {
       return { reply };
@@ -608,20 +877,27 @@ export class CallSession {
 
   private async answerAndGreet(): Promise<void> {
     try {
-      if (this.shouldSkipTelnyxAction('answer')) {
+      const answerStarted = Date.now();
+      if (this.transport.mode === 'pstn' && this.shouldSkipTelnyxAction('answer')) {
         return;
       }
-      const answerStarted = Date.now();
-      await this.telnyx.answerCall(this.callControlId);
+      await this.transport.start();
       const answerDuration = Date.now() - answerStarted;
 
-      log.info(
-        { event: 'telnyx_answer_duration', duration_ms: answerDuration, ...this.logContext },
-        'telnyx answer completed',
-      );
+      if (this.transport.mode === 'pstn') {
+        log.info(
+          { event: 'telnyx_answer_duration', duration_ms: answerDuration, ...this.logContext },
+          'telnyx answer completed',
+        );
+      }
       log.info({ event: 'call_answered', ...this.logContext }, 'call answered');
 
       this.onAnswered();
+
+      if (this.transport.mode === 'webrtc_hd') {
+        await this.playText('Hi! Thanks for calling. How can I help you today?', 'greeting');
+        return;
+      }
 
       const trimmedBaseUrl = env.AUDIO_PUBLIC_BASE_URL.replace(/\/$/, '');
       const greetingUrl = `${trimmedBaseUrl}/greeting.wav`;
@@ -630,7 +906,7 @@ export class CallSession {
         return;
       }
       this.beginPlayback('greeting');
-      await this.telnyx.playAudio(this.callControlId, greetingUrl);
+      await this.transport.playback.play({ kind: 'url', url: greetingUrl });
 
       log.info(
         { event: 'call_playback_started', audio_url: greetingUrl, ...this.logContext },
@@ -654,16 +930,35 @@ export class CallSession {
     this.beginPlayback(turnId);
 
     try {
+      const tenantLabel = this.tenantId ?? 'unknown';
+      const endTts = startStageTimer('tts', tenantLabel);
+
+      const spanMeta = {
+        callId: this.callControlId,
+        tenantId: this.tenantId,
+        logContext: { ...this.logContext, tts_id: turnId },
+        kind: turnId,
+      };
+      markAudioSpan('tts_start', spanMeta);
       const ttsStart = Date.now();
-      const result = await synthesizeSpeech({
-        text,
-        voice: this.ttsConfig?.voice,
-        format: this.ttsConfig?.format,
-        sampleRate: this.ttsConfig?.sampleRate,
-        kokoroUrl: this.ttsConfig?.kokoroUrl,
-      });
+      let result: TTSResult;
+      try {
+        result = await synthesizeSpeech({
+          text,
+          voice: this.ttsConfig?.voice,
+          format: this.ttsConfig?.format,
+          sampleRate: this.ttsConfig?.sampleRate,
+          kokoroUrl: this.ttsConfig?.kokoroUrl,
+        });
+      } catch (error) {
+        incStageError('tts', tenantLabel);
+        throw error;
+      } finally {
+        endTts();
+      }
 
       const ttsDuration = Date.now() - ttsStart;
+      markAudioSpan('tts_ready', spanMeta);
 
       log.info(
         {
@@ -679,29 +974,76 @@ export class CallSession {
         return;
       }
 
-      // Signature in your repo: storeWav(callControlId, turnId, wavBuffer)
-      const publicUrl = await storeWav(this.callControlId, turnId, result.audio);
+      this.logTtsBytesReady(turnId, result.audio, result.contentType);
+      let playbackAudio = result.audio;
+      const applyPstnPipeline = env.PLAYBACK_PROFILE === 'pstn' && this.transport.mode === 'pstn';
+      if (applyPstnPipeline) {
+        const endPipeline = startStageTimer('tts_pipeline_ms', tenantLabel);
+        const pipelineResult = runPlaybackPipeline(playbackAudio, {
+          targetSampleRateHz: env.PLAYBACK_PSTN_SAMPLE_RATE,
+          enableHighpass: env.PLAYBACK_ENABLE_HIGHPASS,
+          logContext: this.logContext,
+        });
+        endPipeline();
+        playbackAudio = pipelineResult.audio;
+      }
+      if (applyPstnPipeline) {
+        this.logWavInfo('pipeline_output', turnId, playbackAudio);
+        const pipelineMeta = getAudioMeta(playbackAudio) ?? {
+          format: 'wav' as const,
+          logContext: { ...this.logContext, tts_id: turnId },
+          lineage: ['pipeline:unknown'],
+        };
+        probeWav('tts.out.telephonyOptimized', playbackAudio, pipelineMeta);
+      }
+      result.audio = playbackAudio;
+
+      const playbackInput =
+        this.transport.mode === 'pstn'
+          ? { kind: 'url' as const, url: await storeWav(this.callControlId, turnId, result.audio) }
+          : { kind: 'buffer' as const, audio: result.audio, contentType: result.contentType };
 
       if (this.playbackState.interrupted) {
         return;
       }
 
-      if (this.shouldSkipTelnyxAction('playback_start')) {
+      if (this.transport.mode === 'pstn' && this.shouldSkipTelnyxAction('playback_start')) {
         return;
       }
+      const playbackStage = this.transport.mode === 'pstn' ? 'telnyx_playback' : 'webrtc_playback_ms';
+      const endPlayback = startStageTimer(playbackStage, tenantLabel);
+
       const playbackStart = Date.now();
-      await this.telnyx.playAudio(this.callControlId, publicUrl);
+      try {
+        if (this.transport.mode === 'pstn') {
+          const txMeta = getAudioMeta(playbackAudio) ?? {
+            format: 'wav' as const,
+            logContext: { ...this.logContext, tts_id: turnId },
+            lineage: ['tx:unknown'],
+          };
+          probeWav('tx.telnyx.payload', playbackAudio, { ...txMeta, kind: turnId });
+        }
+        markAudioSpan('tx_sent', spanMeta);
+        await this.transport.playback.play(playbackInput);
+      } catch (error) {
+        incStageError(playbackStage, tenantLabel);
+        throw error;
+      } finally {
+        endPlayback();
+      }
       const playbackDuration = Date.now() - playbackStart;
 
-      log.info(
-        {
-          event: 'telnyx_playback_duration',
-          duration_ms: playbackDuration,
-          audio_url: publicUrl,
-          ...this.logContext,
-        },
-        'telnyx playback completed',
-      );
+      if (this.transport.mode === 'pstn') {
+        log.info(
+          {
+            event: 'telnyx_playback_duration',
+            duration_ms: playbackDuration,
+            audio_url: (playbackInput as { kind: 'url'; url: string }).url,
+            ...this.logContext,
+          },
+          'telnyx playback completed',
+        );
+      }
     } catch (error) {
       log.error({ err: error, ...this.logContext }, 'call session tts playback failed');
     } finally {
@@ -754,15 +1096,35 @@ export class CallSession {
       return;
     }
 
+    const tenantLabel = this.tenantId ?? 'unknown';
+    const endTts = startStageTimer('tts', tenantLabel);
+
+    const spanMeta = {
+      callId: this.callControlId,
+      tenantId: this.tenantId,
+      logContext: { ...this.logContext, tts_id: segmentId },
+      kind: segmentId,
+    };
+    markAudioSpan('tts_start', spanMeta);
     const ttsStart = Date.now();
-    const result = await synthesizeSpeech({
-      text: segmentText,
-      voice: this.ttsConfig?.voice,
-      format: this.ttsConfig?.format,
-      sampleRate: this.ttsConfig?.sampleRate,
-      kokoroUrl: this.ttsConfig?.kokoroUrl,
-    });
+    let result: TTSResult;
+    try {
+      result = await synthesizeSpeech({
+        text: segmentText,
+        voice: this.ttsConfig?.voice,
+        format: this.ttsConfig?.format,
+        sampleRate: this.ttsConfig?.sampleRate,
+        kokoroUrl: this.ttsConfig?.kokoroUrl,
+      });
+    } catch (error) {
+      incStageError('tts', tenantLabel);
+      throw error;
+    } finally {
+      endTts();
+    }
     const ttsDuration = Date.now() - ttsStart;
+    markAudioSpan('tts_ready', spanMeta);
+
 
     log.info(
       {
@@ -778,38 +1140,88 @@ export class CallSession {
       return;
     }
 
-    const publicUrl = await storeWav(this.callControlId, segmentId, result.audio);
+    this.logTtsBytesReady(segmentId, result.audio, result.contentType);
+    let playbackAudio = result.audio;
+    const applyPstnPipeline = env.PLAYBACK_PROFILE === 'pstn' && this.transport.mode === 'pstn';
+    if (applyPstnPipeline) {
+      const endPipeline = startStageTimer('tts_pipeline_ms', tenantLabel);
+      const pipelineResult = runPlaybackPipeline(playbackAudio, {
+        targetSampleRateHz: env.PLAYBACK_PSTN_SAMPLE_RATE,
+        enableHighpass: env.PLAYBACK_ENABLE_HIGHPASS,
+        logContext: this.logContext,
+      });
+      endPipeline();
+      playbackAudio = pipelineResult.audio;
+    }
+    if (applyPstnPipeline) {
+      this.logWavInfo('pipeline_output', segmentId, playbackAudio);
+      const pipelineMeta = getAudioMeta(playbackAudio) ?? {
+        format: 'wav' as const,
+        logContext: { ...this.logContext, tts_id: segmentId },
+        lineage: ['pipeline:unknown'],
+      };
+      probeWav('tts.out.telephonyOptimized', playbackAudio, pipelineMeta);
+    }
+    result.audio = playbackAudio;
 
-    if (this.playbackState.interrupted || this.shouldSkipTelnyxAction('playback_start')) {
+    const playbackInput =
+      this.transport.mode === 'pstn'
+        ? { kind: 'url' as const, url: await storeWav(this.callControlId, segmentId, result.audio) }
+        : { kind: 'buffer' as const, audio: result.audio, contentType: result.contentType };
+
+    if (this.playbackState.interrupted) {
       return;
     }
 
-    log.info(
-      {
-        event: 'tts_segment_play_start',
-        seg_len: segmentText.length,
-        segment_id: segmentId,
-        audio_url: publicUrl,
-        ...this.logContext,
-      },
-      'tts segment playback start',
-    );
+    if (this.transport.mode === 'pstn') {
+      log.info(
+        {
+          event: 'tts_segment_play_start',
+          seg_len: segmentText.length,
+          segment_id: segmentId,
+          audio_url: (playbackInput as { kind: 'url'; url: string }).url,
+          ...this.logContext,
+        },
+        'tts segment playback start',
+      );
+    }
+
+    const playbackStage = this.transport.mode === 'pstn' ? 'telnyx_playback' : 'webrtc_playback_ms';
+    const endPlayback = startStageTimer(playbackStage, tenantLabel);
 
     const playbackStart = Date.now();
-    await this.telnyx.playAudio(this.callControlId, publicUrl);
+    try {
+      if (this.transport.mode === 'pstn') {
+        const txMeta = getAudioMeta(playbackAudio) ?? {
+          format: 'wav' as const,
+          logContext: { ...this.logContext, tts_id: segmentId },
+          lineage: ['tx:unknown'],
+        };
+        probeWav('tx.telnyx.payload', playbackAudio, { ...txMeta, kind: segmentId });
+      }
+      markAudioSpan('tx_sent', spanMeta);
+      await this.transport.playback.play(playbackInput);
+    } catch (error) {
+      incStageError(playbackStage, tenantLabel);
+      throw error;
+    } finally {
+      endPlayback();
+    }
     const playbackDuration = Date.now() - playbackStart;
 
-    log.info(
-      {
-        event: 'tts_segment_play_end',
-        seg_len: segmentText.length,
-        segment_id: segmentId,
-        duration_ms: playbackDuration,
-        audio_url: publicUrl,
-        ...this.logContext,
-      },
-      'tts segment playback end',
-    );
+    if (this.transport.mode === 'pstn') {
+      log.info(
+        {
+          event: 'tts_segment_play_end',
+          seg_len: segmentText.length,
+          segment_id: segmentId,
+          duration_ms: playbackDuration,
+          audio_url: (playbackInput as { kind: 'url'; url: string }).url,
+          ...this.logContext,
+        },
+        'tts segment playback end',
+      );
+    }
   }
 
   private waitForTtsSegmentQueue(): Promise<void> {
@@ -845,6 +1257,9 @@ export class CallSession {
   }
 
   private shouldSkipTelnyxAction(action: string): boolean {
+    if (this.transport.mode !== 'pstn') {
+      return false;
+    }
     if (this.active) {
       return false;
     }

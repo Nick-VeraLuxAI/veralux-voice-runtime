@@ -3,6 +3,10 @@ import { SessionManager } from '../calls/sessionManager';
 import { env } from '../env';
 import { tryAcquire } from '../limits/capacity';
 import { log } from '../log';
+import { describeWavHeader, parseWavInfo } from '../audio/wavInfo';
+import { runPlaybackPipeline } from '../audio/playbackPipeline';
+import { attachAudioMeta, getAudioMeta, probeWav } from '../diagnostics/audioProbe';
+import { startStageTimer } from '../metrics';
 import { storeWav } from '../storage/audioStore';
 import { normalizeE164, resolveTenantId } from '../tenants/tenantResolver';
 import { loadTenantConfig } from '../tenants/tenantConfig';
@@ -17,6 +21,82 @@ import { synthesizeSpeech } from '../tts/kokoroTTS';
 import type { RuntimeTenantConfig } from '../tenants/tenantConfig';
 
 type RequestWithRawBody = Request & { rawBody?: Buffer; id?: string };
+
+function logTtsBytesReady(
+  context: Record<string, unknown>,
+  id: string,
+  audio: Buffer,
+  contentType: string | undefined,
+): void {
+  const header = describeWavHeader(audio);
+  log.info(
+    {
+      event: 'tts_bytes_ready',
+      id,
+      bytes: audio.length,
+      riff: header.riff,
+      wave: header.wave,
+      ...context,
+    },
+    'tts bytes ready',
+  );
+
+  if (!header.riff || !header.wave) {
+    log.warn(
+      {
+        event: 'tts_non_wav_warning',
+        id,
+        content_type: contentType,
+        first16_hex: header.first16Hex,
+        bytes: audio.length,
+        ...context,
+      },
+      'tts bytes are not wav',
+    );
+  }
+
+  const audioLogContext = { ...context, tts_id: id };
+  const baseMeta = {
+    callId: typeof context.call_control_id === 'string' ? context.call_control_id : undefined,
+    tenantId: typeof context.tenant_id === 'string' ? context.tenant_id : undefined,
+    format: 'wav' as const,
+    logContext: audioLogContext,
+    lineage: ['tts:output'],
+    kind: id,
+  };
+  attachAudioMeta(audio, baseMeta);
+  probeWav('tts.out.raw', audio, baseMeta);
+
+  try {
+    const info = parseWavInfo(audio);
+    log.info(
+      {
+        event: 'wav_info',
+        source: 'kokoro',
+        id,
+        sample_rate_hz: info.sampleRateHz,
+        channels: info.channels,
+        bits_per_sample: info.bitsPerSample,
+        data_bytes: info.dataBytes,
+        duration_ms: info.durationMs,
+        ...context,
+      },
+      'wav info',
+    );
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : 'unknown_error';
+    log.warn(
+      {
+        event: 'wav_info_parse_failed',
+        source: 'kokoro',
+        id,
+        reason,
+        ...context,
+      },
+      'wav info parse failed',
+    );
+  }
+}
 
 export function createTelnyxWebhookRouter(sessionManager: SessionManager): Router {
   const router = Router();
@@ -173,6 +253,60 @@ export function createTelnyxWebhookRouter(sessionManager: SessionManager): Route
         },
         'tts synthesized',
       );
+
+      logTtsBytesReady(context, options.reason, ttsResult.audio, ttsResult.contentType);
+      const pipelineApplied = env.PLAYBACK_PROFILE === 'pstn';
+      if (pipelineApplied) {
+        const endPipeline = startStageTimer('tts_pipeline_ms', options.tenantId ?? 'unknown');
+        const pipelineResult = runPlaybackPipeline(ttsResult.audio, {
+          targetSampleRateHz: env.PLAYBACK_PSTN_SAMPLE_RATE,
+          enableHighpass: env.PLAYBACK_ENABLE_HIGHPASS,
+          logContext: context,
+        });
+        endPipeline();
+        ttsResult.audio = pipelineResult.audio;
+      }
+      const pipelineMeta = getAudioMeta(ttsResult.audio) ?? {
+        format: 'wav' as const,
+        logContext: context,
+        lineage: ['pipeline:unknown'],
+      };
+      if (pipelineApplied) {
+        probeWav('tts.out.telephonyOptimized', ttsResult.audio, pipelineMeta);
+      }
+      probeWav('tx.telnyx.payload', ttsResult.audio, {
+        ...pipelineMeta,
+        kind: options.reason,
+      });
+      try {
+        const info = parseWavInfo(ttsResult.audio);
+        log.info(
+          {
+            event: 'wav_info',
+            source: 'pipeline_output',
+            id: options.reason,
+            sample_rate_hz: info.sampleRateHz,
+            channels: info.channels,
+            bits_per_sample: info.bitsPerSample,
+            data_bytes: info.dataBytes,
+            duration_ms: info.durationMs,
+            ...context,
+          },
+          'wav info',
+        );
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : 'unknown_error';
+        log.warn(
+          {
+            event: 'wav_info_parse_failed',
+            source: 'pipeline_output',
+            id: options.reason,
+            reason,
+            ...context,
+          },
+          'wav info parse failed',
+        );
+      }
 
       const publicUrl = await storeWav(options.callControlId, options.reason, ttsResult.audio);
       const playbackStart = Date.now();

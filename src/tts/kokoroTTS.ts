@@ -3,7 +3,14 @@ import { log } from '../log';
 import { TTSRequest, TTSResult } from './types';
 
 export async function synthesizeSpeech(request: TTSRequest): Promise<TTSResult> {
-  const response = await fetch(env.KOKORO_URL, {
+  const kokoroUrl = request.kokoroUrl ?? env.KOKORO_URL;
+  const sampleRate = request.sampleRate ?? env.TTS_SAMPLE_RATE;
+  const format = request.format ?? 'wav';
+  log.info(
+    { event: 'tts_request', sample_rate: sampleRate, voice: request.voice, format },
+    'tts request',
+  );
+  const response = await fetch(kokoroUrl, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -11,6 +18,8 @@ export async function synthesizeSpeech(request: TTSRequest): Promise<TTSResult> 
     body: JSON.stringify({
       text: request.text,
       voice: request.voice,
+      format,
+      sampleRate,
     }),
   });
 

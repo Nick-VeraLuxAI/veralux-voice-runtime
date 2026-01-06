@@ -1,0 +1,4 @@
+Placeholder module for AMR-WB decoding.
+
+No third-party code is included in this file. Replace with a vendor decoder and its license
+when integrating an actual AMR-WB implementation.

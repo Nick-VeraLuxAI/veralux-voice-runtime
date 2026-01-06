@@ -5,12 +5,18 @@ exports.resolveTenantId = resolveTenantId;
 const env_1 = require("../env");
 const log_1 = require("../log");
 const client_1 = require("../redis/client");
+const E164_REGEX = /^\+[1-9]\d{1,14}$/;
 function normalizeE164(toNumber) {
-    return toNumber.trim().replace(/\s+/g, '');
+    const normalized = toNumber.trim().replace(/\s+/g, '');
+    if (!E164_REGEX.test(normalized)) {
+        return '';
+    }
+    return normalized;
 }
 async function resolveTenantId(toNumber, redis = (0, client_1.getRedisClient)()) {
     const normalized = normalizeE164(toNumber);
     if (!normalized) {
+        log_1.log.debug({ did: toNumber }, 'invalid did');
         return null;
     }
     const key = `${env_1.env.TENANTMAP_PREFIX}:did:${normalized}`;

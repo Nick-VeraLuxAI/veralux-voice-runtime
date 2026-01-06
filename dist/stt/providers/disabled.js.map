@@ -1,0 +1,1 @@
+{"version":3,"file":"disabled.js","sourceRoot":"","sources":["../../../src/stt/providers/disabled.ts"],"names":[],"mappings":";;;AAGA,MAAa,mBAAmB;IAAhC;QACkB,OAAE,GAAG,UAAU,CAAC;QAChB,qBAAgB,GAAG,KAAK,CAAC;IAK3C,CAAC;IAHQ,KAAK,CAAC,UAAU,CAAC,MAAqB,EAAE,QAAoB,EAAE;QACnE,OAAO,EAAE,IAAI,EAAE,EAAE,EAAE,OAAO,EAAE,IAAI,EAAE,UAAU,EAAE,CAAC,EAAE,CAAC;IACpD,CAAC;CACF;AAPD,kDAOC"}

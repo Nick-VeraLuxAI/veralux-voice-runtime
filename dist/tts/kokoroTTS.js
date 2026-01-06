@@ -4,7 +4,11 @@ exports.synthesizeSpeech = synthesizeSpeech;
 const env_1 = require("../env");
 const log_1 = require("../log");
 async function synthesizeSpeech(request) {
-    const response = await fetch(env_1.env.KOKORO_URL, {
+    const kokoroUrl = request.kokoroUrl ?? env_1.env.KOKORO_URL;
+    const sampleRate = request.sampleRate ?? env_1.env.TTS_SAMPLE_RATE;
+    const format = request.format ?? 'wav';
+    log_1.log.info({ event: 'tts_request', sample_rate: sampleRate, voice: request.voice, format }, 'tts request');
+    const response = await fetch(kokoroUrl, {
         method: 'POST',
         headers: {
             'Content-Type': 'application/json',
@@ -12,6 +16,8 @@ async function synthesizeSpeech(request) {
         body: JSON.stringify({
             text: request.text,
             voice: request.voice,
+            format,
+            sampleRate,
         }),
     });
     if (!response.ok) {

@@ -84,7 +84,7 @@ function parseSseBlock(block: string): { event: string; data: string } | null {
 
 async function readSseStream(
   response: Response,
-  onEvent: (event: { event: string; data: string }) => void,
+  onEvent: (event: { event: string; data: string }) => boolean | void,
 ): Promise<void> {
   if (!response.body) {
     throw new Error('brain stream missing body');
@@ -109,7 +109,11 @@ async function readSseStream(
       buffer = buffer.slice(boundaryIndex + 2);
       const parsed = parseSseBlock(block);
       if (parsed) {
-        onEvent(parsed);
+        const shouldContinue = onEvent(parsed);
+        if (shouldContinue === false) {
+          await reader.cancel();
+          return;
+        }
       }
       boundaryIndex = buffer.indexOf('\n\n');
     }
@@ -316,7 +320,7 @@ export async function generateAssistantReplyStream(
         if (text) {
           fullText = text;
         }
-        return;
+        return false;
       }
 
       if (event === 'error') {

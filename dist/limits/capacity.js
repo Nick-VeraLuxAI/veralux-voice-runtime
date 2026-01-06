@@ -101,8 +101,9 @@ async function evalCapacityScript(redis, keys, args) {
         }
     }
     try {
-        scriptSha = await redis.script('LOAD', LUA_CAPACITY_SCRIPT);
-        return (await redis.evalsha(scriptSha, numKeys, ...keys, ...args));
+        const loadedSha = String(await redis.script('LOAD', LUA_CAPACITY_SCRIPT));
+        scriptSha = loadedSha;
+        return (await redis.evalsha(loadedSha, numKeys, ...keys, ...args));
     }
     catch (error) {
         return (await redis.eval(LUA_CAPACITY_SCRIPT, numKeys, ...keys, ...args));
@@ -112,11 +113,12 @@ async function tryAcquire(params) {
     const redis = params.redis ?? (0, client_1.getRedisClient)();
     const nowEpochMs = params.nowEpochMs ?? Date.now();
     const keys = buildCapacityKeys(params.tenantId, nowEpochMs);
+    const capDefaults = params.capDefaults;
     const args = [
         params.callControlId,
-        env_1.env.GLOBAL_CONCURRENCY_CAP.toString(),
-        env_1.env.TENANT_CONCURRENCY_CAP_DEFAULT.toString(),
-        env_1.env.TENANT_CALLS_PER_MIN_CAP_DEFAULT.toString(),
+        (capDefaults?.globalConcurrency ?? env_1.env.GLOBAL_CONCURRENCY_CAP).toString(),
+        (capDefaults?.tenantConcurrency ?? env_1.env.TENANT_CONCURRENCY_CAP_DEFAULT).toString(),
+        (capDefaults?.tenantRpm ?? env_1.env.TENANT_CALLS_PER_MIN_CAP_DEFAULT).toString(),
         env_1.env.CAPACITY_TTL_SECONDS.toString(),
     ];
     let result;

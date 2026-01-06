@@ -16,6 +16,11 @@ export interface TelnyxEventMeta {
   tenantId?: string;
 }
 
+export interface TelnyxSignatureCheck {
+  ok: boolean;
+  skipped: boolean;
+}
+
 function isHex(value: string): boolean {
   return /^[0-9a-f]+$/i.test(value);
 }
@@ -100,20 +105,24 @@ export function verifyTelnyxSignature({
   signature,
   timestamp,
   scheme,
-}: TelnyxSignatureInput): boolean {
+}: TelnyxSignatureInput): TelnyxSignatureCheck {
+  if (env.TELNYX_SKIP_SIGNATURE) {
+    return { ok: true, skipped: true };
+  }
+
   if (!signature || !timestamp) {
-    return false;
+    return { ok: false, skipped: false };
   }
 
   const parsedTimestamp = Number.parseInt(timestamp, 10);
   if (!Number.isFinite(parsedTimestamp)) {
-    return false;
+    return { ok: false, skipped: false };
   }
 
   const now = Math.floor(Date.now() / 1000);
   const normalizedTimestamp = parsedTimestamp > 1_000_000_000_000 ? Math.floor(parsedTimestamp / 1000) : parsedTimestamp;
   if (Math.abs(now - normalizedTimestamp) > MAX_SKEW_SECONDS) {
-    return false;
+    return { ok: false, skipped: false };
   }
 
   const message = Buffer.concat([
@@ -127,13 +136,13 @@ export function verifyTelnyxSignature({
 
   try {
     if (shouldUseHmac && secret) {
-      return verifyHmacSignature(message, signature, secret);
+      return { ok: verifyHmacSignature(message, signature, secret), skipped: false };
     }
 
     const publicKey = parsePublicKey(env.TELNYX_PUBLIC_KEY);
     const signatureBuffer = Buffer.from(signature, isHex(signature) ? 'hex' : 'base64');
-    return crypto.verify(null, message, publicKey, signatureBuffer);
+    return { ok: crypto.verify(null, message, publicKey, signatureBuffer), skipped: false };
   } catch {
-    return false;
+    return { ok: false, skipped: false };
   }
 }

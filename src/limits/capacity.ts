@@ -75,6 +75,7 @@ export interface CapacityParams {
   nowEpochMs?: number;
   requestId?: string;
   redis?: RedisClient;
+  capDefaults?: CapacityDefaults;
 }
 
 export interface ReleaseParams {
@@ -82,6 +83,12 @@ export interface ReleaseParams {
   callControlId: string;
   requestId?: string;
   redis?: RedisClient;
+}
+
+export interface CapacityDefaults {
+  globalConcurrency?: number;
+  tenantConcurrency?: number;
+  tenantRpm?: number;
 }
 
 let scriptSha: string | null = null;
@@ -132,8 +139,9 @@ async function evalCapacityScript(
   }
 
   try {
-    scriptSha = await redis.script('LOAD', LUA_CAPACITY_SCRIPT);
-    return (await redis.evalsha(scriptSha, numKeys, ...keys, ...args)) as string;
+    const loadedSha = String(await redis.script('LOAD', LUA_CAPACITY_SCRIPT));
+    scriptSha = loadedSha;
+    return (await redis.evalsha(loadedSha, numKeys, ...keys, ...args)) as string;
   } catch (error) {
     return (await redis.eval(LUA_CAPACITY_SCRIPT, numKeys, ...keys, ...args)) as string;
   }
@@ -145,11 +153,12 @@ export async function tryAcquire(
   const redis = params.redis ?? getRedisClient();
   const nowEpochMs = params.nowEpochMs ?? Date.now();
   const keys = buildCapacityKeys(params.tenantId, nowEpochMs);
+  const capDefaults = params.capDefaults;
   const args = [
     params.callControlId,
-    env.GLOBAL_CONCURRENCY_CAP.toString(),
-    env.TENANT_CONCURRENCY_CAP_DEFAULT.toString(),
-    env.TENANT_CALLS_PER_MIN_CAP_DEFAULT.toString(),
+    (capDefaults?.globalConcurrency ?? env.GLOBAL_CONCURRENCY_CAP).toString(),
+    (capDefaults?.tenantConcurrency ?? env.TENANT_CONCURRENCY_CAP_DEFAULT).toString(),
+    (capDefaults?.tenantRpm ?? env.TENANT_CALLS_PER_MIN_CAP_DEFAULT).toString(),
     env.CAPACITY_TTL_SECONDS.toString(),
   ];
 

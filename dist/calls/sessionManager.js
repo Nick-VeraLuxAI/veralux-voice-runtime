@@ -11,6 +11,8 @@ class SessionManager {
         this.sessions = new Map();
         this.queues = new Map();
         this.mediaConnections = new Map();
+        this.transports = new Map();
+        this.inactiveCalls = new Map();
         const idleMinutes = options.idleTtlMinutes ?? DEFAULT_IDLE_TTL_MINUTES;
         this.idleTtlMs = Math.max(idleMinutes, 1) * 60000;
         this.capacityRelease = options.capacityRelease ?? capacity_1.release;
@@ -41,8 +43,15 @@ class SessionManager {
             return existing;
         }
         const session = new callSession_1.CallSession({ ...config, requestId: context.requestId ?? config.requestId });
-        session.start({ autoAnswer: options.autoAnswer });
         this.sessions.set(config.callControlId, session);
+        const transport = session.getTransport();
+        this.transports.set(config.callControlId, transport);
+        transport.ingest.onFrame((frame) => session.onAudioFrame(frame));
+        transport.playback.onPlaybackEnd(() => session.onPlaybackEnded());
+        void Promise.resolve(transport.ingest.start()).catch((error) => {
+            log_1.log.warn({ err: error, call_control_id: session.callControlId, tenant_id: session.tenantId, requestId: context.requestId }, 'transport ingest start failed');
+        });
+        session.start({ autoAnswer: options.autoAnswer });
         log_1.log.info({
             event: 'call_session_created',
             call_control_id: session.callControlId,
@@ -52,6 +61,15 @@ class SessionManager {
             state: session.getState(),
             requestId: context.requestId,
         }, 'call session created');
+        const transportMode = transport.mode;
+        const idKey = transportMode === 'webrtc_hd' ? 'session_id' : 'call_control_id';
+        log_1.log.info({
+            event: 'transport_selected',
+            transport_mode: transportMode,
+            tenant_id: session.tenantId,
+            requestId: context.requestId,
+            [idKey]: session.callControlId,
+        }, 'transport selected');
         return session;
     }
     onAnswered(callControlId, context = {}) {
@@ -66,9 +84,42 @@ class SessionManager {
             requestId: context.requestId,
         }, 'call session answered');
     }
+    onPlaybackEnded(callControlId, context = {}) {
+        const session = this.sessions.get(callControlId);
+        if (!session) {
+            log_1.log.warn({
+                event: 'call_session_playback_end_missing',
+                call_control_id: callControlId,
+                requestId: context.requestId,
+            }, 'call session missing on playback end');
+            return;
+        }
+        const transport = this.transports.get(callControlId);
+        if (transport?.notifyPlaybackEnded) {
+            transport.notifyPlaybackEnded();
+        }
+        else {
+            session.onPlaybackEnded();
+        }
+        log_1.log.info({
+            event: 'call_session_playback_end',
+            call_control_id: session.callControlId,
+            tenant_id: session.tenantId,
+            state: session.getState(),
+            requestId: context.requestId,
+        }, 'call session playback ended');
+    }
+    isCallActive(callControlId) {
+        if (this.inactiveCalls.has(callControlId)) {
+            return false;
+        }
+        const session = this.sessions.get(callControlId);
+        return session ? session.isActive() : true;
+    }
     onHangup(callControlId, reason, context = {}) {
         const session = this.sessions.get(callControlId);
         if (!session) {
+            this.inactiveCalls.set(callControlId, Date.now());
             log_1.log.warn({
                 event: 'call_session_hangup_missing',
                 call_control_id: callControlId,
@@ -78,6 +129,8 @@ class SessionManager {
             }, 'call session missing on hangup');
             return;
         }
+        session.markEnded(reason ?? 'hangup');
+        this.inactiveCalls.set(callControlId, Date.now());
         const changed = session.end();
         log_1.log.info({
             event: changed ? 'call_session_hangup' : 'call_session_hangup_duplicate',
@@ -92,8 +145,16 @@ class SessionManager {
     teardown(callControlId, reason, context = {}) {
         const session = this.sessions.get(callControlId);
         if (!session) {
+            this.inactiveCalls.set(callControlId, Date.now());
             this.closeMediaConnections(callControlId, reason ?? 'teardown');
             this.clearQueue(callControlId);
+            const transport = this.transports.get(callControlId);
+            if (transport) {
+                this.transports.delete(callControlId);
+                void Promise.resolve(transport.stop(reason)).catch((error) => {
+                    log_1.log.warn({ err: error, call_control_id: callControlId }, 'transport stop failed');
+                });
+            }
             if (context.tenantId) {
                 void this.capacityRelease({
                     tenantId: context.tenantId,
@@ -103,8 +164,17 @@ class SessionManager {
             }
             return;
         }
+        session.markEnded(reason ?? 'teardown');
+        this.inactiveCalls.set(callControlId, Date.now());
         session.end();
         this.sessions.delete(callControlId);
+        const transport = this.transports.get(callControlId);
+        if (transport) {
+            this.transports.delete(callControlId);
+            void Promise.resolve(transport.stop(reason)).catch((error) => {
+                log_1.log.warn({ err: error, call_control_id: callControlId }, 'transport stop failed');
+            });
+        }
         this.closeMediaConnections(callControlId, reason ?? 'teardown');
         this.clearQueue(callControlId);
         if (session.tenantId) {
@@ -144,15 +214,32 @@ class SessionManager {
             }, 'call session missing for audio');
             return false;
         }
-        if (session.getState() === 'ENDED') {
+        if (!session.isActive() || session.getState() === 'ENDED') {
             log_1.log.warn({
                 event: 'call_session_audio_ended',
                 call_control_id: callControlId,
             }, 'call session ended for audio');
             return false;
         }
-        session.onAudioFrame(frame);
+        const transport = this.transports.get(callControlId);
+        if (transport?.pushFrame) {
+            transport.pushFrame(frame);
+        }
+        else {
+            session.onAudioFrame(frame);
+        }
         return true;
+    }
+    pushPcm16(callControlId, pcm16, sampleRateHz) {
+        if (sampleRateHz <= 0) {
+            log_1.log.warn({
+                event: 'call_session_pcm16_invalid_rate',
+                call_control_id: callControlId,
+                sample_rate_hz: sampleRateHz,
+            }, 'invalid pcm16 sample rate');
+        }
+        const buffer = Buffer.from(pcm16.buffer, pcm16.byteOffset, pcm16.byteLength);
+        return this.pushAudio(callControlId, buffer);
     }
     registerMediaConnection(callControlId, connection) {
         const connections = this.mediaConnections.get(callControlId) ?? new Set();
@@ -176,7 +263,21 @@ class SessionManager {
                 continue;
             }
             try {
-                await task();
+                const session = this.sessions.get(callControlId);
+                const requiresActive = task.requiresActive !== false;
+                if (requiresActive) {
+                    const inactive = this.inactiveCalls.has(callControlId) || (session ? !session.isActive() : false);
+                    if (inactive) {
+                        log_1.log.warn({
+                            event: 'call_session_task_skipped_inactive',
+                            task: task.name,
+                            call_control_id: callControlId,
+                            tenant_id: session?.tenantId,
+                        }, 'skipping queued task - call inactive');
+                        continue;
+                    }
+                }
+                await task.run();
             }
             catch (error) {
                 log_1.log.error({ err: error, call_control_id: callControlId, event: 'call_session_task_failed' }, 'session task failed');
@@ -220,6 +321,14 @@ class SessionManager {
                 continue;
             }
             this.teardown(callControlId, 'idle_timeout');
+        }
+        for (const [callControlId, endedAt] of this.inactiveCalls.entries()) {
+            if (this.sessions.has(callControlId) || this.queues.has(callControlId)) {
+                continue;
+            }
+            if (nowMs - endedAt > this.idleTtlMs) {
+                this.inactiveCalls.delete(callControlId);
+            }
         }
     }
 }

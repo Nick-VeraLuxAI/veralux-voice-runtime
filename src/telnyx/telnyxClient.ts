@@ -1,5 +1,6 @@
 import { env } from '../env';
 import { log } from '../log';
+import { diagnosticsEnabled } from '../diagnostics/audioProbe';
 import { TelnyxRequestOptions } from './types';
 
 export interface TelnyxPreparedRequest {
@@ -283,7 +284,8 @@ export async function telnyxCallControl(
       const { media_format: _mediaFormat, ...rest } = body;
       normalizedBody = {
         ...rest,
-        stream_codec: 'PCMU',
+        stream_codec: process.env.TELNYX_STREAM_CODEC ?? 'PCMU',
+
       };
     }
   }
@@ -363,12 +365,43 @@ export class TelnyxClient {
     );
   }
 
-  public async startStreaming(callControlId: string, streamUrl: string): Promise<void> {
+  public async startStreaming(
+    callControlId: string,
+    streamUrl: string,
+    options: { streamCodec?: string; streamTrack?: string } = {},
+  ): Promise<void> {
+    const normalizeStreamTrack = (track: string): 'inbound_track' | 'outbound_track' | 'both_tracks' => {
+      switch (track) {
+        case 'inbound':
+          return 'inbound_track';
+        case 'outbound':
+          return 'outbound_track';
+        case 'both':
+          return 'both_tracks';
+        default:
+          return track as 'inbound_track' | 'outbound_track' | 'both_tracks';
+      }
+    };
+
+    const fallbackCodec = env.TRANSPORT_MODE === 'webrtc_hd' ? 'OPUS' : 'PCMU';
+    const streamTrack = normalizeStreamTrack(options.streamTrack ?? env.TELNYX_STREAM_TRACK);
     const requestBody = {
       stream_url: streamUrl,
-      stream_track: env.TELNYX_STREAM_TRACK,
-      stream_codec: 'PCMU',
+      stream_track: streamTrack,
+      stream_codec: options.streamCodec ?? env.TELNYX_STREAM_CODEC ?? fallbackCodec,
     };
+    if (diagnosticsEnabled()) {
+      log.info(
+        {
+          event: 'audio_codec_info',
+          direction: 'tx.telnyx_stream_request',
+          call_control_id: callControlId,
+          stream_codec: requestBody.stream_codec,
+          stream_track: requestBody.stream_track,
+        },
+        'audio codec info',
+      );
+    }
     const redactedStreamUrl = (() => {
       try {
         const parsed = new URL(streamUrl);

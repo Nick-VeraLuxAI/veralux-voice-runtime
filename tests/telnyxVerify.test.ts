@@ -13,5 +13,5 @@ test('telnyxVerify rejects missing signature', async () => {
     timestamp: Math.floor(Date.now() / 1000).toString(),
   });
 
-  assert.equal(result, false);
+  assert.deepEqual(result, { ok: false, skipped: false });
 });

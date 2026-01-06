@@ -1,0 +1,154 @@
+Phase 2 Codex Prompt — Crisp PSTN Playback (Format-Correct, Minimal DSP)
+
+Paste this directly into Codex.
+
+Goal
+
+Implement Phase 2 “Crisp PSTN Playback” in veralux-voice-runtime with a safe, minimal playback pipeline that guarantees correct PSTN audio format while preserving the existing raw-passthrough fallback (Option A).
+
+This phase must NOT introduce heavy DSP, LUFS processing, aggressive EQ, or risky transformations.
+
+1️⃣ Create a playback pipeline module
+
+Create a new file:
+
+src/audio/playbackPipeline.ts
+
+
+Responsibilities:
+
+Input: Buffer containing a WAV file (from Kokoro TTS)
+
+Output: Buffer containing a PSTN-safe WAV
+
+Pipeline steps (in order):
+
+Parse WAV header (RIFF/WAVE/fmt/data) using Buffer reads
+
+Validate:
+
+PCM format
+
+mono channel
+
+Decode PCM16 samples
+
+Apply safety peak normalization only
+
+Detect clipping
+
+Reduce gain slightly if needed
+
+NO compression, NO LUFS targeting
+
+Optional gentle high-pass filter (~100 Hz), guarded by flag
+
+Resample only if needed → target 8000 Hz
+
+Encode clean WAV:
+
+PCM16
+
+mono
+
+8000 Hz
+
+Rules:
+
+PSTN default target sample rate = 8000 Hz
+
+Do NOT resample unless source SR ≠ target
+
+If any step fails → return original input buffer unchanged
+
+Log a warning on fallback (no throw)
+
+2️⃣ Add environment-controlled profiles
+
+Add env support (do not break existing env.ts validation):
+
+PLAYBACK_PROFILE=pstn|hd (default: pstn)
+
+PLAYBACK_PSTN_SAMPLE_RATE=8000
+
+PLAYBACK_ENABLE_HIGHPASS=false
+
+Behavior:
+
+pstn → pipeline enabled
+
+hd → bypass pipeline entirely (raw bytes)
+
+3️⃣ Wire pipeline into playback path
+
+Locate where TTS audio is prepared for serving (/audio/:id.wav or cached audio handler).
+
+Modify flow:
+
+After Kokoro returns bytes:
+
+If PLAYBACK_PROFILE === 'pstn'
+
+Pass buffer through playbackPipeline
+
+Else
+
+Use original buffer
+
+Preserve Option A behavior as fallback
+
+4️⃣ Add instrumentation (using existing metrics.ts)
+
+Use existing helpers — do NOT create new metric systems.
+
+Add stage timing:
+
+tts_pipeline_ms (wrap pipeline execution)
+
+playback_serve_ms (serve handler timing)
+
+Use:
+
+startStageTimer(...)
+observeStageDuration(...)
+
+5️⃣ Add WAV introspection logging (diagnostics)
+
+At three points, log a structured event:
+
+event: "wav_info"
+source: "kokoro" | "pipeline_output" | "audio_serve"
+sample_rate_hz
+channels
+bits_per_sample
+data_bytes
+duration_ms
+
+
+This logging is for diagnostics only, not metrics.
+
+6️⃣ Strict constraints
+
+❌ No ffmpeg
+
+❌ No native deps
+
+❌ No WebRTC changes
+
+❌ No STT modifications
+
+❌ No behavior regressions
+
+PSTN playback must never be worse than Option A.
+
+✅ Success Criteria
+
+PSTN playback sounds at least as clear as raw passthrough
+
+No muffled / underwater / clipped audio
+
+WAV format is consistent and observable in logs
+
+Pipeline can be safely disabled via env
+
+Future HD/WebRTC path remains untouched

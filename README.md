@@ -31,6 +31,9 @@ Optional (defaults shown):
 - BRAIN_STREAM_FIRST_AUDIO_MAX_MS (2000)
 - BRAIN_STREAM_SEGMENT_MIN_CHARS (120)
 - BRAIN_STREAM_SEGMENT_NEXT_CHARS (180)
+- TRANSPORT_MODE (pstn)
+- WEBRTC_PORT (optional)
+- WEBRTC_ALLOWED_ORIGINS (optional, comma-separated)
 - TENANTMAP_PREFIX (tenantmap)
 - CAP_PREFIX (cap)
 - AUDIO_CLEANUP_HOURS (24)
@@ -73,6 +76,35 @@ export BRAIN_STREAM_SEGMENT_NEXT_CHARS=180
 ```
 
 If the stream endpoint is unavailable or does not return `text/event-stream`, the runtime falls back to `POST /reply`.
+
+## Transport Modes
+
+PSTN (default):
+- `TRANSPORT_MODE=pstn`
+- Use Telnyx Call Control + Media Streams as usual.
+
+WebRTC HD (optional):
+1) Set:
+```bash
+export TRANSPORT_MODE=webrtc_hd
+export WEBRTC_ALLOWED_ORIGINS=http://localhost:4001
+```
+2) Install the optional WebRTC dependency (required for HD mode):
+```bash
+npm install
+```
+2) Ensure the tenant config exists in Redis.
+3) Run the server and open:
+```
+http://localhost:4001/hd-call?tenant_id=tenantA
+```
+4) Click **Start Call** in the browser.
+
+Notes:
+- For true wideband playback, set `TTS_SAMPLE_RATE` or per-tenant `tts.sampleRate` to 24000/48000.
+- PSTN remains unchanged and continues to use Telnyx webhooks.
+- WebRTC endpoints are served on the main HTTP port; `WEBRTC_PORT` is reserved for future separation.
+- If `wrtc` is not installed, the `/v1/webrtc/offer` endpoint returns `webrtc_init_failed`.
 
 ## Test Webhooks
 

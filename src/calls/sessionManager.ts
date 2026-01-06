@@ -1,7 +1,9 @@
 import { release, type ReleaseParams } from '../limits/capacity';
 import { log } from '../log';
+import { incInboundAudioFrames, incInboundAudioFramesDropped } from '../metrics';
 import { CallSession } from './callSession';
 import { CallSessionConfig, CallSessionId } from './types';
+import type { TransportMode, TransportSession } from '../transport/types';
 
 const DEFAULT_IDLE_TTL_MINUTES = 10;
 const DEFAULT_SWEEP_INTERVAL_MS = 60_000;
@@ -32,6 +34,7 @@ export class SessionManager {
   private readonly sweepTimer: NodeJS.Timeout;
   private readonly queues = new Map<CallSessionId, QueueState>();
   private readonly mediaConnections = new Map<CallSessionId, Set<MediaConnection>>();
+  private readonly transports = new Map<CallSessionId, TransportSession>();
   private readonly capacityRelease: (params: ReleaseParams) => Promise<void>;
   private readonly inactiveCalls = new Map<CallSessionId, number>();
 
@@ -84,8 +87,20 @@ export class SessionManager {
     }
 
     const session = new CallSession({ ...config, requestId: context.requestId ?? config.requestId });
-    session.start({ autoAnswer: options.autoAnswer });
     this.sessions.set(config.callControlId, session);
+
+    const transport = session.getTransport();
+    this.transports.set(config.callControlId, transport);
+    transport.ingest.onFrame((frame) => session.onAudioFrame(frame));
+    transport.playback.onPlaybackEnd(() => session.onPlaybackEnded());
+    void Promise.resolve(transport.ingest.start()).catch((error) => {
+      log.warn(
+        { err: error, call_control_id: session.callControlId, tenant_id: session.tenantId, requestId: context.requestId },
+        'transport ingest start failed',
+      );
+    });
+
+    session.start({ autoAnswer: options.autoAnswer });
 
     log.info(
       {
@@ -98,6 +113,19 @@ export class SessionManager {
         requestId: context.requestId,
       },
       'call session created',
+    );
+
+    const transportMode = transport.mode;
+    const idKey = transportMode === 'webrtc_hd' ? 'session_id' : 'call_control_id';
+    log.info(
+      {
+        event: 'transport_selected',
+        transport_mode: transportMode,
+        tenant_id: session.tenantId,
+        requestId: context.requestId,
+        [idKey]: session.callControlId,
+      },
+      'transport selected',
     );
 
     return session;
@@ -135,7 +163,12 @@ export class SessionManager {
       return;
     }
 
-    session.onPlaybackEnded();
+    const transport = this.transports.get(callControlId);
+    if (transport?.notifyPlaybackEnded) {
+      transport.notifyPlaybackEnded();
+    } else {
+      session.onPlaybackEnded();
+    }
 
     log.info(
       {
@@ -156,6 +189,28 @@ export class SessionManager {
 
     const session = this.sessions.get(callControlId);
     return session ? session.isActive() : true;
+  }
+
+  public getTransportMode(callControlId: CallSessionId): TransportMode | undefined {
+    const transport = this.transports.get(callControlId);
+    return transport?.mode;
+  }
+
+  public notifyIngestFailure(callControlId: CallSessionId, reason: string): void {
+    const session = this.sessions.get(callControlId);
+    if (!session) {
+      log.warn(
+        {
+          event: 'call_session_ingest_missing',
+          call_control_id: callControlId,
+          reason,
+        },
+        'call session missing for ingest failure',
+      );
+      return;
+    }
+
+    session.notifyIngestFailure(reason);
   }
 
   public onHangup(callControlId: CallSessionId, reason?: string, context: SessionLogContext = {}): void {
@@ -200,6 +255,13 @@ export class SessionManager {
       this.inactiveCalls.set(callControlId, Date.now());
       this.closeMediaConnections(callControlId, reason ?? 'teardown');
       this.clearQueue(callControlId);
+      const transport = this.transports.get(callControlId);
+      if (transport) {
+        this.transports.delete(callControlId);
+        void Promise.resolve(transport.stop(reason)).catch((error) => {
+          log.warn({ err: error, call_control_id: callControlId }, 'transport stop failed');
+        });
+      }
       if (context.tenantId) {
         void this.capacityRelease({
           tenantId: context.tenantId,
@@ -214,6 +276,13 @@ export class SessionManager {
     this.inactiveCalls.set(callControlId, Date.now());
     session.end();
     this.sessions.delete(callControlId);
+    const transport = this.transports.get(callControlId);
+    if (transport) {
+      this.transports.delete(callControlId);
+      void Promise.resolve(transport.stop(reason)).catch((error) => {
+        log.warn({ err: error, call_control_id: callControlId }, 'transport stop failed');
+      });
+    }
     this.closeMediaConnections(callControlId, reason ?? 'teardown');
     this.clearQueue(callControlId);
     if (session.tenantId) {
@@ -253,8 +322,10 @@ export class SessionManager {
   }
 
   public pushAudio(callControlId: CallSessionId, frame: Buffer): boolean {
+    incInboundAudioFrames();
     const session = this.sessions.get(callControlId);
     if (!session) {
+      incInboundAudioFramesDropped('missing_session');
       log.warn(
         {
           event: 'call_session_missing_audio',
@@ -266,6 +337,7 @@ export class SessionManager {
     }
 
     if (!session.isActive() || session.getState() === 'ENDED') {
+      incInboundAudioFramesDropped('inactive_session');
       log.warn(
         {
           event: 'call_session_audio_ended',
@@ -276,8 +348,28 @@ export class SessionManager {
       return false;
     }
 
-    session.onAudioFrame(frame);
+    const transport = this.transports.get(callControlId);
+    if (transport?.pushFrame) {
+      transport.pushFrame(frame);
+    } else {
+      session.onAudioFrame(frame);
+    }
     return true;
+  }
+
+  public pushPcm16(callControlId: CallSessionId, pcm16: Int16Array, sampleRateHz: number): boolean {
+    if (sampleRateHz <= 0) {
+      log.warn(
+        {
+          event: 'call_session_pcm16_invalid_rate',
+          call_control_id: callControlId,
+          sample_rate_hz: sampleRateHz,
+        },
+        'invalid pcm16 sample rate',
+      );
+    }
+    const buffer = Buffer.from(pcm16.buffer, pcm16.byteOffset, pcm16.byteLength);
+    return this.pushAudio(callControlId, buffer);
   }
 
   public registerMediaConnection(callControlId: CallSessionId, connection: MediaConnection): void {

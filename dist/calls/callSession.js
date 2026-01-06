@@ -3,20 +3,43 @@ Object.defineProperty(exports, "__esModule", { value: true });
 exports.CallSession = void 0;
 const env_1 = require("../env");
 const log_1 = require("../log");
+const wavInfo_1 = require("../audio/wavInfo");
+const playbackPipeline_1 = require("../audio/playbackPipeline");
+const codecDecode_1 = require("../audio/codecDecode");
 const audioStore_1 = require("../storage/audioStore");
 const chunkedSTT_1 = require("../stt/chunkedSTT");
-const telnyxClient_1 = require("../telnyx/telnyxClient");
+const registry_1 = require("../stt/registry");
+const pstnTelnyxTransport_1 = require("../transport/pstnTelnyxTransport");
 const kokoroTTS_1 = require("../tts/kokoroTTS");
+const audioProbe_1 = require("../diagnostics/audioProbe");
+const brainClient_1 = require("../ai/brainClient");
+const metrics_1 = require("../metrics");
+const PARTIAL_FAST_PATH_MIN_CHARS = 18;
+function getErrorMessage(error) {
+    if (error instanceof Error)
+        return error.message;
+    return 'unknown_error';
+}
 class CallSession {
     constructor(config) {
         this.state = 'INIT';
         this.transcriptBuffer = [];
         this.conversationHistory = [];
         this.deadAirMs = env_1.env.DEAD_AIR_MS;
+        this.active = true;
         this.isHandlingTranscript = false;
         this.hasStarted = false;
         this.turnSequence = 0;
         this.repromptInFlight = false;
+        this.logPreviewChars = 160;
+        this.ttsSegmentChain = Promise.resolve();
+        this.ttsSegmentQueueDepth = 0;
+        this.playbackState = {
+            active: false,
+            interrupted: false,
+        };
+        this.transcriptHandlingToken = 0;
+        this.transcriptAcceptedForUtterance = false;
         this.callControlId = config.callControlId;
         this.tenantId = config.tenantId;
         this.from = config.from;
@@ -27,23 +50,53 @@ class CallSession {
             lastHeardAt: undefined,
             turns: 0,
         };
+        this.sttConfig = config.tenantConfig?.stt;
+        this.ttsConfig = config.tenantConfig?.tts;
         this.logContext = {
             call_control_id: this.callControlId,
             tenant_id: this.tenantId,
             requestId: this.requestId,
         };
-        this.telnyx = new telnyxClient_1.TelnyxClient(this.logContext);
+        this.transport =
+            config.transportSession ??
+                new pstnTelnyxTransport_1.PstnTelnyxTransportSession({
+                    callControlId: this.callControlId,
+                    tenantId: this.tenantId,
+                    requestId: this.requestId,
+                    isActive: () => this.active && this.state !== 'ENDED',
+                });
+        // ✅ Ensure this is ALWAYS a string (tenant override → env fallback)
+        const sttEndpointUrl = this.sttConfig?.config?.url ??
+            this.sttConfig?.whisperUrl ??
+            env_1.env.WHISPER_URL;
+        const sttMode = this.sttConfig?.mode ?? 'whisper_http';
+        const provider = (0, registry_1.getProvider)(sttMode);
+        const acceptCodecs = (0, codecDecode_1.parseTelnyxAcceptCodecs)(env_1.env.TELNYX_ACCEPT_CODECS);
+        acceptCodecs.add('PCMU');
+        acceptCodecs.add('PCMA');
+        const usePcm16Ingest = (0, codecDecode_1.shouldUsePcm16Ingest)(acceptCodecs, env_1.env.TELNYX_AMRWB_DECODE, env_1.env.TELNYX_G722_DECODE, env_1.env.TELNYX_OPUS_DECODE);
+        const sttAudioInput = this.transport.mode === 'pstn' && usePcm16Ingest
+            ? { codec: 'pcm16le', sampleRateHz: env_1.env.TELNYX_TARGET_SAMPLE_RATE }
+            : this.transport.audioInput;
         this.stt = new chunkedSTT_1.ChunkedSTT({
-            chunkMs: env_1.env.STT_CHUNK_MS,
-            silenceMs: env_1.env.STT_SILENCE_MS,
-            onTranscript: async (text) => {
-                await this.handleTranscript(text);
+            provider,
+            whisperUrl: sttEndpointUrl,
+            language: this.sttConfig?.language,
+            frameMs: this.sttConfig?.chunkMs ?? env_1.env.STT_CHUNK_MS,
+            silenceEndMs: env_1.env.STT_SILENCE_MS,
+            inputCodec: sttAudioInput.codec,
+            sampleRate: sttAudioInput.sampleRateHz,
+            onTranscript: async (text, source) => {
+                await this.handleTranscript(text, source);
+            },
+            onSpeechStart: () => {
+                void this.handleSpeechStart();
             },
             logContext: this.logContext,
         });
     }
     start(options = {}) {
-        if (this.state === 'ENDED' || this.hasStarted) {
+        if (!this.active || this.state === 'ENDED' || this.hasStarted) {
             return false;
         }
         this.state = 'INIT';
@@ -54,7 +107,7 @@ class CallSession {
         return true;
     }
     onAnswered() {
-        if (this.state === 'ENDED') {
+        if (!this.active || this.state === 'ENDED') {
             return false;
         }
         const previousState = this.state;
@@ -65,7 +118,7 @@ class CallSession {
         return previousState !== this.state;
     }
     onAudioFrame(frame) {
-        if (this.state === 'ENDED') {
+        if (!this.active || this.state === 'ENDED') {
             return;
         }
         if (this.state === 'INIT' || this.state === 'ANSWERED') {
@@ -75,14 +128,14 @@ class CallSession {
             this.scheduleDeadAirTimer();
         }
         this.metrics.lastHeardAt = new Date();
-        if (this.state === 'LISTENING') {
-            this.stt.ingest(frame);
-        }
+        this.stt.ingest(frame);
     }
     end() {
         if (this.state === 'ENDED') {
+            this.markEnded('ended');
             return false;
         }
+        this.markEnded('ended');
         this.state = 'ENDED';
         this.metrics.lastHeardAt = new Date();
         this.clearDeadAirTimer();
@@ -91,6 +144,30 @@ class CallSession {
     }
     getState() {
         return this.state;
+    }
+    getTransport() {
+        return this.transport;
+    }
+    isActive() {
+        return this.active;
+    }
+    markEnded(reason) {
+        if (!this.active) {
+            if (!this.endedReason) {
+                this.endedReason = reason;
+            }
+            return;
+        }
+        this.active = false;
+        this.endedAt = Date.now();
+        this.endedReason = reason;
+        log_1.log.info({ event: 'call_marked_inactive', reason, ...this.logContext }, 'call marked inactive');
+    }
+    getEndInfo() {
+        return {
+            endedAt: this.endedAt,
+            endedReason: this.endedReason,
+        };
     }
     getMetrics() {
         return {
@@ -112,15 +189,163 @@ class CallSession {
         this.conversationHistory.push(turn);
         this.metrics.turns += 1;
     }
+    onPlaybackEnded() {
+        if (this.playbackState.interrupted) {
+            log_1.log.info({ event: 'playback_ended_ignored', reason: 'barge_in', ...this.logContext }, 'playback ended after barge-in');
+            return;
+        }
+        if (!this.playbackState.active) {
+            return;
+        }
+        this.playbackState.active = false;
+        this.playbackState.segmentId = undefined;
+        this.playbackStopSignal = undefined;
+        if (this.active && this.state === 'SPEAKING') {
+            this.enterListeningState();
+        }
+    }
+    createPlaybackStopSignal() {
+        let resolve;
+        const promise = new Promise((resolver) => {
+            resolve = resolver;
+        });
+        return { promise, resolve: resolve };
+    }
+    beginPlayback(segmentId) {
+        if (!this.playbackState.active) {
+            this.playbackStopSignal = this.createPlaybackStopSignal();
+        }
+        this.playbackState.active = true;
+        this.playbackState.interrupted = false;
+        this.playbackState.segmentId = segmentId;
+        this.state = 'SPEAKING';
+        this.clearDeadAirTimer();
+    }
+    resolvePlaybackStopSignal() {
+        if (this.playbackStopSignal) {
+            this.playbackStopSignal.resolve();
+            this.playbackStopSignal = undefined;
+        }
+    }
+    clearTtsQueue() {
+        this.ttsSegmentChain = Promise.resolve();
+        this.ttsSegmentQueueDepth = 0;
+    }
+    invalidateTranscriptHandling() {
+        this.transcriptHandlingToken += 1;
+        this.isHandlingTranscript = false;
+    }
+    logTtsBytesReady(id, audio, contentType) {
+        const header = (0, wavInfo_1.describeWavHeader)(audio);
+        log_1.log.info({
+            event: 'tts_bytes_ready',
+            id,
+            bytes: audio.length,
+            riff: header.riff,
+            wave: header.wave,
+            ...this.logContext,
+        }, 'tts bytes ready');
+        if (!header.riff || !header.wave) {
+            log_1.log.warn({
+                event: 'tts_non_wav_warning',
+                id,
+                content_type: contentType,
+                first16_hex: header.first16Hex,
+                bytes: audio.length,
+                ...this.logContext,
+            }, 'tts bytes are not wav');
+        }
+        const audioLogContext = { ...this.logContext, tts_id: id };
+        const baseMeta = {
+            callId: this.callControlId,
+            tenantId: this.tenantId,
+            format: 'wav',
+            logContext: audioLogContext,
+            lineage: ['tts:output'],
+            kind: id,
+        };
+        (0, audioProbe_1.attachAudioMeta)(audio, baseMeta);
+        (0, audioProbe_1.probeWav)('tts.out.raw', audio, baseMeta);
+        this.logWavInfo('kokoro', id, audio);
+    }
+    logWavInfo(source, id, audio) {
+        try {
+            const info = (0, wavInfo_1.parseWavInfo)(audio);
+            log_1.log.info({
+                event: 'wav_info',
+                source,
+                id,
+                sample_rate_hz: info.sampleRateHz,
+                channels: info.channels,
+                bits_per_sample: info.bitsPerSample,
+                data_bytes: info.dataBytes,
+                duration_ms: info.durationMs,
+                ...this.logContext,
+            }, 'wav info');
+        }
+        catch (error) {
+            log_1.log.warn({
+                event: 'wav_info_parse_failed',
+                source,
+                id,
+                reason: getErrorMessage(error),
+                ...this.logContext,
+            }, 'wav info parse failed');
+        }
+    }
+    resetTranscriptTracking() {
+        this.transcriptAcceptedForUtterance = false;
+        this.firstPartialAt = undefined;
+    }
+    shouldTriggerPartialFastPath(text) {
+        const trimmed = text.trim();
+        if (!trimmed)
+            return false;
+        if (/[.!?]$/.test(trimmed))
+            return true;
+        return trimmed.length >= PARTIAL_FAST_PATH_MIN_CHARS;
+    }
+    handleSpeechStart() {
+        if (!this.active || this.state === 'ENDED') {
+            return;
+        }
+        this.resetTranscriptTracking();
+        const playbackActive = this.playbackState.active || this.state === 'SPEAKING' || this.ttsSegmentQueueDepth > 0;
+        if (!playbackActive || this.playbackState.interrupted) {
+            return;
+        }
+        log_1.log.info({
+            event: 'barge_in',
+            reason: 'speech_start',
+            state: this.state,
+            ...this.logContext,
+        }, 'barge in');
+        this.playbackState.active = false;
+        this.playbackState.interrupted = true;
+        this.playbackState.segmentId = undefined;
+        this.resolvePlaybackStopSignal();
+        this.clearTtsQueue();
+        this.invalidateTranscriptHandling();
+        this.enterListeningState();
+        void this.stopPlayback();
+    }
+    async stopPlayback() {
+        try {
+            await this.transport.playback.stop();
+        }
+        catch (error) {
+            log_1.log.warn({ err: error, ...this.logContext }, 'playback stop failed');
+        }
+    }
     enterListeningState() {
-        if (this.state === 'ENDED') {
+        if (!this.active || this.state === 'ENDED') {
             return;
         }
         this.state = 'LISTENING';
         this.scheduleDeadAirTimer();
     }
     scheduleDeadAirTimer() {
-        if (this.state !== 'LISTENING') {
+        if (!this.active || this.state !== 'LISTENING') {
             return;
         }
         this.clearDeadAirTimer();
@@ -136,7 +361,9 @@ class CallSession {
         }
     }
     async handleDeadAirTimeout() {
-        if (this.state !== 'LISTENING' || this.state === 'ENDED' || this.repromptInFlight) {
+        // FIX (TS2367): remove redundant `this.state === 'ENDED'` check.
+        // If state isn't LISTENING, we already return.
+        if (!this.active || this.state !== 'LISTENING' || this.repromptInFlight) {
             return;
         }
         if (this.isHandlingTranscript) {
@@ -155,46 +382,286 @@ class CallSession {
             }
         }
     }
-    async handleTranscript(text) {
-        if (this.state !== 'LISTENING' || this.isHandlingTranscript) {
+    async handleTranscript(text, transcriptSource) {
+        if (!this.active || this.state !== 'LISTENING' || this.isHandlingTranscript) {
             return;
         }
+        const trimmed = text.trim();
+        if (trimmed === '') {
+            return;
+        }
+        const isPartial = transcriptSource === 'partial_fallback';
+        if (this.transcriptAcceptedForUtterance) {
+            return;
+        }
+        if (isPartial && !this.firstPartialAt) {
+            this.firstPartialAt = Date.now();
+        }
+        if (isPartial && !this.shouldTriggerPartialFastPath(trimmed)) {
+            return;
+        }
+        const tenantLabel = this.tenantId ?? 'unknown';
+        const trigger = isPartial ? 'partial' : 'final';
+        const responseStartAt = Date.now();
+        if (isPartial && this.firstPartialAt) {
+            (0, metrics_1.observeStageDuration)('stt_first_partial_to_response_ms', tenantLabel, responseStartAt - this.firstPartialAt);
+        }
+        else if (!isPartial) {
+            (0, metrics_1.observeStageDuration)('stt_final_to_response_ms', tenantLabel, 0);
+        }
+        log_1.log.info({
+            event: 'turn_trigger',
+            trigger,
+            transcript_length: trimmed.length,
+            ...this.logContext,
+        }, 'turn trigger');
+        this.transcriptAcceptedForUtterance = true;
         this.isHandlingTranscript = true;
+        const handlingToken = (this.transcriptHandlingToken += 1);
         this.clearDeadAirTimer();
         try {
-            const trimmed = text.trim();
-            if (trimmed === '') {
-                return;
+            const transcriptPreview = trimmed.length <= this.logPreviewChars
+                ? trimmed
+                : `${trimmed.slice(0, this.logPreviewChars - 3)}...`;
+            const transcriptLog = {
+                event: 'transcript_received',
+                transcript_length: trimmed.length,
+                transcript_preview: transcriptPreview,
+                ...this.logContext,
+            };
+            if (transcriptSource === 'partial_fallback') {
+                transcriptLog.transcript_source = transcriptSource;
             }
+            log_1.log.info(transcriptLog, 'transcript received');
             this.state = 'THINKING';
             this.appendTranscriptSegment(trimmed);
             this.appendHistory({ role: 'user', content: trimmed, timestamp: new Date() });
-            const response = await this.mockAiTurn(trimmed);
+            let response = '';
+            let replySource = 'unknown';
+            let playbackDone;
+            try {
+                if (env_1.env.BRAIN_STREAMING_ENABLED) {
+                    // LLM stage timing for streaming is handled inside streamAssistantReply()
+                    const streamResult = await this.streamAssistantReply(trimmed, handlingToken);
+                    response = streamResult.reply.text;
+                    replySource = streamResult.reply.source;
+                    playbackDone = streamResult.playbackDone;
+                }
+                else {
+                    const endLlm = (0, metrics_1.startStageTimer)('llm', tenantLabel);
+                    try {
+                        const reply = await (0, brainClient_1.generateAssistantReply)({
+                            tenantId: this.tenantId,
+                            callControlId: this.callControlId,
+                            transcript: trimmed,
+                            history: this.conversationHistory,
+                        });
+                        endLlm();
+                        response = reply.text;
+                        replySource = reply.source;
+                    }
+                    catch (error) {
+                        (0, metrics_1.incStageError)('llm', tenantLabel);
+                        endLlm();
+                        throw error; // let your existing outer catch handle fallback response/logging
+                    }
+                }
+            }
+            catch (error) {
+                response = 'Acknowledged.';
+                replySource = 'fallback_error';
+                log_1.log.error({ err: error, assistant_reply_source: replySource, ...this.logContext }, 'assistant reply generation failed');
+            }
+            if (handlingToken !== this.transcriptHandlingToken) {
+                return;
+            }
+            (0, audioProbe_1.markAudioSpan)('llm_result', {
+                callId: this.callControlId,
+                tenantId: this.tenantId,
+                logContext: this.logContext,
+            });
+            const replyPreview = response.length <= this.logPreviewChars
+                ? response
+                : `${response.slice(0, this.logPreviewChars - 3)}...`;
+            log_1.log.info({
+                event: 'assistant_reply_text',
+                assistant_reply_text: replyPreview,
+                assistant_reply_length: response.length,
+                assistant_reply_source: replySource,
+                ...this.logContext,
+            }, 'assistant reply text');
+            if (handlingToken !== this.transcriptHandlingToken) {
+                return;
+            }
             this.appendHistory({ role: 'assistant', content: response, timestamp: new Date() });
-            await this.playAssistantTurn(response);
+            if (env_1.env.BRAIN_STREAMING_ENABLED) {
+                if (playbackDone) {
+                    await playbackDone;
+                }
+            }
+            else {
+                await this.playAssistantTurn(response);
+            }
         }
         catch (error) {
             log_1.log.error({ err: error, ...this.logContext }, 'call session transcript handling failed');
         }
         finally {
-            if (this.state !== 'ENDED') {
+            if (handlingToken === this.transcriptHandlingToken) {
+                // FIX (TS2367): call unconditionally; enterListeningState guards ENDED internally.
                 this.enterListeningState();
+                this.isHandlingTranscript = false;
             }
-            this.isHandlingTranscript = false;
         }
     }
-    async mockAiTurn(transcript) {
-        void transcript;
-        return 'Acknowledged.';
+    async streamAssistantReply(transcript, handlingToken) {
+        let bufferedText = '';
+        let firstTokenAt;
+        let speakCursor = 0;
+        let firstSegmentQueued = false;
+        let segmentIndex = 0;
+        let queuedSegments = 0;
+        let baseTurnId;
+        const firstSegmentMin = env_1.env.BRAIN_STREAM_SEGMENT_MIN_CHARS;
+        const nextSegmentMin = env_1.env.BRAIN_STREAM_SEGMENT_NEXT_CHARS;
+        const firstAudioMaxMs = env_1.env.BRAIN_STREAM_FIRST_AUDIO_MAX_MS;
+        const queueSegment = (segment) => {
+            if (handlingToken !== this.transcriptHandlingToken) {
+                return;
+            }
+            const trimmed = segment.trim();
+            if (!trimmed) {
+                return;
+            }
+            const resolvedTurnId = baseTurnId ?? `turn-${this.nextTurnId()}`;
+            baseTurnId = resolvedTurnId;
+            segmentIndex += 1;
+            queuedSegments += 1;
+            const segmentId = `${resolvedTurnId}-${segmentIndex}`;
+            this.queueTtsSegment(trimmed, segmentId, handlingToken);
+        };
+        const maybeQueueSegments = (force) => {
+            if (!this.active) {
+                return;
+            }
+            while (true) {
+                const pending = bufferedText.slice(speakCursor);
+                if (!pending) {
+                    return;
+                }
+                if (!firstSegmentQueued) {
+                    const boundary = this.findSentenceBoundary(pending);
+                    if (boundary !== null) {
+                        queueSegment(pending.slice(0, boundary));
+                        speakCursor += boundary;
+                        firstSegmentQueued = true;
+                        continue;
+                    }
+                    if (pending.length >= firstSegmentMin) {
+                        const end = this.selectSegmentEnd(pending, firstSegmentMin);
+                        queueSegment(pending.slice(0, end));
+                        speakCursor += end;
+                        firstSegmentQueued = true;
+                        continue;
+                    }
+                    if (force ||
+                        (firstTokenAt && Date.now() - firstTokenAt >= firstAudioMaxMs)) {
+                        queueSegment(pending);
+                        speakCursor += pending.length;
+                        firstSegmentQueued = true;
+                        continue;
+                    }
+                    return;
+                }
+                const boundary = this.findSentenceBoundary(pending);
+                if (boundary !== null) {
+                    queueSegment(pending.slice(0, boundary));
+                    speakCursor += boundary;
+                    continue;
+                }
+                if (pending.length >= nextSegmentMin) {
+                    const end = this.selectSegmentEnd(pending, nextSegmentMin);
+                    queueSegment(pending.slice(0, end));
+                    speakCursor += end;
+                    continue;
+                }
+                if (force) {
+                    queueSegment(pending);
+                    speakCursor += pending.length;
+                }
+                return;
+            }
+        };
+        const tenantLabel = this.tenantId ?? 'unknown';
+        const endLlm = (0, metrics_1.startStageTimer)('llm', tenantLabel);
+        let reply;
+        try {
+            reply = await (0, brainClient_1.generateAssistantReplyStream)({
+                tenantId: this.tenantId,
+                callControlId: this.callControlId,
+                transcript,
+                history: this.conversationHistory,
+            }, (chunk) => {
+                if (!chunk)
+                    return;
+                if (!firstTokenAt)
+                    firstTokenAt = Date.now();
+                bufferedText += chunk;
+                maybeQueueSegments(false);
+            });
+            endLlm();
+        }
+        catch (error) {
+            (0, metrics_1.incStageError)('llm', tenantLabel);
+            endLlm();
+            throw error;
+        }
+        if (handlingToken !== this.transcriptHandlingToken) {
+            return { reply };
+        }
+        if (reply.source !== 'brain_http_stream') {
+            if (handlingToken !== this.transcriptHandlingToken) {
+                return { reply };
+            }
+            return { reply, playbackDone: this.playAssistantTurn(reply.text) };
+        }
+        if (reply.text.length > bufferedText.length) {
+            bufferedText = reply.text;
+        }
+        maybeQueueSegments(true);
+        if (queuedSegments === 0) {
+            if (handlingToken !== this.transcriptHandlingToken) {
+                return { reply };
+            }
+            return { reply, playbackDone: this.playAssistantTurn(reply.text) };
+        }
+        return { reply, playbackDone: this.waitForTtsSegmentQueue() };
     }
     async answerAndGreet() {
         try {
             const answerStarted = Date.now();
-            await this.telnyx.answerCall(this.callControlId);
+            if (this.transport.mode === 'pstn' && this.shouldSkipTelnyxAction('answer')) {
+                return;
+            }
+            await this.transport.start();
             const answerDuration = Date.now() - answerStarted;
-            log_1.log.info({ event: 'telnyx_answer_duration', duration_ms: answerDuration, ...this.logContext }, 'telnyx answer completed');
+            if (this.transport.mode === 'pstn') {
+                log_1.log.info({ event: 'telnyx_answer_duration', duration_ms: answerDuration, ...this.logContext }, 'telnyx answer completed');
+            }
+            log_1.log.info({ event: 'call_answered', ...this.logContext }, 'call answered');
             this.onAnswered();
-            await this.playText('Hello, thanks for calling.', 'greeting');
+            if (this.transport.mode === 'webrtc_hd') {
+                await this.playText('Hi! Thanks for calling. How can I help you today?', 'greeting');
+                return;
+            }
+            const trimmedBaseUrl = env_1.env.AUDIO_PUBLIC_BASE_URL.replace(/\/$/, '');
+            const greetingUrl = `${trimmedBaseUrl}/greeting.wav`;
+            if (this.shouldSkipTelnyxAction('playback_start')) {
+                return;
+            }
+            this.beginPlayback('greeting');
+            await this.transport.playback.play({ kind: 'url', url: greetingUrl });
+            log_1.log.info({ event: 'call_playback_started', audio_url: greetingUrl, ...this.logContext }, 'playback started');
         }
         catch (error) {
             log_1.log.error({ err: error, ...this.logContext }, 'call start greeting failed');
@@ -205,39 +672,305 @@ class CallSession {
         await this.playText(text, turnId);
     }
     async playText(text, turnId) {
-        if (this.state === 'ENDED') {
+        if (!this.active || this.state === 'ENDED') {
             return;
         }
-        this.clearDeadAirTimer();
-        this.state = 'SPEAKING';
+        this.beginPlayback(turnId);
         try {
+            const tenantLabel = this.tenantId ?? 'unknown';
+            const endTts = (0, metrics_1.startStageTimer)('tts', tenantLabel);
+            const spanMeta = {
+                callId: this.callControlId,
+                tenantId: this.tenantId,
+                logContext: { ...this.logContext, tts_id: turnId },
+                kind: turnId,
+            };
+            (0, audioProbe_1.markAudioSpan)('tts_start', spanMeta);
             const ttsStart = Date.now();
-            const result = await (0, kokoroTTS_1.synthesizeSpeech)({ text });
+            let result;
+            try {
+                result = await (0, kokoroTTS_1.synthesizeSpeech)({
+                    text,
+                    voice: this.ttsConfig?.voice,
+                    format: this.ttsConfig?.format,
+                    sampleRate: this.ttsConfig?.sampleRate,
+                    kokoroUrl: this.ttsConfig?.kokoroUrl,
+                });
+            }
+            catch (error) {
+                (0, metrics_1.incStageError)('tts', tenantLabel);
+                throw error;
+            }
+            finally {
+                endTts();
+            }
             const ttsDuration = Date.now() - ttsStart;
-            log_1.log.info({ event: 'tts_synthesized', duration_ms: ttsDuration, audio_bytes: result.audio.length, ...this.logContext }, 'tts synthesized');
-            const publicUrl = await (0, audioStore_1.storeWav)(this.callControlId, turnId, result.audio);
-            const playbackStart = Date.now();
-            await this.telnyx.playAudio(this.callControlId, publicUrl);
-            const playbackDuration = Date.now() - playbackStart;
+            (0, audioProbe_1.markAudioSpan)('tts_ready', spanMeta);
             log_1.log.info({
-                event: 'telnyx_playback_duration',
-                duration_ms: playbackDuration,
-                audio_url: publicUrl,
+                event: 'tts_synthesized',
+                duration_ms: ttsDuration,
+                audio_bytes: result.audio.length,
                 ...this.logContext,
-            }, 'telnyx playback completed');
+            }, 'tts synthesized');
+            if (!this.active || this.playbackState.interrupted) {
+                return;
+            }
+            this.logTtsBytesReady(turnId, result.audio, result.contentType);
+            let playbackAudio = result.audio;
+            const applyPstnPipeline = env_1.env.PLAYBACK_PROFILE === 'pstn' && this.transport.mode === 'pstn';
+            if (applyPstnPipeline) {
+                const endPipeline = (0, metrics_1.startStageTimer)('tts_pipeline_ms', tenantLabel);
+                const pipelineResult = (0, playbackPipeline_1.runPlaybackPipeline)(playbackAudio, {
+                    targetSampleRateHz: env_1.env.PLAYBACK_PSTN_SAMPLE_RATE,
+                    enableHighpass: env_1.env.PLAYBACK_ENABLE_HIGHPASS,
+                    logContext: this.logContext,
+                });
+                endPipeline();
+                playbackAudio = pipelineResult.audio;
+            }
+            if (applyPstnPipeline) {
+                this.logWavInfo('pipeline_output', turnId, playbackAudio);
+                const pipelineMeta = (0, audioProbe_1.getAudioMeta)(playbackAudio) ?? {
+                    format: 'wav',
+                    logContext: { ...this.logContext, tts_id: turnId },
+                    lineage: ['pipeline:unknown'],
+                };
+                (0, audioProbe_1.probeWav)('tts.out.telephonyOptimized', playbackAudio, pipelineMeta);
+            }
+            result.audio = playbackAudio;
+            const playbackInput = this.transport.mode === 'pstn'
+                ? { kind: 'url', url: await (0, audioStore_1.storeWav)(this.callControlId, turnId, result.audio) }
+                : { kind: 'buffer', audio: result.audio, contentType: result.contentType };
+            if (this.playbackState.interrupted) {
+                return;
+            }
+            if (this.transport.mode === 'pstn' && this.shouldSkipTelnyxAction('playback_start')) {
+                return;
+            }
+            const playbackStage = this.transport.mode === 'pstn' ? 'telnyx_playback' : 'webrtc_playback_ms';
+            const endPlayback = (0, metrics_1.startStageTimer)(playbackStage, tenantLabel);
+            const playbackStart = Date.now();
+            try {
+                if (this.transport.mode === 'pstn') {
+                    const txMeta = (0, audioProbe_1.getAudioMeta)(playbackAudio) ?? {
+                        format: 'wav',
+                        logContext: { ...this.logContext, tts_id: turnId },
+                        lineage: ['tx:unknown'],
+                    };
+                    (0, audioProbe_1.probeWav)('tx.telnyx.payload', playbackAudio, { ...txMeta, kind: turnId });
+                }
+                (0, audioProbe_1.markAudioSpan)('tx_sent', spanMeta);
+                await this.transport.playback.play(playbackInput);
+            }
+            catch (error) {
+                (0, metrics_1.incStageError)(playbackStage, tenantLabel);
+                throw error;
+            }
+            finally {
+                endPlayback();
+            }
+            const playbackDuration = Date.now() - playbackStart;
+            if (this.transport.mode === 'pstn') {
+                log_1.log.info({
+                    event: 'telnyx_playback_duration',
+                    duration_ms: playbackDuration,
+                    audio_url: playbackInput.url,
+                    ...this.logContext,
+                }, 'telnyx playback completed');
+            }
         }
         catch (error) {
             log_1.log.error({ err: error, ...this.logContext }, 'call session tts playback failed');
         }
         finally {
-            if (this.state !== 'ENDED') {
-                this.enterListeningState();
-            }
+            // FIX (TS2367): call unconditionally; enterListeningState guards ENDED internally.
+            this.enterListeningState();
         }
+    }
+    queueTtsSegment(segmentText, segmentId, handlingToken) {
+        if (!segmentText.trim()) {
+            return;
+        }
+        if (!this.active || this.state === 'ENDED') {
+            return;
+        }
+        if (handlingToken !== undefined && handlingToken !== this.transcriptHandlingToken) {
+            return;
+        }
+        this.beginPlayback(segmentId);
+        this.ttsSegmentQueueDepth += 1;
+        const queueDepth = this.ttsSegmentQueueDepth;
+        log_1.log.info({
+            event: 'tts_segment_queued',
+            seg_len: segmentText.length,
+            queue_depth: queueDepth,
+            segment_id: segmentId,
+            ...this.logContext,
+        }, 'tts segment queued');
+        this.ttsSegmentChain = this.ttsSegmentChain
+            .then(async () => {
+            await this.playTtsSegment(segmentText, segmentId);
+        })
+            .catch((error) => {
+            log_1.log.error({ err: error, ...this.logContext }, 'tts segment playback failed');
+        })
+            .finally(() => {
+            this.ttsSegmentQueueDepth = Math.max(0, this.ttsSegmentQueueDepth - 1);
+        });
+    }
+    async playTtsSegment(segmentText, segmentId) {
+        const shouldAbort = !this.active || this.state === 'ENDED' || this.playbackState.interrupted;
+        if (shouldAbort) {
+            return;
+        }
+        const tenantLabel = this.tenantId ?? 'unknown';
+        const endTts = (0, metrics_1.startStageTimer)('tts', tenantLabel);
+        const spanMeta = {
+            callId: this.callControlId,
+            tenantId: this.tenantId,
+            logContext: { ...this.logContext, tts_id: segmentId },
+            kind: segmentId,
+        };
+        (0, audioProbe_1.markAudioSpan)('tts_start', spanMeta);
+        const ttsStart = Date.now();
+        let result;
+        try {
+            result = await (0, kokoroTTS_1.synthesizeSpeech)({
+                text: segmentText,
+                voice: this.ttsConfig?.voice,
+                format: this.ttsConfig?.format,
+                sampleRate: this.ttsConfig?.sampleRate,
+                kokoroUrl: this.ttsConfig?.kokoroUrl,
+            });
+        }
+        catch (error) {
+            (0, metrics_1.incStageError)('tts', tenantLabel);
+            throw error;
+        }
+        finally {
+            endTts();
+        }
+        const ttsDuration = Date.now() - ttsStart;
+        (0, audioProbe_1.markAudioSpan)('tts_ready', spanMeta);
+        log_1.log.info({
+            event: 'tts_synthesized',
+            duration_ms: ttsDuration,
+            audio_bytes: result.audio.length,
+            ...this.logContext,
+        }, 'tts synthesized');
+        if (!this.active || this.state === 'ENDED' || this.playbackState.interrupted) {
+            return;
+        }
+        this.logTtsBytesReady(segmentId, result.audio, result.contentType);
+        let playbackAudio = result.audio;
+        const applyPstnPipeline = env_1.env.PLAYBACK_PROFILE === 'pstn' && this.transport.mode === 'pstn';
+        if (applyPstnPipeline) {
+            const endPipeline = (0, metrics_1.startStageTimer)('tts_pipeline_ms', tenantLabel);
+            const pipelineResult = (0, playbackPipeline_1.runPlaybackPipeline)(playbackAudio, {
+                targetSampleRateHz: env_1.env.PLAYBACK_PSTN_SAMPLE_RATE,
+                enableHighpass: env_1.env.PLAYBACK_ENABLE_HIGHPASS,
+                logContext: this.logContext,
+            });
+            endPipeline();
+            playbackAudio = pipelineResult.audio;
+        }
+        if (applyPstnPipeline) {
+            this.logWavInfo('pipeline_output', segmentId, playbackAudio);
+            const pipelineMeta = (0, audioProbe_1.getAudioMeta)(playbackAudio) ?? {
+                format: 'wav',
+                logContext: { ...this.logContext, tts_id: segmentId },
+                lineage: ['pipeline:unknown'],
+            };
+            (0, audioProbe_1.probeWav)('tts.out.telephonyOptimized', playbackAudio, pipelineMeta);
+        }
+        result.audio = playbackAudio;
+        const playbackInput = this.transport.mode === 'pstn'
+            ? { kind: 'url', url: await (0, audioStore_1.storeWav)(this.callControlId, segmentId, result.audio) }
+            : { kind: 'buffer', audio: result.audio, contentType: result.contentType };
+        if (this.playbackState.interrupted) {
+            return;
+        }
+        if (this.transport.mode === 'pstn') {
+            log_1.log.info({
+                event: 'tts_segment_play_start',
+                seg_len: segmentText.length,
+                segment_id: segmentId,
+                audio_url: playbackInput.url,
+                ...this.logContext,
+            }, 'tts segment playback start');
+        }
+        const playbackStage = this.transport.mode === 'pstn' ? 'telnyx_playback' : 'webrtc_playback_ms';
+        const endPlayback = (0, metrics_1.startStageTimer)(playbackStage, tenantLabel);
+        const playbackStart = Date.now();
+        try {
+            if (this.transport.mode === 'pstn') {
+                const txMeta = (0, audioProbe_1.getAudioMeta)(playbackAudio) ?? {
+                    format: 'wav',
+                    logContext: { ...this.logContext, tts_id: segmentId },
+                    lineage: ['tx:unknown'],
+                };
+                (0, audioProbe_1.probeWav)('tx.telnyx.payload', playbackAudio, { ...txMeta, kind: segmentId });
+            }
+            (0, audioProbe_1.markAudioSpan)('tx_sent', spanMeta);
+            await this.transport.playback.play(playbackInput);
+        }
+        catch (error) {
+            (0, metrics_1.incStageError)(playbackStage, tenantLabel);
+            throw error;
+        }
+        finally {
+            endPlayback();
+        }
+        const playbackDuration = Date.now() - playbackStart;
+        if (this.transport.mode === 'pstn') {
+            log_1.log.info({
+                event: 'tts_segment_play_end',
+                seg_len: segmentText.length,
+                segment_id: segmentId,
+                duration_ms: playbackDuration,
+                audio_url: playbackInput.url,
+                ...this.logContext,
+            }, 'tts segment playback end');
+        }
+    }
+    waitForTtsSegmentQueue() {
+        if (!this.playbackStopSignal) {
+            return this.ttsSegmentChain;
+        }
+        return Promise.race([this.ttsSegmentChain, this.playbackStopSignal.promise]);
+    }
+    findSentenceBoundary(text) {
+        const match = text.match(/[.!?](?=\s|$)/);
+        if (!match || match.index === undefined) {
+            return null;
+        }
+        return match.index + 1;
+    }
+    selectSegmentEnd(text, targetChars) {
+        if (text.length <= targetChars) {
+            return text.length;
+        }
+        const slice = text.slice(0, targetChars);
+        const lastSpace = slice.lastIndexOf(' ');
+        if (lastSpace >= Math.floor(targetChars * 0.6)) {
+            return lastSpace;
+        }
+        return targetChars;
     }
     nextTurnId() {
         this.turnSequence += 1;
         return this.turnSequence;
+    }
+    shouldSkipTelnyxAction(action) {
+        if (this.transport.mode !== 'pstn') {
+            return false;
+        }
+        if (this.active) {
+            return false;
+        }
+        const event = action === 'playback_stop' ? 'playback_stop_skipped' : 'telnyx_action_skipped_inactive';
+        log_1.log.warn({ event, action, ...this.logContext }, 'skipping telnyx action - call inactive');
+        return true;
     }
 }
 exports.CallSession = CallSession;
