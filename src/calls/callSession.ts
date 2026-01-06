@@ -1,10 +1,16 @@
+import fs from 'fs';
+import path from 'path';
 import { env } from '../env';
 import { log } from '../log';
 import { describeWavHeader, parseWavInfo } from '../audio/wavInfo';
 import { runPlaybackPipeline } from '../audio/playbackPipeline';
 import { MediaFrame } from '../media/types';
 import { storeWav } from '../storage/audioStore';
-import { ChunkedSTT, type STTProvider as ChunkedSttProvider } from '../stt/chunkedSTT';
+import {
+  ChunkedSTT,
+  type SpeechStartInfo,
+  type STTProvider as ChunkedSttProvider,
+} from '../stt/chunkedSTT';
 import { getProvider } from '../stt/registry';
 import { PstnTelnyxTransportSession } from '../transport/pstnTelnyxTransport';
 import type { TransportSession } from '../transport/types';
@@ -29,6 +35,38 @@ function getErrorMessage(error: unknown): string {
   return 'unknown_error';
 }
 
+function resolveDebugDir(): string {
+  const dir = process.env.STT_DEBUG_DIR;
+  return dir && dir.trim() !== '' ? dir.trim() : '/tmp/veralux-stt-debug';
+}
+
+function wavHeader(pcmDataBytes: number, sampleRate: number, channels: number): Buffer {
+  const bytesPerSample = 2;
+  const blockAlign = channels * bytesPerSample;
+  const byteRate = sampleRate * blockAlign;
+
+  const header = Buffer.alloc(44);
+  header.write('RIFF', 0, 'ascii');
+  header.writeUInt32LE(36 + pcmDataBytes, 4);
+  header.write('WAVE', 8, 'ascii');
+  header.write('fmt ', 12, 'ascii');
+  header.writeUInt32LE(16, 16);
+  header.writeUInt16LE(1, 20);
+  header.writeUInt16LE(channels, 22);
+  header.writeUInt32LE(sampleRate, 24);
+  header.writeUInt32LE(byteRate, 28);
+  header.writeUInt16LE(blockAlign, 32);
+  header.writeUInt16LE(16, 34);
+  header.write('data', 36, 'ascii');
+  header.writeUInt32LE(pcmDataBytes, 40);
+  return header;
+}
+
+function encodePcm16Wav(pcm16le: Buffer, sampleRateHz: number): Buffer {
+  const header = wavHeader(pcm16le.length, sampleRateHz, 1);
+  return Buffer.concat([header, pcm16le]);
+}
+
 export class CallSession {
   public readonly callControlId: string;
   public readonly tenantId?: string;
@@ -44,6 +82,8 @@ export class CallSession {
   private readonly transport: TransportSession;
   private readonly logContext: Record<string, unknown>;
   private readonly deadAirMs = env.DEAD_AIR_MS;
+  private readonly deadAirNoFramesMs = env.DEAD_AIR_NO_FRAMES_MS;
+  private readonly rxSampleRateHz: number;
   private readonly sttConfig?: RuntimeTenantConfig['stt'];
   private readonly ttsConfig?: RuntimeTenantConfig['tts'];
   private endedAt?: number;
@@ -68,6 +108,12 @@ export class CallSession {
   private transcriptAcceptedForUtterance = false;
   private deferredTranscript?: { text: string; source?: 'partial_fallback' | 'final' };
   private firstPartialAt?: number;
+  private lastSpeechStartAtMs = 0;
+  private lastDecodedFrameAtMs = 0;
+  private rxDumpActive = false;
+  private rxDumpSamplesTarget = 0;
+  private rxDumpSamplesCollected = 0;
+  private rxDumpBuffers: Buffer[] = [];
 
   constructor(config: CallSessionConfig) {
     this.callControlId = config.callControlId;
@@ -89,6 +135,7 @@ export class CallSession {
       call_control_id: this.callControlId,
       tenant_id: this.tenantId,
       requestId: this.requestId,
+      telnyx_track: env.TELNYX_STREAM_TRACK,
     };
 
     this.transport =
@@ -112,6 +159,7 @@ export class CallSession {
       this.transport.mode === 'pstn'
         ? { codec: 'pcm16le' as const, sampleRateHz: env.TELNYX_TARGET_SAMPLE_RATE }
         : this.transport.audioInput;
+    this.rxSampleRateHz = sttAudioInput.sampleRateHz;
 
     this.stt = new ChunkedSTT({
       provider,
@@ -124,9 +172,13 @@ export class CallSession {
       onTranscript: async (text, source) => {
         await this.handleTranscript(text, source);
       },
-      onSpeechStart: () => {
-        void this.handleSpeechStart();
+      onSpeechStart: (info: SpeechStartInfo) => {
+        void this.handleSpeechStart(info);
       },
+      isPlaybackActive: () => this.isPlaybackActive(),
+      isListening: () => this.isListening(),
+      getTrack: () => env.TELNYX_STREAM_TRACK,
+      getCodec: () => this.transport.audioInput.codec,
       logContext: this.logContext,
     });
   }
@@ -166,6 +218,8 @@ export class CallSession {
       return;
     }
 
+    this.lastDecodedFrameAtMs = Date.now();
+
     if (this.state === 'INIT' || this.state === 'ANSWERED') {
       this.enterListeningState();
     } else if (this.state === 'LISTENING') {
@@ -176,7 +230,23 @@ export class CallSession {
 
     // Never gate STT audio feed on playback state; transcript handling is gated separately.
     incSttFramesFed();
+    this.maybeCaptureRxDump(frame);
     this.stt.ingest(frame);
+  }
+
+  public isPlaybackActive(): boolean {
+    if (!this.active || this.state === 'ENDED') {
+      return false;
+    }
+    return this.playbackState.active || this.state === 'SPEAKING' || this.ttsSegmentQueueDepth > 0;
+  }
+
+  public isListening(): boolean {
+    return this.state === 'LISTENING';
+  }
+
+  public getLastSpeechStartAtMs(): number {
+    return this.lastSpeechStartAtMs;
   }
 
   public notifyIngestFailure(reason: string): void {
@@ -307,6 +377,8 @@ export class CallSession {
     if (this.active && this.state === 'LISTENING') {
       this.flushDeferredTranscript();
     }
+
+    this.startRxDumpAfterPlayback();
   }
 
   private createPlaybackStopSignal(): { promise: Promise<void>; resolve: () => void } {
@@ -326,6 +398,7 @@ export class CallSession {
     this.playbackState.segmentId = segmentId;
     this.state = 'SPEAKING';
     this.clearDeadAirTimer();
+    this.resetRxDump();
   }
 
   private resolvePlaybackStopSignal(): void {
@@ -449,11 +522,12 @@ export class CallSession {
     return trimmed.length >= PARTIAL_FAST_PATH_MIN_CHARS;
   }
 
-  private handleSpeechStart(): void {
+  private handleSpeechStart(info: SpeechStartInfo): void {
     if (!this.active || this.state === 'ENDED') {
       return;
     }
 
+    this.lastSpeechStartAtMs = Date.now();
     this.resetTranscriptTracking();
 
     const playbackActive =
@@ -467,6 +541,10 @@ export class CallSession {
         event: 'barge_in',
         reason: 'speech_start',
         state: this.state,
+        speech_rms: info.rms,
+        speech_peak: info.peak,
+        speech_frame_ms: Math.round(info.frameMs),
+        speech_frame_streak: info.streak,
         ...this.logContext,
       },
       'barge in',
@@ -519,6 +597,79 @@ export class CallSession {
     }
   }
 
+  private startRxDumpAfterPlayback(): void {
+    if (!env.STT_DEBUG_DUMP_RX_WAV) {
+      return;
+    }
+    this.rxDumpActive = true;
+    this.rxDumpSamplesTarget = Math.max(1, Math.round(this.rxSampleRateHz * 2));
+    this.rxDumpSamplesCollected = 0;
+    this.rxDumpBuffers = [];
+  }
+
+  private resetRxDump(): void {
+    this.rxDumpActive = false;
+    this.rxDumpSamplesCollected = 0;
+    this.rxDumpSamplesTarget = 0;
+    this.rxDumpBuffers = [];
+  }
+
+  private maybeCaptureRxDump(frame: Buffer): void {
+    if (!this.rxDumpActive) {
+      return;
+    }
+    const sampleCount = Math.floor(frame.length / 2);
+    if (sampleCount <= 0) {
+      return;
+    }
+    this.rxDumpBuffers.push(Buffer.from(frame));
+    this.rxDumpSamplesCollected += sampleCount;
+    if (this.rxDumpSamplesCollected >= this.rxDumpSamplesTarget) {
+      void this.flushRxDump();
+    }
+  }
+
+  private async flushRxDump(): Promise<void> {
+    if (!this.rxDumpActive) {
+      return;
+    }
+    this.rxDumpActive = false;
+
+    const pcmBuffer = Buffer.concat(this.rxDumpBuffers);
+    this.rxDumpBuffers = [];
+
+    if (pcmBuffer.length === 0) {
+      return;
+    }
+
+    const dir = resolveDebugDir();
+    const filePath = path.join(
+      dir,
+      `rx_after_playback_${this.callControlId}_${Date.now()}.wav`,
+    );
+
+    try {
+      await fs.promises.mkdir(dir, { recursive: true });
+      const wav = encodePcm16Wav(pcmBuffer, this.rxSampleRateHz);
+      await fs.promises.writeFile(filePath, wav);
+      log.info(
+        {
+          event: 'stt_debug_rx_wav_written',
+          file_path: filePath,
+          sample_rate_hz: this.rxSampleRateHz,
+          bytes: wav.length,
+          ...this.logContext,
+        },
+        'stt debug rx wav written',
+      );
+    } catch (error) {
+      log.warn(
+        { err: error, file_path: filePath, ...this.logContext },
+        'stt debug rx wav write failed',
+      );
+    }
+  }
+
   private async handleDeadAirTimeout(): Promise<void> {
     // FIX (TS2367): remove redundant `this.state === 'ENDED'` check.
     // If state isn't LISTENING, we already return.
@@ -527,6 +678,12 @@ export class CallSession {
     }
 
     if (this.isHandlingTranscript) {
+      this.scheduleDeadAirTimer();
+      return;
+    }
+
+    const now = Date.now();
+    if (this.lastDecodedFrameAtMs > 0 && now - this.lastDecodedFrameAtMs < this.deadAirNoFramesMs) {
       this.scheduleDeadAirTimer();
       return;
     }

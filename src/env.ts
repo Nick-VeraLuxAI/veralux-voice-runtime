@@ -72,6 +72,34 @@ const EnvSchema = z.object({
     emptyToUndefined,
     z.coerce.number().int().nonnegative().default(1),
   ),
+  TELNYX_INGEST_HEALTH_GRACE_MS: z.preprocess(
+    emptyToUndefined,
+    z.coerce.number().int().nonnegative().default(1200),
+  ),
+  TELNYX_INGEST_HEALTH_ENABLED: z.preprocess(
+    stringToBoolean,
+    z.boolean().default(true),
+  ),
+  TELNYX_INGEST_HEALTH_RESTART_ENABLED: z.preprocess(
+    stringToBoolean,
+    z.boolean().default(true),
+  ),
+  TELNYX_INGEST_POST_PLAYBACK_GRACE_MS: z.preprocess(
+    emptyToUndefined,
+    z.coerce.number().int().nonnegative().default(1200),
+  ),
+  TELNYX_INGEST_MIN_AUDIO_MS_SINCE_PLAYBACK_END: z.preprocess(
+    emptyToUndefined,
+    z.coerce.number().int().nonnegative().default(2000),
+  ),
+  TELNYX_AMRWB_MIN_DECODED_BYTES: z.preprocess(
+    emptyToUndefined,
+    z.coerce.number().int().positive().default(320),
+  ),
+  TELNYX_INGEST_DECODE_FAILURES_BEFORE_FALLBACK: z.preprocess(
+    emptyToUndefined,
+    z.coerce.number().int().positive().default(3),
+  ),
   TELNYX_TARGET_SAMPLE_RATE: z.preprocess(
     emptyToUndefined,
     z.coerce.number().int().positive().default(16000),
@@ -144,6 +172,18 @@ const EnvSchema = z.object({
   ),
 
   /* Speech detection thresholds */
+  STT_RMS_FLOOR: z.preprocess(
+    emptyToUndefined,
+    z.coerce.number().positive().default(0.015),
+  ),
+  STT_PEAK_FLOOR: z.preprocess(
+    emptyToUndefined,
+    z.coerce.number().positive().default(0.05),
+  ),
+  STT_DISABLE_GATES: z.preprocess(
+    stringToBoolean,
+    z.boolean().default(false),
+  ),
   STT_SPEECH_RMS_FLOOR: z.preprocess(
     sttRmsFloorFallback,
     z.coerce.number().positive().default(0.03),
@@ -162,9 +202,41 @@ const EnvSchema = z.object({
     emptyToUndefined,
     z.coerce.number().int().positive().default(250),
   ),
+  STT_PARTIAL_MIN_MS: z.preprocess(
+    emptyToUndefined,
+    z.coerce.number().int().positive().default(600),
+  ),
+
+  /* STT input DSP */
+  STT_HIGHPASS_ENABLED: z.preprocess(
+    stringToBoolean,
+    z.boolean().default(true),
+  ),
+  STT_HIGHPASS_CUTOFF_HZ: z.preprocess(
+    emptyToUndefined,
+    z.coerce.number().int().positive().default(100),
+  ),
+
+  /* STT debug dumps */
+  STT_DEBUG_DUMP_WHISPER_WAVS: z.preprocess(
+    stringToBoolean,
+    z.boolean().default(false),
+  ),
+  STT_DEBUG_DUMP_PCM16: z.preprocess(
+    stringToBoolean,
+    z.boolean().default(false),
+  ),
+  STT_DEBUG_DUMP_RX_WAV: z.preprocess(
+    stringToBoolean,
+    z.boolean().default(false),
+  ),
 
   /* Dead air protection */
   DEAD_AIR_MS: z.coerce.number().int().positive(),
+  DEAD_AIR_NO_FRAMES_MS: z.preprocess(
+    emptyToUndefined,
+    z.coerce.number().int().positive().default(1500),
+  ),
 
   /* ───────────────────────── TTS ───────────────────────── */
   KOKORO_URL: z.string().min(1),

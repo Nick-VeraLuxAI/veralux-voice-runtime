@@ -687,6 +687,9 @@ function attachMediaWebSocketServer(server: http.Server, sessionManager: Session
       allowOpus: env.TELNYX_OPUS_DECODE,
       maxRestartAttempts: env.TELNYX_STREAM_RESTART_MAX,
       logContext: { call_control_id: callControlId },
+      isPlaybackActive: () => sessionManager.isPlaybackActive(callControlId),
+      isListening: () => sessionManager.isListening(callControlId),
+      getLastSpeechStartAtMs: () => sessionManager.getLastSpeechStartAtMs(callControlId),
       onFrame: (frame) => {
         const ok = sessionManager.pushPcm16(callControlId, frame.pcm16, frame.sampleRateHz);
         if (!ok) log.warn({ event: 'media_orphan_frame', call_control_id: callControlId }, 'media orphan frame');

@@ -1,3 +1,5 @@
+import fs from 'fs';
+import path from 'path';
 import { env } from '../../env';
 import { log } from '../../log';
 import { observeStageDuration, startStageTimer, incStageError } from '../../metrics';
@@ -11,6 +13,13 @@ const PCM_8K_SAMPLE_RATE_HZ = 8000;
 
 const wavDebugLogged = new Set<string>();
 let wavDebugLoggedAnonymous = false;
+const whisperDumpCounters = new Map<string, number>();
+
+function parseBoolEnv(value: string | undefined): boolean {
+  if (!value) return false;
+  const normalized = value.trim().toLowerCase();
+  return normalized === '1' || normalized === 'true' || normalized === 'yes';
+}
 
 const mediaDebugEnabled = (): boolean => {
   const value = process.env.MEDIA_DEBUG;
@@ -18,6 +27,46 @@ const mediaDebugEnabled = (): boolean => {
   const normalized = value.trim().toLowerCase();
   return normalized === '1' || normalized === 'true' || normalized === 'yes';
 };
+
+const whisperDumpEnabled = (): boolean => parseBoolEnv(process.env.STT_DEBUG_DUMP_WHISPER_WAVS);
+
+function debugDir(): string {
+  return process.env.STT_DEBUG_DIR && process.env.STT_DEBUG_DIR.trim() !== ''
+    ? process.env.STT_DEBUG_DIR.trim()
+    : '/tmp/veralux-stt-debug';
+}
+
+function sanitizeFilePart(value: string): string {
+  return value.replace(/[^A-Za-z0-9._-]/g, '_');
+}
+
+async function maybeDumpWhisperWav(
+  wavPayload: Buffer,
+  kind: 'partial' | 'final',
+  logContext?: Record<string, unknown>,
+): Promise<void> {
+  if (!whisperDumpEnabled()) return;
+  const callControlId = extractCallControlId(logContext) ?? 'unknown';
+  const safeId = sanitizeFilePart(callControlId);
+  const seq = (whisperDumpCounters.get(safeId) ?? 0) + 1;
+  whisperDumpCounters.set(safeId, seq);
+
+  const dir = debugDir();
+  const filePath = path.join(dir, `whisper_${safeId}_${kind}_${seq}_${Date.now()}.wav`);
+  try {
+    await fs.promises.mkdir(dir, { recursive: true });
+    await fs.promises.writeFile(filePath, wavPayload);
+    log.info(
+      { event: 'stt_whisper_wav_dumped', file_path: filePath, kind, ...(logContext ?? {}) },
+      'stt whisper wav dumped',
+    );
+  } catch (error) {
+    log.warn(
+      { event: 'stt_whisper_wav_dump_failed', file_path: filePath, err: error, ...(logContext ?? {}) },
+      'stt whisper wav dump failed',
+    );
+  }
+}
 
 function clampInt16(n: number): number {
   if (n > 32767) return 32767;
@@ -272,6 +321,7 @@ export class WhisperHttpProvider implements STTProvider {
       ...wavMeta,
       kind: whisperStage,
     });
+    await maybeDumpWhisperWav(wavPayload, whisperStage, opts.logContext);
 
     if (mediaDebugEnabled()) {
       logWavDebug(wavPayload, opts.logContext);

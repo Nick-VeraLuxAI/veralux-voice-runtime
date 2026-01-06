@@ -191,6 +191,21 @@ export class SessionManager {
     return session ? session.isActive() : true;
   }
 
+  public isPlaybackActive(callControlId: CallSessionId): boolean {
+    const session = this.sessions.get(callControlId);
+    return session ? session.isPlaybackActive() : false;
+  }
+
+  public isListening(callControlId: CallSessionId): boolean {
+    const session = this.sessions.get(callControlId);
+    return session ? session.isListening() : false;
+  }
+
+  public getLastSpeechStartAtMs(callControlId: CallSessionId): number {
+    const session = this.sessions.get(callControlId);
+    return session ? session.getLastSpeechStartAtMs() : 0;
+  }
+
   public getTransportMode(callControlId: CallSessionId): TransportMode | undefined {
     const transport = this.transports.get(callControlId);
     return transport?.mode;

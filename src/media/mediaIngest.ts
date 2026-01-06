@@ -1,5 +1,6 @@
 import fs from 'fs';
 import path from 'path';
+import { env } from '../env';
 import { decodeTelnyxPayloadToPcm16, type TelnyxCodecState } from '../audio/codecDecode';
 import { attachAudioMeta, diagnosticsEnabled, markAudioSpan, probePcm } from '../diagnostics/audioProbe';
 import type { AudioMeta } from '../diagnostics/audioProbe';
@@ -55,6 +56,9 @@ export type MediaIngestOptions = {
   onRestartStreaming?: (codec: string, reason: MediaIngestUnhealthyReason) => Promise<boolean> | boolean;
   onReprompt?: (reason: MediaIngestUnhealthyReason) => void;
   maxRestartAttempts?: number;
+  isPlaybackActive?: () => boolean;
+  isListening?: () => boolean;
+  getLastSpeechStartAtMs?: () => number;
 };
 
 const DEFAULT_HEALTH_WINDOW_MS = 1000;
@@ -62,6 +66,7 @@ const DEFAULT_HEALTH_RMS_FLOOR = 0.001;
 const DEFAULT_HEALTH_MIN_FRAMES = 10;
 const DEFAULT_HEALTH_TINY_PAYLOAD_LIMIT = 10;
 const DEFAULT_HEALTH_DECODE_FAILURE_LIMIT = 5;
+const DEFAULT_HEALTH_GRACE_MS = 1200;
 const DEFAULT_FRAME_MS = 20;
 
 const TELNYX_CAPTURE_WINDOW_MS = 3000;
@@ -77,7 +82,13 @@ const SENSITIVE_KEY_REGEX = /(token|authorization|auth|signature|secret|api_key)
 function parseBoolEnv(value: string | undefined): boolean {
   if (!value) return false;
   const normalized = value.trim().toLowerCase();
-  return normalized === '1' || normalized === 'true' || normalized === 'yes';
+  if (normalized === 'true') return true;
+  if (normalized === 'false') return false;
+  return false;
+}
+
+function ingestHealthGraceMs(): number {
+  return Math.max(0, env.TELNYX_INGEST_HEALTH_GRACE_MS ?? DEFAULT_HEALTH_GRACE_MS);
 }
 
 function mediaSchemaDebugEnabled(): boolean {
@@ -165,6 +176,7 @@ function decodeTelnyxPayloadWithInfo(payload: string): { buffer: Buffer; encodin
 
 const AMRWB_FRAME_SIZES = [17, 23, 32, 36, 40, 46, 50, 58, 60];
 const AMRWB_SID_FRAME_BYTES = 5;
+const AMRWB_MIN_FRAME_BYTES = AMRWB_FRAME_SIZES[0] ?? 17;
 
 function amrWbFrameSize(ft: number): number {
   if (ft >= 0 && ft < AMRWB_FRAME_SIZES.length) return AMRWB_FRAME_SIZES[ft] ?? 0;
@@ -433,6 +445,8 @@ export class MediaIngestHealthMonitor {
   private decodeFailures = 0;
   private lastRms = 0;
   private lastPeak = 0;
+  private rollingRms = 0;
+  private rollingPeak = 0;
   private disabled = false;
   private evaluated = false;
 
@@ -447,6 +461,8 @@ export class MediaIngestHealthMonitor {
     this.decodeFailures = 0;
     this.lastRms = 0;
     this.lastPeak = 0;
+    this.rollingRms = 0;
+    this.rollingPeak = 0;
     this.evaluated = false;
   }
 
@@ -454,18 +470,32 @@ export class MediaIngestHealthMonitor {
     this.disabled = true;
   }
 
-  public recordPayload(payloadLen: number, decodedLen: number, rms: number, peak: number, decodeOk: boolean): void {
+  public recordPayload(
+    payloadLen: number,
+    decodedLen: number,
+    rms: number,
+    peak: number,
+    decodeOk: boolean,
+    meta?: { decodeFailures?: number; decodedFrames?: number; isTinyPayload?: boolean },
+  ): void {
     if (this.disabled) return;
     this.totalFrames += 1;
+    const decodeFailures = meta?.decodeFailures ?? 0;
+    const decodedFrames = meta?.decodedFrames ?? (decodeOk ? 1 : 0);
     if (!decodeOk) {
-      this.decodeFailures += 1;
+      this.decodeFailures += Math.max(1, decodeFailures);
     } else {
-      this.decodedFrames += 1;
-      if (rms < DEFAULT_HEALTH_RMS_FLOOR) this.silentFrames += 1;
+      this.decodedFrames += decodedFrames;
+      if (decodedFrames > 0 && rms < DEFAULT_HEALTH_RMS_FLOOR) this.silentFrames += decodedFrames;
     }
-    if (decodedLen < DEFAULT_HEALTH_TINY_PAYLOAD_LIMIT) this.tinyPayloadFrames += 1;
+    if (meta?.isTinyPayload) this.tinyPayloadFrames += 1;
     this.lastRms = rms;
     this.lastPeak = peak;
+    if (decodeOk) {
+      const alpha = 0.2;
+      this.rollingRms = this.rollingRms === 0 ? rms : this.rollingRms + alpha * (rms - this.rollingRms);
+      this.rollingPeak = this.rollingPeak === 0 ? peak : this.rollingPeak + alpha * (peak - this.rollingPeak);
+    }
   }
 
   public evaluate(now: number): MediaIngestUnhealthyReason | null {
@@ -493,6 +523,8 @@ export class MediaIngestHealthMonitor {
     decodeFailures: number;
     lastRms: number;
     lastPeak: number;
+    rollingRms: number;
+    rollingPeak: number;
   } {
     return {
       totalFrames: this.totalFrames,
@@ -502,7 +534,13 @@ export class MediaIngestHealthMonitor {
       decodeFailures: this.decodeFailures,
       lastRms: this.lastRms,
       lastPeak: this.lastPeak,
+      rollingRms: this.rollingRms,
+      rollingPeak: this.rollingPeak,
     };
+  }
+
+  public getStartedAtMs(): number | undefined {
+    return this.startedAtMs;
   }
 }
 
@@ -520,6 +558,15 @@ export class MediaIngest {
   private readonly onRestartStreaming?: (codec: string, reason: MediaIngestUnhealthyReason) => Promise<boolean> | boolean;
   private readonly onReprompt?: (reason: MediaIngestUnhealthyReason) => void;
   private readonly maxRestartAttempts: number;
+  private readonly isPlaybackActive?: () => boolean;
+  private readonly isListening?: () => boolean;
+  private readonly getLastSpeechStartAtMs?: () => number;
+  private readonly healthEnabled: boolean;
+  private readonly restartEnabled: boolean;
+  private readonly postPlaybackGraceMs: number;
+  private readonly minAudioMsSincePlaybackEnd: number;
+  private readonly amrwbMinDecodedBytes: number;
+  private readonly decodeFailuresBeforeFallback: number;
 
   private readonly healthMonitor = new MediaIngestHealthMonitor();
 
@@ -541,6 +588,13 @@ export class MediaIngest {
   private rxFramesInbound = 0;
   private rxFramesOutboundSkipped = 0;
   private rxFramesUnknownTrackSkipped = 0;
+  private payloadNotBase64Frames = 0;
+  private lastPlaybackActive = false;
+  private playbackEndedAtMs?: number;
+  private decodedAudioMsSincePlaybackEnd = 0;
+  private consecutiveDecodeFailures = 0;
+  private lastDecodedBytes = 0;
+  private amrwbExplicitMismatch = false;
 
   constructor(options: MediaIngestOptions) {
     this.callControlId = options.callControlId;
@@ -555,11 +609,29 @@ export class MediaIngest {
     this.onFrame = options.onFrame;
     this.onRestartStreaming = options.onRestartStreaming;
     this.onReprompt = options.onReprompt;
+    this.isPlaybackActive = options.isPlaybackActive;
+    this.isListening = options.isListening;
+    this.getLastSpeechStartAtMs = options.getLastSpeechStartAtMs;
     const maxRestartAttempts =
       typeof options.maxRestartAttempts === 'number' && Number.isFinite(options.maxRestartAttempts)
         ? options.maxRestartAttempts
         : 1;
     this.maxRestartAttempts = Math.max(0, maxRestartAttempts);
+    this.healthEnabled = env.TELNYX_INGEST_HEALTH_ENABLED ?? true;
+    this.restartEnabled = env.TELNYX_INGEST_HEALTH_RESTART_ENABLED ?? true;
+    this.postPlaybackGraceMs = Math.max(0, env.TELNYX_INGEST_POST_PLAYBACK_GRACE_MS ?? DEFAULT_HEALTH_GRACE_MS);
+    this.minAudioMsSincePlaybackEnd = Math.max(
+      0,
+      env.TELNYX_INGEST_MIN_AUDIO_MS_SINCE_PLAYBACK_END ?? 0,
+    );
+    this.amrwbMinDecodedBytes = Math.max(0, env.TELNYX_AMRWB_MIN_DECODED_BYTES ?? 0);
+    this.decodeFailuresBeforeFallback = Math.max(
+      1,
+      env.TELNYX_INGEST_DECODE_FAILURES_BEFORE_FALLBACK ?? 1,
+    );
+    if (!this.healthEnabled) {
+      this.healthMonitor.disable();
+    }
 
     this.captureState = initCaptureState(this.callControlId) ?? undefined;
     if (this.captureState) {
@@ -587,7 +659,24 @@ export class MediaIngest {
     this.handleEncodedPayload(buffer, undefined, undefined, 'binary');
   }
 
+  private updatePlaybackState(): void {
+    const playbackActive = this.isPlaybackActive?.() ?? false;
+    if (playbackActive) {
+      this.lastPlaybackActive = true;
+      this.playbackEndedAtMs = undefined;
+      this.decodedAudioMsSincePlaybackEnd = 0;
+      return;
+    }
+
+    if (this.lastPlaybackActive) {
+      this.lastPlaybackActive = false;
+      this.playbackEndedAtMs = Date.now();
+      this.decodedAudioMsSincePlaybackEnd = 0;
+    }
+  }
+
   public handleMessage(message: Record<string, unknown>): void {
+    this.updatePlaybackState();
     const event = typeof message.event === 'string' ? message.event : undefined;
 
     const capture = this.captureState;
@@ -758,7 +847,9 @@ export class MediaIngest {
     if (capture && !capture.stopped) {
       const payloadLen = trimmedPayload.length;
       capture.frameCount += 1;
-      if (payloadLen < TELNYX_CAPTURE_TINY_PAYLOAD_LEN) capture.tinyPayloadFrames += 1;
+      if (payloadLen < TELNYX_CAPTURE_TINY_PAYLOAD_LEN && currentCodec !== 'AMR-WB') {
+        capture.tinyPayloadFrames += 1;
+      }
       if (payloadLooksBase64) capture.payloadBase64Frames += 1;
       else capture.payloadNotBase64Frames += 1;
 
@@ -783,7 +874,7 @@ export class MediaIngest {
 
       const amrwbParse = currentCodec === 'AMR-WB' ? debugParseAmrWbPayload(buffer) : null;
       if (!amrwbParse?.ok && amrwbParse) {
-        log.warn(
+        log.debug(
           {
             event: 'amrwb_capture_parse_failed',
             call_control_id: this.callControlId,
@@ -831,7 +922,29 @@ export class MediaIngest {
       }
     }
 
-    if (buffer.length < 10) {
+    if (!payloadLooksBase64) {
+      this.payloadNotBase64Frames += 1;
+      if (currentCodec === 'AMR-WB') {
+        this.amrwbExplicitMismatch = true;
+      }
+      log.info(
+        {
+          event: 'media_payload_not_base64',
+          call_control_id: this.callControlId,
+          codec: currentCodec,
+          payload_len: trimmedPayload.length,
+          payload_source: payloadSource,
+          frame_seq: this.frameSeq,
+        },
+        'media payload is not base64',
+      );
+      this.healthMonitor.recordPayload(trimmedPayload.length, 0, 0, 0, false, { isTinyPayload: true });
+      this.checkHealth(currentCodec);
+      return;
+    }
+
+    const minPayloadBytes = currentCodec === 'AMR-WB' ? AMRWB_MIN_FRAME_BYTES : 10;
+    if (currentCodec !== 'AMR-WB' && buffer.length < minPayloadBytes) {
       log.info(
         {
           event: 'media_payload_suspicious',
@@ -845,7 +958,7 @@ export class MediaIngest {
         },
         'media payload too short',
       );
-      this.healthMonitor.recordPayload(trimmedPayload.length, buffer.length, 0, 0, false);
+      this.healthMonitor.recordPayload(trimmedPayload.length, buffer.length, 0, 0, false, { isTinyPayload: true });
       this.checkHealth(currentCodec);
       return;
     }
@@ -985,6 +1098,8 @@ export class MediaIngest {
     let decodeOk = false;
     let rms = 0;
     let peak = 0;
+    let decodedBytes = 0;
+    let isTinyPayload = false;
 
     const decodeResult = await decodeTelnyxPayloadToPcm16({
       encoding,
@@ -1000,12 +1115,48 @@ export class MediaIngest {
     });
 
     if (!decodeResult) {
-      this.healthMonitor.recordPayload(buffer.length, 0, 0, 0, false);
+      this.consecutiveDecodeFailures += 1;
+      this.healthMonitor.recordPayload(buffer.length, 0, 0, 0, false, { decodeFailures: 1, isTinyPayload: false });
       this.checkHealth(encoding);
       return;
     }
 
     const pcm16 = decodeResult.pcm16;
+    decodedBytes = pcm16.length * 2;
+    this.lastDecodedBytes = decodedBytes;
+    if (encoding === 'AMR-WB' && decodedBytes > 0 && decodedBytes < this.amrwbMinDecodedBytes) {
+      isTinyPayload = true;
+    }
+    if (isTinyPayload) {
+      this.consecutiveDecodeFailures += 1;
+      log.info(
+        {
+          event: 'media_payload_tiny_decoded',
+          call_control_id: this.callControlId,
+          codec: encoding,
+          decoded_bytes: decodedBytes,
+          min_decoded_bytes: this.amrwbMinDecodedBytes,
+          frame_seq: seq ?? this.frameSeq,
+        },
+        'media payload decoded too small',
+      );
+      this.healthMonitor.recordPayload(buffer.length, decodedBytes, 0, 0, false, {
+        decodeFailures: decodeResult.decodeFailures,
+        decodedFrames: decodeResult.decodedFrames,
+        isTinyPayload: true,
+      });
+      this.checkHealth(encoding);
+      return;
+    }
+
+    if (decodeResult.decodedFrames && decodeResult.decodedFrames > 0) {
+      this.consecutiveDecodeFailures = 0;
+    } else if (decodeResult.decodeFailures && decodeResult.decodeFailures > 0) {
+      this.consecutiveDecodeFailures += 1;
+    } else {
+      this.consecutiveDecodeFailures = 0;
+    }
+
     if (pcm16.length > 0) {
       const stats = computePcmStats(pcm16);
       rms = stats.rms;
@@ -1065,7 +1216,17 @@ export class MediaIngest {
       this.pendingPcm = leftover;
     }
 
-    this.healthMonitor.recordPayload(buffer.length, buffer.length, rms, peak, decodeOk);
+    if (this.playbackEndedAtMs && !this.lastPlaybackActive) {
+      const decodedMs =
+        decodeResult.sampleRateHz > 0 ? (pcm16.length / decodeResult.sampleRateHz) * 1000 : 0;
+      this.decodedAudioMsSincePlaybackEnd += decodedMs;
+    }
+
+    this.healthMonitor.recordPayload(buffer.length, decodedBytes, rms, peak, decodeOk, {
+      decodeFailures: decodeResult.decodeFailures,
+      decodedFrames: decodeResult.decodedFrames,
+      isTinyPayload,
+    });
     this.checkHealth(encoding);
 
     const now = Date.now();
@@ -1080,15 +1241,20 @@ export class MediaIngest {
           payload_source: payloadSource ?? null,
           frame_seq: seq ?? this.frameSeq,
           frames_emitted: framesEmitted,
+          decoded_bytes: this.lastDecodedBytes,
           rms: Number(stats.lastRms.toFixed(6)),
           peak: Number(stats.lastPeak.toFixed(6)),
+          rolling_rms: Number(stats.rollingRms.toFixed(6)),
+          rolling_peak: Number(stats.rollingPeak.toFixed(6)),
           decoded_frames: stats.decodedFrames,
           silent_frames: stats.silentFrames,
           tiny_payload_frames: stats.tinyPayloadFrames,
           decode_failures: stats.decodeFailures,
+          consecutive_decode_failures: this.consecutiveDecodeFailures,
           rx_frames_inbound: this.rxFramesInbound,
           rx_frames_outbound_skipped: this.rxFramesOutboundSkipped,
           rx_frames_unknown_track_skipped: this.rxFramesUnknownTrackSkipped,
+          payload_not_base64_frames: this.payloadNotBase64Frames,
         },
         'media ingest decode stats',
       );
@@ -1096,11 +1262,58 @@ export class MediaIngest {
   }
 
   private checkHealth(codec: string): void {
+    if (!this.healthEnabled) return;
     const now = Date.now();
+    const startedAt = this.healthMonitor.getStartedAtMs();
+    if (!startedAt) return;
+    const playbackActive = this.isPlaybackActive?.() ?? false;
+    const withinGrace = now - startedAt < ingestHealthGraceMs();
+    const withinPostPlaybackGrace =
+      this.playbackEndedAtMs !== undefined && now - this.playbackEndedAtMs < this.postPlaybackGraceMs;
+    const listening = this.isListening ? this.isListening() : true;
+    const audioSincePlaybackOk =
+      this.playbackEndedAtMs === undefined ||
+      this.decodedAudioMsSincePlaybackEnd >= this.minAudioMsSincePlaybackEnd;
+    const lastSpeechStartAtMs = this.getLastSpeechStartAtMs?.() ?? 0;
+    const speechDetected =
+      this.playbackEndedAtMs !== undefined
+        ? lastSpeechStartAtMs >= this.playbackEndedAtMs
+        : lastSpeechStartAtMs > 0;
     const reason = this.healthMonitor.evaluate(now);
     if (!reason || this.ingestUnhealthyLogged) return;
 
     const stats = this.healthMonitor.getStats();
+
+    if (reason === 'low_rms') {
+      const suppressReasons: string[] = [];
+      if (playbackActive) suppressReasons.push('playback_active');
+      if (withinGrace) suppressReasons.push('startup_grace');
+      if (withinPostPlaybackGrace) suppressReasons.push('post_playback_grace');
+      if (!listening) suppressReasons.push('not_listening');
+      if (!audioSincePlaybackOk) suppressReasons.push('insufficient_audio_since_playback_end');
+      if (speechDetected) suppressReasons.push('speech_detected');
+
+      if (suppressReasons.length > 0) {
+        log.info(
+          {
+            event: 'media_ingest_unhealthy_suppressed',
+            call_control_id: this.callControlId,
+            reason,
+            codec,
+            suppress_reasons: suppressReasons,
+            decoded_bytes: this.lastDecodedBytes,
+            last_rms: Number(stats.lastRms.toFixed(6)),
+            last_peak: Number(stats.lastPeak.toFixed(6)),
+            playback_active: playbackActive,
+            listening,
+            audio_ms_since_playback_end: Math.round(this.decodedAudioMsSincePlaybackEnd),
+          },
+          'media ingest unhealthy suppressed',
+        );
+        return;
+      }
+    }
+
     this.ingestUnhealthyLogged = true;
 
     log.warn(
@@ -1114,6 +1327,7 @@ export class MediaIngest {
         silent_frames: stats.silentFrames,
         tiny_payload_frames: stats.tinyPayloadFrames,
         decode_failures: stats.decodeFailures,
+        decoded_bytes: this.lastDecodedBytes,
         last_rms: Number(stats.lastRms.toFixed(6)),
         last_peak: Number(stats.lastPeak.toFixed(6)),
       },
@@ -1125,6 +1339,21 @@ export class MediaIngest {
 
   private async handleUnhealthy(reason: MediaIngestUnhealthyReason, codec: string): Promise<void> {
     if (this.transportMode !== 'pstn') {
+      this.onReprompt?.(reason);
+      return;
+    }
+
+    if (!this.restartEnabled) {
+      log.warn(
+        {
+          event: 'media_ingest_restart_suppressed',
+          call_control_id: this.callControlId,
+          reason,
+          codec,
+          suppression: 'restart_disabled',
+        },
+        'media ingest restart suppressed',
+      );
       this.onReprompt?.(reason);
       return;
     }
@@ -1142,19 +1371,26 @@ export class MediaIngest {
     this.restartAttempts += 1;
     this.healthMonitor.disable();
 
+    let requestedCodec = 'PCMU';
+    if (codec === 'AMR-WB' && !this.amrwbExplicitMismatch) {
+      if (this.consecutiveDecodeFailures < this.decodeFailuresBeforeFallback) {
+        requestedCodec = 'AMR-WB';
+      }
+    }
+
     log.warn(
       {
         event: 'media_ingest_restart_streaming',
         call_control_id: this.callControlId,
         attempt: this.restartAttempts,
         reason,
-        requested_codec: 'PCMU',
+        requested_codec: requestedCodec,
       },
       'media ingest restart streaming',
     );
 
     try {
-      const ok = await this.onRestartStreaming('PCMU', reason);
+      const ok = await this.onRestartStreaming(requestedCodec, reason);
       if (!ok) {
         log.warn(
           { event: 'media_ingest_restart_failed', call_control_id: this.callControlId, reason },

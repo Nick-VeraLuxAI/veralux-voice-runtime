@@ -3,8 +3,9 @@ import path from 'path';
 import { log } from '../log';
 import { AmrWbDecoder } from './vendor/amrwb/AmrWbDecoder';
 import { G722Decoder } from './vendor/g722/g722';
-import OpusDecoder from './vendor/opus/OpusDecoder';
 import { encodePcm16ToWav } from './postprocess';
+import { OpusPacketDecoder } from './opusDecoder';
+import { resample48kTo16k } from './resample48kTo16k';
 
 export interface TelnyxCodecState {
   amrwb?: AmrWbDecoder;
@@ -12,10 +13,12 @@ export interface TelnyxCodecState {
   amrwbFailed?: boolean;
   amrwbLastError?: string;
   g722?: G722Decoder;
-  opus?: any;
-  opusReady?: Promise<void>;
+  opus?: OpusPacketDecoder;
   opusFailed?: boolean;
+  opusChannels?: number;
+  opusLogged?: boolean;
   debugLastPostDecodeMs?: number;
+  debugLastPcmDumpMs?: number;
 }
 
 export interface DecodeTelnyxOptions {
@@ -29,6 +32,13 @@ export interface DecodeTelnyxOptions {
   allowOpus: boolean;
   state?: TelnyxCodecState;
   logContext?: Record<string, unknown>;
+}
+
+export interface DecodeTelnyxResult {
+  pcm16: Int16Array;
+  sampleRateHz: number;
+  decodedFrames?: number;
+  decodeFailures?: number;
 }
 
 export function parseTelnyxAcceptCodecs(raw: string | undefined): Set<string> {
@@ -73,6 +83,10 @@ function debugPostDecodeEnabled(): boolean {
     parseBoolEnv(process.env.TELNYX_DEBUG_TAP_POST_DECODE) ||
     parseBoolEnv(process.env.STT_DEBUG_DUMP_POST_DECODE)
   );
+}
+
+function debugPcmDumpEnabled(): boolean {
+  return parseBoolEnv(process.env.STT_DEBUG_DUMP_PCM16);
 }
 
 function debugDir(): string {
@@ -140,6 +154,51 @@ async function maybeDumpPostDecode(
   );
 }
 
+async function maybeDumpPcm16(
+  samples: Int16Array,
+  sampleRateHz: number,
+  encoding: string,
+  state: TelnyxCodecState | undefined,
+  logContext: Record<string, unknown> | undefined,
+): Promise<void> {
+  if (!debugPcmDumpEnabled()) return;
+  const now = Date.now();
+  if (state?.debugLastPcmDumpMs && now - state.debugLastPcmDumpMs < DEBUG_POST_DECODE_INTERVAL_MS) {
+    return;
+  }
+  if (state) state.debugLastPcmDumpMs = now;
+
+  const callId = typeof logContext?.call_control_id === 'string' ? logContext.call_control_id : 'unknown';
+  const dir = debugDir();
+  const filePath = path.join(dir, `post_decode_${callId}_${now}.pcm`);
+
+  try {
+    await fs.promises.mkdir(dir, { recursive: true });
+    const buffer = Buffer.from(samples.buffer, samples.byteOffset, samples.byteLength);
+    await fs.promises.writeFile(filePath, buffer);
+  } catch (error) {
+    log.warn(
+      { event: 'stt_post_decode_pcm_failed', encoding, file_path: filePath, err: error, ...(logContext ?? {}) },
+      'stt post-decode PCM dump failed',
+    );
+    return;
+  }
+
+  const stats = computePcmStats(samples);
+  log.info(
+    {
+      event: 'stt_post_decode_pcm',
+      encoding,
+      sample_rate_hz: sampleRateHz,
+      samples: samples.length,
+      rms: Number(stats.rms.toFixed(6)),
+      peak: Number(stats.peak.toFixed(6)),
+      file_path: filePath,
+      ...(logContext ?? {}),
+    },
+    'stt post-decode pcm',
+  );
+}
 function clampInt16(value: number): number {
   if (value > 32767) return 32767;
   if (value < -32768) return -32768;
@@ -349,7 +408,7 @@ function parseAmrWbOctetAligned(payload: Buffer, startOffset: number): Buffer[] 
   return frames.length ? frames : null;
 }
 
-function splitAmrWbPayload(payload: Buffer): Buffer[] | null {
+function splitAmrWbPayloadNoStrip(payload: Buffer): Buffer[] | null {
   if (payload.length === 0) {
     return null;
   }
@@ -372,9 +431,24 @@ function splitAmrWbPayload(payload: Buffer): Buffer[] | null {
   return parseAmrWbOctetAligned(payload, 0);
 }
 
+function splitAmrWbPayload(payload: Buffer): { frames: Buffer[]; strippedBytes: number } | null {
+  const direct = splitAmrWbPayloadNoStrip(payload);
+  if (direct) {
+    return { frames: direct, strippedBytes: 0 };
+  }
+  for (const strip of [1, 2]) {
+    if (payload.length <= strip) continue;
+    const stripped = splitAmrWbPayloadNoStrip(payload.subarray(strip));
+    if (stripped) {
+      return { frames: stripped, strippedBytes: strip };
+    }
+  }
+  return null;
+}
+
 export async function decodeTelnyxPayloadToPcm16(
   opts: DecodeTelnyxOptions,
-): Promise<{ pcm16: Int16Array; sampleRateHz: number } | null> {
+): Promise<DecodeTelnyxResult | null> {
   const encoding = opts.encoding.trim().toUpperCase();
   const channels = opts.channels ?? 1;
   const targetRate = opts.targetSampleRateHz;
@@ -383,14 +457,18 @@ export async function decodeTelnyxPayloadToPcm16(
     const pcm = decodePcmu(opts.payload);
     const mono = downmixInterleaved(pcm, channels);
     const resampled = resamplePcm16(mono, 8000, targetRate);
-    return { pcm16: resampled, sampleRateHz: targetRate };
+    await maybeDumpPostDecode(resampled, targetRate, encoding, opts.state, opts.logContext);
+    await maybeDumpPcm16(resampled, targetRate, encoding, opts.state, opts.logContext);
+    return { pcm16: resampled, sampleRateHz: targetRate, decodedFrames: 1 };
   }
 
   if (encoding === 'PCMA') {
     const pcm = decodePcma(opts.payload);
     const mono = downmixInterleaved(pcm, channels);
     const resampled = resamplePcm16(mono, 8000, targetRate);
-    return { pcm16: resampled, sampleRateHz: targetRate };
+    await maybeDumpPostDecode(resampled, targetRate, encoding, opts.state, opts.logContext);
+    await maybeDumpPcm16(resampled, targetRate, encoding, opts.state, opts.logContext);
+    return { pcm16: resampled, sampleRateHz: targetRate, decodedFrames: 1 };
   }
 
   if (encoding === 'AMR-WB') {
@@ -415,23 +493,34 @@ export async function decodeTelnyxPayloadToPcm16(
       }
     }
     try {
-      const frames = splitAmrWbPayload(opts.payload);
-      const framesToDecode = frames ?? [opts.payload];
-      if (frames && frames.length === 1 && frames[0].length !== opts.payload.length) {
+      const splitResult = splitAmrWbPayload(opts.payload);
+      const framesToDecode = splitResult?.frames ?? [opts.payload];
+      if (splitResult && splitResult.strippedBytes > 0 && state.amrwbLastError !== 'amrwb_header_stripped') {
+        state.amrwbLastError = 'amrwb_header_stripped';
+        log.info(
+          {
+            event: 'amrwb_header_stripped',
+            payload_len: opts.payload.length,
+            stripped_bytes: splitResult.strippedBytes,
+            ...(opts.logContext ?? {}),
+          },
+          'amr-wb header stripped before decode',
+        );
+      } else if (splitResult && splitResult.frames.length === 1 && splitResult.frames[0].length !== opts.payload.length) {
         if (state.amrwbLastError !== 'amrwb_header_stripped') {
           state.amrwbLastError = 'amrwb_header_stripped';
           log.info(
             {
               event: 'amrwb_header_stripped',
               payload_len: opts.payload.length,
-              frame_len: frames[0].length,
+              frame_len: splitResult.frames[0].length,
               ...(opts.logContext ?? {}),
             },
             'amr-wb header stripped before decode',
           );
         }
       }
-      if (!frames && state.amrwbLastError !== 'amrwb_packet_parse_failed') {
+      if (!splitResult && state.amrwbLastError !== 'amrwb_packet_parse_failed') {
         state.amrwbLastError = 'amrwb_packet_parse_failed';
         log.warn(
           {
@@ -445,16 +534,26 @@ export async function decodeTelnyxPayloadToPcm16(
 
       const chunks: Int16Array[] = [];
       let totalSamples = 0;
+      let decodeFailures = 0;
+      let decodedFrames = 0;
       for (const frame of framesToDecode) {
         if (frame.length === AMRWB_SID_FRAME_BYTES) {
           continue;
         }
-        const decoded = state.amrwb.decodeFrame(new Uint8Array(frame));
-        chunks.push(decoded);
-        totalSamples += decoded.length;
+        try {
+          const decoded = state.amrwb.decodeFrame(new Uint8Array(frame));
+          chunks.push(decoded);
+          totalSamples += decoded.length;
+          decodedFrames += 1;
+        } catch (error) {
+          decodeFailures += 1;
+        }
+      }
+      if (totalSamples === 0 && decodeFailures > 0) {
+        return null;
       }
       if (totalSamples === 0) {
-        return { pcm16: new Int16Array(0), sampleRateHz: targetRate };
+        return { pcm16: new Int16Array(0), sampleRateHz: targetRate, decodedFrames: 0, decodeFailures };
       }
 
       const merged = new Int16Array(totalSamples);
@@ -465,7 +564,14 @@ export async function decodeTelnyxPayloadToPcm16(
       }
 
       const resampled = resamplePcm16(merged, 16000, targetRate);
-      return { pcm16: resampled, sampleRateHz: targetRate };
+      await maybeDumpPostDecode(resampled, targetRate, encoding, state, opts.logContext);
+      await maybeDumpPcm16(resampled, targetRate, encoding, state, opts.logContext);
+      return {
+        pcm16: resampled,
+        sampleRateHz: targetRate,
+        decodedFrames,
+        decodeFailures,
+      };
     } catch (error) {
       state.amrwbLastError = error instanceof Error ? error.message : 'amrwb_decode_failed';
       return null;
@@ -483,7 +589,9 @@ export async function decodeTelnyxPayloadToPcm16(
     const decoded = state.g722.decode(opts.payload);
     const mono = downmixInterleaved(decoded, channels);
     const resampled = resamplePcm16(mono, 16000, targetRate);
-    return { pcm16: resampled, sampleRateHz: targetRate };
+    await maybeDumpPostDecode(resampled, targetRate, encoding, state, opts.logContext);
+    await maybeDumpPcm16(resampled, targetRate, encoding, state, opts.logContext);
+    return { pcm16: resampled, sampleRateHz: targetRate, decodedFrames: 1 };
   }
 
   if (encoding === 'OPUS') {
@@ -504,10 +612,10 @@ export async function decodeTelnyxPayloadToPcm16(
     }
 
     const state = opts.state ?? {};
-    if (!state.opus && !state.opusFailed) {
+    if ((!state.opus || state.opusChannels !== channels) && !state.opusFailed) {
       try {
-        state.opus = new OpusDecoder();
-        state.opusReady = state.opus.ready;
+        state.opus = new OpusPacketDecoder(channels);
+        state.opusChannels = channels;
       } catch (error) {
         state.opusFailed = true;
         log.warn(
@@ -522,28 +630,44 @@ export async function decodeTelnyxPayloadToPcm16(
       return null;
     }
 
-    if (state.opusReady) {
-      try {
-        await state.opusReady;
-      } catch (error) {
-        state.opusFailed = true;
-        log.warn(
-          { err: error, event: 'opus_decoder_ready_failed', ...(opts.logContext ?? {}) },
-          'Opus decoder ready failed',
-        );
-        return null;
-      }
-    }
-
-    const result = state.opus.decodeFrame(new Uint8Array(opts.payload));
-    if (!result || !isFloat32ArrayArray(result.channelData)) {
+    let pcm = new Int16Array(0);
+    try {
+      const decoded = state.opus.decode(opts.payload);
+      const mono = downmixInterleaved(decoded, channels);
+      pcm = new Int16Array(mono);
+    } catch (error) {
+      log.warn(
+        { err: error, event: 'opus_decode_failed', ...(opts.logContext ?? {}) },
+        'Opus decode failed',
+      );
       return null;
     }
-    const monoFloat = downmixFloat32(result.channelData);
-    const pcm = floatToPcm16(monoFloat);
-    const inputRate = typeof result.sampleRate === 'number' ? result.sampleRate : DEFAULT_OPUS_SAMPLE_RATE;
-    const resampled = resamplePcm16(pcm, inputRate, targetRate);
-    return { pcm16: resampled, sampleRateHz: targetRate };
+
+    const inputRate = DEFAULT_OPUS_SAMPLE_RATE;
+    const resampled =
+      inputRate === 48000 && targetRate === 16000
+        ? resample48kTo16k(pcm)
+        : resamplePcm16(pcm, inputRate, targetRate);
+
+    if (!state.opusLogged) {
+      state.opusLogged = true;
+      log.info(
+        {
+          event: 'opus_decode_success',
+          input_bytes: opts.payload.length,
+          input_rate_hz: inputRate,
+          output_rate_hz: targetRate,
+          decoded_samples: pcm.length,
+          output_samples: resampled.length,
+          ...(opts.logContext ?? {}),
+        },
+        'Opus packet decoded',
+      );
+    }
+
+    await maybeDumpPostDecode(resampled, targetRate, encoding, state, opts.logContext);
+    await maybeDumpPcm16(resampled, targetRate, encoding, state, opts.logContext);
+    return { pcm16: resampled, sampleRateHz: targetRate, decodedFrames: 1 };
   }
 
   return null;
