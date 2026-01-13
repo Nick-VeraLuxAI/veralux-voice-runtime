@@ -613,6 +613,57 @@ async function dumpTelnyxRawPayload(callControlId: string, payload: string, buff
   }
 }
 
+const TELNYX_RAW_PAYLOAD_PATH = '/tmp/telnyx_payload_raw.bin';
+const rawPayloadInitPromises = new Map<string, Promise<void>>();
+
+async function initTelnyxRawPayloadCapture(callControlId: string): Promise<void> {
+  if (!telnyxTapRawEnabled()) return;
+  const existing = rawPayloadInitPromises.get(callControlId);
+  if (existing) return existing;
+
+  const initPromise = (async () => {
+    try {
+      await fs.promises.writeFile(TELNYX_RAW_PAYLOAD_PATH, Buffer.alloc(0));
+      log.info(
+        { event: 'telnyx_raw_capture_init', call_control_id: callControlId, path: TELNYX_RAW_PAYLOAD_PATH },
+        'telnyx raw capture initialized',
+      );
+    } catch (error) {
+      log.warn(
+        { event: 'telnyx_raw_capture_init_failed', call_control_id: callControlId, err: error },
+        'telnyx raw capture init failed',
+      );
+    }
+  })();
+
+  rawPayloadInitPromises.set(callControlId, initPromise);
+  return initPromise;
+}
+
+async function captureTelnyxRawPayloadFrame(callControlId: string, payload: string): Promise<void> {
+  if (!telnyxTapRawEnabled()) return;
+  try {
+    await initTelnyxRawPayloadCapture(callControlId);
+    const decoded = decodeTelnyxPayloadWithInfo(payload);
+    const buffer = decoded.buffer;
+    await fs.promises.appendFile(TELNYX_RAW_PAYLOAD_PATH, buffer);
+    log.info(
+      {
+        event: 'telnyx_raw_payload_frame',
+        call_control_id: callControlId,
+        decoded_len: buffer.length,
+        hex_prefix: buffer.subarray(0, 20).toString('hex'),
+      },
+      'telnyx raw payload frame captured',
+    );
+  } catch (error) {
+    log.warn(
+      { event: 'telnyx_raw_payload_frame_failed', call_control_id: callControlId, err: error },
+      'telnyx raw payload frame capture failed',
+    );
+  }
+}
+
 function parseMediaRequest(request: http.IncomingMessage): { callControlId: string; token: string | null } | null {
   if (!request.url) return null;
 
@@ -674,6 +725,7 @@ function attachMediaWebSocketServer(server: http.Server, sessionManager: Session
     }
 
     sessionManager.registerMediaConnection(callControlId, ws);
+    void initTelnyxRawPayloadCapture(callControlId);
 
     const transportMode = sessionManager.getTransportMode(callControlId) ?? env.TRANSPORT_MODE;
     const ingest = new MediaIngest({
@@ -690,8 +742,26 @@ function attachMediaWebSocketServer(server: http.Server, sessionManager: Session
       isPlaybackActive: () => sessionManager.isPlaybackActive(callControlId),
       isListening: () => sessionManager.isListening(callControlId),
       getLastSpeechStartAtMs: () => sessionManager.getLastSpeechStartAtMs(callControlId),
+
+      onAcceptedPayload: (tap) => {
+        log.info(
+          {
+            event: 'media_ingest_accepted_payload',
+            call_control_id: tap.callControlId,
+            codec: tap.codec,
+            track: tap.track ?? null,
+            seq: tap.seq ?? null,
+            timestamp: tap.timestamp ?? null,
+            payload_source: tap.payloadSource ?? null,
+            decoded_len: tap.decodedLen,
+            hex_prefix: tap.hexPrefix,
+          },
+          'accepted payload (post-gating)',
+        );
+      },
+
       onFrame: (frame) => {
-        const ok = sessionManager.pushPcm16(callControlId, frame.pcm16, frame.sampleRateHz);
+        const ok = sessionManager.pushPcm16Frame(callControlId, frame);
         if (!ok) log.warn({ event: 'media_orphan_frame', call_control_id: callControlId }, 'media orphan frame');
       },
       onRestartStreaming: async (codec, reason) => {
@@ -757,8 +827,9 @@ function attachMediaWebSocketServer(server: http.Server, sessionManager: Session
         return;
       }
 
-      ingest.handleMessage(message);
       const event = typeof message.event === 'string' ? message.event : undefined;
+
+      ingest.handleMessage(message);
       if (event === 'stop') {
         ws.close(1000, 'media_stop');
       }

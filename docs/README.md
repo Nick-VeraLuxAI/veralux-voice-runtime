@@ -12,3 +12,4 @@ High-level documentation for the Veralux Voice Runtime.
 - Troubleshooting: troubleshooting.md
 - Limitations: limitations.md
 - Redis contract: redis_contract_report.md
+- File guide: file-guide.md

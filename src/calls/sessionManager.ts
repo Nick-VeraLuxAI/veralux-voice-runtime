@@ -4,6 +4,7 @@ import { incInboundAudioFrames, incInboundAudioFramesDropped } from '../metrics'
 import { CallSession } from './callSession';
 import { CallSessionConfig, CallSessionId } from './types';
 import type { TransportMode, TransportSession } from '../transport/types';
+import type { Pcm16Frame } from '../media/types';
 
 const DEFAULT_IDLE_TTL_MINUTES = 10;
 const DEFAULT_SWEEP_INTERVAL_MS = 60_000;
@@ -373,19 +374,46 @@ export class SessionManager {
   }
 
   public pushPcm16(callControlId: CallSessionId, pcm16: Int16Array, sampleRateHz: number): boolean {
-    if (sampleRateHz <= 0) {
+    return this.pushPcm16Frame(callControlId, { pcm16, sampleRateHz, channels: 1 });
+  }
+
+  public pushPcm16Frame(callControlId: CallSessionId, frame: Pcm16Frame): boolean {
+    incInboundAudioFrames();
+
+    const session = this.sessions.get(callControlId);
+    if (!session) {
+      incInboundAudioFramesDropped('missing_session');
+      log.warn(
+        { event: 'call_session_missing_pcm16', call_control_id: callControlId },
+        'missing session for pcm16',
+      );
+      return false;
+    }
+
+    if (!session.isActive() || session.getState() === 'ENDED') {
+      incInboundAudioFramesDropped('inactive_session');
+      log.warn(
+        { event: 'call_session_pcm16_ended', call_control_id: callControlId },
+        'session ended for pcm16',
+      );
+      return false;
+    }
+
+    if (frame.sampleRateHz <= 0) {
       log.warn(
         {
           event: 'call_session_pcm16_invalid_rate',
           call_control_id: callControlId,
-          sample_rate_hz: sampleRateHz,
+          sample_rate_hz: frame.sampleRateHz,
         },
-        'invalid pcm16 sample rate',
+        'invalid pcm16 rate',
       );
     }
-    const buffer = Buffer.from(pcm16.buffer, pcm16.byteOffset, pcm16.byteLength);
-    return this.pushAudio(callControlId, buffer);
+
+    session.onPcm16Frame(frame);
+    return true;
   }
+
 
   public registerMediaConnection(callControlId: CallSessionId, connection: MediaConnection): void {
     const connections = this.mediaConnections.get(callControlId) ?? new Set<MediaConnection>();

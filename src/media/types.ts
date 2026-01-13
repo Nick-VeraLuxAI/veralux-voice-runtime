@@ -8,6 +8,12 @@ export interface MediaStreamConfig {
 
 export type MediaFrame = Buffer;
 
+export type Pcm16Frame = {
+  pcm16: Int16Array;
+  sampleRateHz: number;
+  channels: 1;
+};
+
 export interface MediaFrameEnvelope {
   data: Buffer;
   timestampMs?: number;

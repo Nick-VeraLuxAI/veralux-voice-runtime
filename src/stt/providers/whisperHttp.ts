@@ -7,6 +7,8 @@ import type { STTProvider } from '../provider';
 import type { STTAudioInput, STTOptions, STTTranscript } from '../types';
 import type { AudioMeta } from '../../diagnostics/audioProbe';
 import { appendLineage, probeWav } from '../../diagnostics/audioProbe';
+import { assertLooksLikeWav } from '../wavGuard';
+import { preWhisperGate } from '../../audio/preWhisperGate';
 
 const WAV_SAMPLE_RATE_HZ = 16000;
 const PCM_8K_SAMPLE_RATE_HZ = 8000;
@@ -29,6 +31,7 @@ const mediaDebugEnabled = (): boolean => {
 };
 
 const whisperDumpEnabled = (): boolean => parseBoolEnv(process.env.STT_DEBUG_DUMP_WHISPER_WAVS);
+const preWhisperGateEnabled = (): boolean => parseBoolEnv(process.env.STT_PREWHISPER_GATE);
 
 function debugDir(): string {
   return process.env.STT_DEBUG_DIR && process.env.STT_DEBUG_DIR.trim() !== ''
@@ -305,8 +308,46 @@ export class WhisperHttpProvider implements STTProvider {
       logContext: opts.logContext ?? opts.audioMeta?.logContext,
       kind: opts.isPartial ? 'partial' : 'final',
     };
-    const { wav: wavPayload, meta: wavMeta } = prepareWavPayload(audio, baseMeta);
-    const audioMs = computeAudioMs(audio, wavPayload);
+    const gateEnabled = preWhisperGateEnabled();
+    const callControlId = extractCallControlId(opts.logContext) ?? 'unknown';
+    let wavPayload: Buffer;
+    let wavMeta: AudioMeta;
+    let audioForMetrics = audio;
+    let logEncoding = audio.encoding;
+    let logSampleRateHz = audio.sampleRateHz;
+
+    if (gateEnabled) {
+      const gate = await preWhisperGate({
+        buf: audio.audio,
+        hints: {
+          codec: opts.audioMeta?.codec ?? audio.encoding,
+          sampleRate: audio.sampleRateHz,
+          channels: audio.channels ?? 1,
+          callId: callControlId,
+        },
+      });
+      wavPayload = gate.wav16kMono;
+      wavMeta = appendLineage(baseMeta, 'prewhisper_gate');
+      wavMeta = { ...wavMeta, sampleRateHz: WAV_SAMPLE_RATE_HZ, channels: 1, bitDepth: 16, format: 'wav' };
+      audioForMetrics = {
+        audio: wavPayload,
+        sampleRateHz: WAV_SAMPLE_RATE_HZ,
+        encoding: 'wav',
+        channels: 1,
+      };
+      logEncoding = 'wav';
+      logSampleRateHz = WAV_SAMPLE_RATE_HZ;
+    } else {
+      const prepared = prepareWavPayload(audio, baseMeta);
+      wavPayload = prepared.wav;
+      wavMeta = prepared.meta;
+    }
+    assertLooksLikeWav(wavPayload, {
+      provider: 'whisper_http',
+      wav_bytes: wavPayload.length,
+      ...(opts.logContext ?? {}),
+    });
+    const audioMs = computeAudioMs(audioForMetrics, wavPayload);
     const tenantLabel = typeof opts.logContext?.tenant_id === 'string' ? opts.logContext.tenant_id : 'unknown';
     const whisperStage = opts.isPartial ? 'partial' : 'final';
     const stageLabel = opts.isPartial ? 'stt_whisper_http_partial' : 'stt_whisper_http_final';
@@ -328,7 +369,7 @@ export class WhisperHttpProvider implements STTProvider {
       log.info(
         {
           event: 'whisper_request',
-          encoding: audio.encoding,
+          encoding: logEncoding,
           wav_bytes: wavPayload.length,
         },
         'whisper request',
@@ -340,6 +381,22 @@ export class WhisperHttpProvider implements STTProvider {
     let response: Response;
     let httpMs = 0;
     try {
+      log.info(
+        {
+          event: 'stt_whisper_http_request_start',
+          tenant_id: tenantLabel,
+          kind: whisperStage,
+          whisper_url: whisperUrl,
+          encoding: logEncoding,
+          sampleRateHz: logSampleRateHz,
+          wav_bytes: wavPayload.length,
+          audio_ms: audioMs,
+          language: opts.language ?? null,
+          ...(opts.logContext ?? {}),
+        },
+        'stt whisper http request start',
+      );
+
       response = await fetch(whisperUrl, {
         method: 'POST',
         headers: {
@@ -357,8 +414,8 @@ export class WhisperHttpProvider implements STTProvider {
           tenant_id: tenantLabel,
           kind: whisperStage,
           whisper_stage: whisperStage,
-          encoding: audio.encoding,
-          sampleRateHz: audio.sampleRateHz,
+          encoding: logEncoding,
+          sampleRateHz: logSampleRateHz,
           audio_bytes: wavPayload.length,
           audio_ms: audioMs,
           http_ms: httpMs,
@@ -381,8 +438,8 @@ export class WhisperHttpProvider implements STTProvider {
         tenant_id: tenantLabel,
         kind: whisperStage,
         whisper_stage: whisperStage,
-        encoding: audio.encoding,
-        sampleRateHz: audio.sampleRateHz,
+        encoding: logEncoding,
+        sampleRateHz: logSampleRateHz,
         audio_bytes: wavPayload.length,
         audio_ms: audioMs,
         http_ms: httpMs,

@@ -26,6 +26,24 @@ const sttRmsFloorFallback = (value: unknown): unknown => {
   return emptyToUndefined(process.env.STT_RMS_THRESHOLD);
 };
 
+const numberFromEnv = (value: unknown): unknown => {
+  if (typeof value === 'boolean') return NaN;
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    if (trimmed === '') return undefined;
+    const normalized = trimmed.toLowerCase();
+    if (normalized === 'true' || normalized === 'false') return NaN;
+    return trimmed;
+  }
+  return value;
+};
+
+const sttFramesRequiredFallback = (value: unknown): unknown => {
+  const normalized = numberFromEnv(value);
+  if (normalized !== undefined) return normalized;
+  return numberFromEnv(process.env.STT_FRAMES_REQUIRED);
+};
+
 const ttsSampleRateFallback = (value: unknown): unknown => {
   const normalized = emptyToUndefined(value);
   if (normalized !== undefined) return normalized;
@@ -126,6 +144,7 @@ const EnvSchema = z.object({
 
   /* ───────────────────────── STT (Whisper) ───────────────────────── */
   WHISPER_URL: z.string().min(1),
+  ALLOW_HTTP_WAV_JSON: z.preprocess(stringToBoolean, z.boolean().default(false)),
 
   STT_CHUNK_MS: z.coerce.number().int().positive(),
   STT_SILENCE_MS: z.coerce.number().int().positive(),
@@ -193,7 +212,7 @@ const EnvSchema = z.object({
     z.coerce.number().positive().default(0.05),
   ),
   STT_SPEECH_FRAMES_REQUIRED: z.preprocess(
-    emptyToUndefined,
+    sttFramesRequiredFallback,
     z.coerce.number().int().positive().optional(),
   ),
 

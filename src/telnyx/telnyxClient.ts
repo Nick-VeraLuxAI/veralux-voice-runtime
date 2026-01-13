@@ -284,7 +284,7 @@ export async function telnyxCallControl(
       const { media_format: _mediaFormat, ...rest } = body;
       normalizedBody = {
         ...rest,
-        stream_codec: process.env.TELNYX_STREAM_CODEC ?? 'PCMU',
+        stream_codec: process.env.TELNYX_STREAM_CODEC ?? 'AMR-WB',
 
       };
     }

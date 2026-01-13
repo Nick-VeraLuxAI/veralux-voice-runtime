@@ -4,7 +4,7 @@ import { env } from '../env';
 import { log } from '../log';
 import { describeWavHeader, parseWavInfo } from '../audio/wavInfo';
 import { runPlaybackPipeline } from '../audio/playbackPipeline';
-import { MediaFrame } from '../media/types';
+import { MediaFrame, type Pcm16Frame } from '../media/types';
 import { storeWav } from '../storage/audioStore';
 import {
   ChunkedSTT,
@@ -114,6 +114,11 @@ export class CallSession {
   private rxDumpSamplesTarget = 0;
   private rxDumpSamplesCollected = 0;
   private rxDumpBuffers: Buffer[] = [];
+  private listeningSinceAtMs = 0;
+  // pick reasonable defaults; you can env-ize later
+  private readonly deadAirListeningGraceMs = 1200;  // prevents immediate reprompt right after enter LISTENING
+  private readonly deadAirAfterSpeechStartGraceMs = 1500; // prevents reprompt while user has started speaking but transcript not ready
+
 
   constructor(config: CallSessionConfig) {
     this.callControlId = config.callControlId;
@@ -155,6 +160,19 @@ export class CallSession {
 
     const sttMode = this.sttConfig?.mode ?? 'whisper_http';
     const provider = getProvider(sttMode) as unknown as ChunkedSttProvider;
+    const selectedMode =
+      sttMode === 'http_wav_json' && !env.ALLOW_HTTP_WAV_JSON ? 'whisper_http' : sttMode;
+    log.info(
+      {
+        event: 'stt_provider_selected',
+        call_control_id: this.callControlId,
+        stt_mode: selectedMode,
+        requested_mode: sttMode,
+        provider_id: provider.id,
+        ...(this.logContext ?? {}),
+      },
+      'stt provider selected',
+    );
     const sttAudioInput =
       this.transport.mode === 'pstn'
         ? { codec: 'pcm16le' as const, sampleRateHz: env.TELNYX_TARGET_SAMPLE_RATE }
@@ -232,6 +250,37 @@ export class CallSession {
     incSttFramesFed();
     this.maybeCaptureRxDump(frame);
     this.stt.ingest(frame);
+  }
+
+  public onPcm16Frame(frame: Pcm16Frame): void {
+    if (!this.active || this.state === 'ENDED') {
+      return;
+    }
+
+    this.lastDecodedFrameAtMs = Date.now();
+
+    if (this.state === 'INIT' || this.state === 'ANSWERED') {
+      this.enterListeningState();
+    } 
+
+    this.metrics.lastHeardAt = new Date();
+
+    if (frame.sampleRateHz !== this.rxSampleRateHz) {
+      log.warn(
+        {
+          event: 'stt_sample_rate_mismatch',
+          expected_hz: this.rxSampleRateHz,
+          got_hz: frame.sampleRateHz,
+          ...this.logContext,
+        },
+        'stt sample rate mismatch',
+      );
+    }
+
+    const pcmBuffer = Buffer.from(frame.pcm16.buffer, frame.pcm16.byteOffset, frame.pcm16.byteLength);
+    incSttFramesFed();
+    this.maybeCaptureRxDump(pcmBuffer);
+    this.stt.ingestPcm16(frame.pcm16, frame.sampleRateHz);
   }
 
   public isPlaybackActive(): boolean {
@@ -575,8 +624,10 @@ export class CallSession {
     }
 
     this.state = 'LISTENING';
+    this.listeningSinceAtMs = Date.now();
     this.scheduleDeadAirTimer();
   }
+
 
   private scheduleDeadAirTimer(): void {
     if (!this.active || this.state !== 'LISTENING') {
@@ -671,19 +722,41 @@ export class CallSession {
   }
 
   private async handleDeadAirTimeout(): Promise<void> {
-    // FIX (TS2367): remove redundant `this.state === 'ENDED'` check.
-    // If state isn't LISTENING, we already return.
     if (!this.active || this.state !== 'LISTENING' || this.repromptInFlight) {
       return;
     }
 
+    // If we're currently processing a transcript, don't reprompt.
     if (this.isHandlingTranscript) {
       this.scheduleDeadAirTimer();
       return;
     }
 
     const now = Date.now();
+
+    // 1) Grace right after we enter LISTENING (prevents greet/playback -> listening race)
+    if (this.listeningSinceAtMs > 0 && now - this.listeningSinceAtMs < this.deadAirListeningGraceMs) {
+      this.scheduleDeadAirTimer();
+      return;
+    }
+
+    // 2) If we recently detected speech start, assume user is talking and STT is behind.
+    if (this.lastSpeechStartAtMs > 0 && now - this.lastSpeechStartAtMs < this.deadAirAfterSpeechStartGraceMs) {
+      this.scheduleDeadAirTimer();
+      return;
+    }
+
+    // 3) If we are still receiving frames recently, don't reprompt.
+    // If frames are still arriving, do NOT treat this as "no-frames" dead air.
     if (this.lastDecodedFrameAtMs > 0 && now - this.lastDecodedFrameAtMs < this.deadAirNoFramesMs) {
+      // frames are alive; just wait for next deadAirMs tick
+      this.scheduleDeadAirTimer();
+      return;
+    }
+
+
+    // 4) Extra safety: never reprompt if playback/tts is active (should already be true, but safe)
+    if (this.isPlaybackActive()) {
       this.scheduleDeadAirTimer();
       return;
     }
@@ -695,10 +768,12 @@ export class CallSession {
     } finally {
       this.repromptInFlight = false;
       if (this.state === 'LISTENING') {
+        this.listeningSinceAtMs = Date.now(); // reset grace so it doesn't immediately fire again
         this.scheduleDeadAirTimer();
       }
     }
   }
+
 
   private async handleTranscript(
     text: string,

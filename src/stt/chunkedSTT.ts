@@ -2,7 +2,10 @@ import { env } from '../env';
 import { log } from '../log';
 import { incStageError, observeStageDuration, startStageTimer } from '../metrics';
 import type { AudioMeta } from '../diagnostics/audioProbe';
-import { appendLineage, attachAudioMeta, getAudioMeta, markAudioSpan, probePcm } from '../diagnostics/audioProbe';
+import { appendLineage, attachAudioMeta, getAudioMeta, markAudioSpan, probePcm } from '../diagnostics/audioProbe'
+import { postprocessPcm16 } from '../audio/postprocess';
+
+
 
 type FinalReason = 'silence' | 'stop' | 'max';
 
@@ -82,7 +85,7 @@ const DEFAULT_HIGHPASS_CUTOFF_HZ = 100;
 
 // Speech detection defaults (your env.ts may override)
 const DEFAULT_SPEECH_RMS_FLOOR = 0.03;
-const DEFAULT_SPEECH_PEAK_FLOOR = 0.08;
+const DEFAULT_SPEECH_PEAK_FLOOR = 0.1;
 const DEFAULT_SPEECH_FRAMES_REQUIRED = 8;
 
 function clamp(n: number, min: number, max: number): number {
@@ -317,7 +320,7 @@ export class ChunkedSTT {
         env.STT_SPEECH_FRAMES_REQUIRED ?? DEFAULT_SPEECH_FRAMES_REQUIRED,
       ),
       1,
-      6,
+      30,
     );
     this.disableGates = env.STT_DISABLE_GATES ?? false;
 
@@ -482,6 +485,24 @@ export class ChunkedSTT {
     );
   }
 
+  public ingestPcm16(pcm16: Int16Array, sampleRateHz: number): void {
+    if (!pcm16 || pcm16.length === 0) return;
+    if (sampleRateHz !== this.sampleRate) {
+      log.warn(
+        {
+          event: 'chunked_stt_sample_rate_mismatch',
+          expected_hz: this.sampleRate,
+          got_hz: sampleRateHz,
+          ...(this.logContext ?? {}),
+        },
+        'chunked stt sample rate mismatch',
+      );
+      return;
+    }
+    const buf = Buffer.from(pcm16.buffer, pcm16.byteOffset, pcm16.byteLength);
+    this.ingest(buf);
+  }
+
   public ingest(pcm: Buffer): void {
     if (!pcm || pcm.length === 0) return;
 
@@ -521,7 +542,29 @@ export class ChunkedSTT {
       attachAudioMeta(pcm, rawMeta);
     }
 
-    let frame = this.inputCodec === 'pcmu' ? pcmuToPcm16le(pcm) : pcm;
+    let frame =
+      this.inputCodec === 'pcmu'
+        ? pcmuToPcm16le(pcm)
+        : pcm;
+
+    // 🔑 APPLY RX POSTPROCESS HERE
+    // 🔑 APPLY RX POSTPROCESS HERE (SAFE LE PCM16 <-> Int16)
+    const sampleCount = Math.floor(frame.length / 2);
+    const safePcm = new Int16Array(sampleCount);
+    for (let i = 0; i < sampleCount; i += 1) {
+      safePcm[i] = frame.readInt16LE(i * 2);
+    }
+
+    const processed = postprocessPcm16(safePcm, this.sampleRate);
+
+    const out = Buffer.allocUnsafe(processed.samples.length * 2);
+    for (let i = 0; i < processed.samples.length; i += 1) {
+      out.writeInt16LE(processed.samples[i]!, i * 2);
+    }
+    frame = out;
+
+
+
     let decodedMeta = appendLineage(
       rawMeta,
       this.inputCodec === 'pcmu' ? 'decode:pcmu->pcm16le' : 'passthrough:pcm16le',
