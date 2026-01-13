@@ -1496,10 +1496,7 @@ export async function decodeTelnyxPayloadToPcm16(opts: DecodeTelnyxOptions): Pro
       return null;
     }
 
-    // Fill in non-speech frames with silence so timing stays stable.
-    if (dep.frameTypes.length > 0) {
-      decoded.pcm16 = expandAmrWbPcmWithSilence(decoded.pcm16, dep.frameTypes, samplesPerFrame);
-    }
+
 
     const actualSamples = decoded.pcm16.length;
     const zeroCount = countZeroSamples(decoded.pcm16);

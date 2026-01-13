@@ -1586,6 +1586,8 @@ export class MediaIngest {
     const octetPath = path.join(this.amrwbCaptureDir, 'octet_aligned.awb');
     const bePath = path.join(this.amrwbCaptureDir, 'be_converted.awb');
 
+
+
     try {
       if (!this.amrwbCaptureOctetHeaderWritten) {
         await fs.promises.writeFile(octetPath, AMRWB_FILE_HEADER);
