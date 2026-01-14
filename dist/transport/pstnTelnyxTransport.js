@@ -1,6 +1,7 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.PstnTelnyxTransportSession = void 0;
+const env_1 = require("../env");
 const log_1 = require("../log");
 const telnyxClient_1 = require("../telnyx/telnyxClient");
 class PstnAudioIngest {
@@ -66,7 +67,10 @@ class PstnAudioPlayback {
 class PstnTelnyxTransportSession {
     constructor(options) {
         this.mode = 'pstn';
-        this.audioInput = { codec: 'pcmu', sampleRateHz: 8000 };
+        this.audioInput = {
+            codec: 'pcm16le',
+            sampleRateHz: env_1.env.TELNYX_TARGET_SAMPLE_RATE, // import env here
+        };
         this.id = options.callControlId;
         this.logContext = {
             call_control_id: options.callControlId,

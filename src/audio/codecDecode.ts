@@ -6,7 +6,8 @@ import { G722Decoder } from './vendor/g722/g722';
 import { encodePcm16ToWav } from './postprocess';
 import { OpusPacketDecoder } from './opusDecoder';
 import { resample48kTo16k } from './resample48kTo16k';
-import { transcodeTelnyxAmrWbPayload, writeAmrwbArtifacts } from './amrwbRtp';
+import { transcodeTelnyxAmrWbPayload, writeAmrwbArtifacts, depacketizeAmrWbBandwidthEfficientNoCmr } from './amrwbRtp';
+
 
 export interface TelnyxCodecState {
   // AMR-WB (ffmpeg) state + log gating
@@ -27,6 +28,7 @@ export interface TelnyxCodecState {
   amrwbDebugDropoutCount?: number;
   amrwbDebugLastLogAt?: number;
   amrwbShortPcmCount?: number;
+  amrwbCandidateSelectedLogged?: boolean;
 
   // G.722
   g722?: G722Decoder;
@@ -46,11 +48,16 @@ export interface TelnyxCodecState {
   debugPcmAccumSamples?: number;
   debugPcmAccumSampleRateHz?: number;
   debugPcmDumpIndex?: number;
+  debugRollingPcm16?: Int16Array;
+  debugLastChunkDumpMs?: number;
+  debugChunkDumpIndex?: number;
+
 }
 
 export interface DecodeTelnyxOptions {
   encoding: string;
   payload: Buffer;
+  forceAmrWbBe?: boolean;
   channels?: number;
   reportedSampleRateHz?: number;
   targetSampleRateHz: number;
@@ -100,6 +107,10 @@ export function shouldUsePcm16Ingest(
 
 const DEFAULT_OPUS_SAMPLE_RATE = 48000;
 const DEBUG_POST_DECODE_INTERVAL_MS = 1000;
+const DEBUG_CHUNK_MIN_MS = 50;
+const DEBUG_CHUNK_MAX_MS = 120; // keep small; enough to hear shape, not huge spam
+const DEBUG_CHUNK_INTERVAL_MS = 300; // rate-limit chunk dumping
+const DEBUG_WINDOW_MS = 400;
 const AMRWB_STREAM_HEADER = Buffer.from('#!AMR-WB\n', 'ascii');
 const AMRWB_FRAME_RATE = 50;
 const AMRWB_STREAM_STDERR_MAX_BYTES = 4096;
@@ -182,97 +193,160 @@ function shouldLogAmrwbDebug(state: TelnyxCodecState, now: number, isDropout: bo
   return false;
 }
 
-async function maybeDumpPostDecode(
-  samples: Int16Array,
+function takeRollingWindowPcm16(
+  state: TelnyxCodecState,
+  pcm16: Int16Array,
   sampleRateHz: number,
-  encoding: string,
-  state: TelnyxCodecState | undefined,
-  logContext: Record<string, unknown> | undefined,
-): Promise<void> {
-  if (!debugPostDecodeEnabled()) return;
-  if (!state) return;
+  windowMs: number,
+): Int16Array | null {
+  const winSamples = Math.max(1, Math.round((sampleRateHz * windowMs) / 1000));
+  const prev = state.debugRollingPcm16 ?? new Int16Array(0);
 
-  const callId =
-    typeof logContext?.call_control_id === 'string' ? (logContext.call_control_id as string) : 'unknown';
-  const targetSamples = Math.max(1, Math.round(sampleRateHz * 0.4));
-  const currentRate = state.debugPcmAccumSampleRateHz;
+  // append
+  const merged = new Int16Array(prev.length + pcm16.length);
+  merged.set(prev, 0);
+  merged.set(pcm16, prev.length);
 
-  if (currentRate && currentRate !== sampleRateHz) {
-    state.debugPcmAccum = [];
-    state.debugPcmAccumSamples = 0;
-  }
-  state.debugPcmAccumSampleRateHz = sampleRateHz;
+  // keep last winSamples
+  const start = Math.max(0, merged.length - winSamples);
+  const sliced = merged.subarray(start);
 
-  if (!state.debugPcmAccum) state.debugPcmAccum = [];
-  state.debugPcmAccum.push(samples);
-  state.debugPcmAccumSamples = (state.debugPcmAccumSamples ?? 0) + samples.length;
+  // store back (copy so we don’t retain huge underlying buffers)
+  state.debugRollingPcm16 = new Int16Array(sliced);
 
-  if (state.debugPcmAccumSamples < targetSamples) return;
+  // only dump once we actually have a full window
+  if (merged.length < winSamples) return null;
 
-  const combined = new Int16Array(state.debugPcmAccumSamples);
-  let combinedOffset = 0;
-  for (const chunk of state.debugPcmAccum) {
-    combined.set(chunk, combinedOffset);
-    combinedOffset += chunk.length;
-  }
+  return state.debugRollingPcm16;
+}
 
-  const dir = path.join(debugDir(), callId);
-  try {
-    await fs.promises.mkdir(dir, { recursive: true });
-  } catch (error) {
-    log.warn(
-      { event: 'stt_post_decode_dump_failed', encoding, file_path: dir, err: error, ...(logContext ?? {}) },
-      'stt post-decode dump failed',
-    );
-    return;
-  }
 
-  let cursor = 0;
-  let dumpIndex = state.debugPcmDumpIndex ?? 0;
-  while (combined.length - cursor >= targetSamples) {
-    dumpIndex += 1;
-    const slice = combined.subarray(cursor, cursor + targetSamples);
-    const filePath = path.join(dir, `decoded_pcm_400ms_${String(dumpIndex).padStart(3, '0')}.wav`);
+  async function maybeDumpPostDecode(
+    samples: Int16Array,
+    sampleRateHz: number,
+    encoding: string,
+    state: TelnyxCodecState | undefined,
+    logContext: Record<string, unknown> | undefined,
+  ): Promise<void> {
+    if (!debugPostDecodeEnabled()) return;
+    if (!state) return;
+    if (!samples || samples.length === 0 || sampleRateHz <= 0) return;
+
+    const callId =
+      typeof logContext?.call_control_id === 'string'
+        ? (logContext.call_control_id as string)
+        : 'unknown';
+
+    const dir = path.join(debugDir(), callId);
     try {
-      const wav = encodePcm16ToWav(slice, sampleRateHz);
-      await fs.promises.writeFile(filePath, wav);
+      await fs.promises.mkdir(dir, { recursive: true });
     } catch (error) {
       log.warn(
-        { event: 'stt_post_decode_dump_failed', encoding, file_path: filePath, err: error, ...(logContext ?? {}) },
+        { event: 'stt_post_decode_dump_failed', encoding, file_path: dir, err: error, ...(logContext ?? {}) },
         'stt post-decode dump failed',
       );
       return;
     }
 
-    const stats = computePcmStats(slice);
-    log.info(
-      {
-        event: 'stt_post_decode',
-        encoding,
-        sample_rate_hz: sampleRateHz,
-        samples: slice.length,
-        rms: Number(stats.rms.toFixed(6)),
-        peak: Number(stats.peak.toFixed(6)),
-        file_path: filePath,
-        ...(logContext ?? {}),
-      },
-      'stt post-decode dump',
-    );
+    const now = Date.now();
 
-    cursor += targetSamples;
-  }
+    /* ----------------------- (A) CHUNK DUMP (>=50ms) ----------------------- */
 
-  const remaining = combined.length - cursor;
-  if (remaining > 0) {
-    const leftover = new Int16Array(remaining);
-    leftover.set(combined.subarray(cursor));
-    state.debugPcmAccum = [leftover];
-    state.debugPcmAccumSamples = remaining;
-  } else {
-    state.debugPcmAccum = [];
-    state.debugPcmAccumSamples = 0;
-  }
-  state.debugPcmDumpIndex = dumpIndex;
+    const chunkMinSamples = Math.max(1, Math.round((sampleRateHz * DEBUG_CHUNK_MIN_MS) / 1000));
+    const chunkMaxSamples = Math.max(chunkMinSamples, Math.round((sampleRateHz * DEBUG_CHUNK_MAX_MS) / 1000));
+
+    const canChunkDump =
+      !state.debugLastChunkDumpMs || now - state.debugLastChunkDumpMs >= DEBUG_CHUNK_INTERVAL_MS;
+
+    if (canChunkDump && samples.length >= chunkMinSamples) {
+      state.debugLastChunkDumpMs = now;
+
+      // take a small slice from *the end* (most recent audio)
+      const take = Math.min(samples.length, chunkMaxSamples);
+      const chunk = samples.subarray(samples.length - take);
+
+      const chunkStats = computePcmStats(chunk);
+      const chunkIndex = (state.debugChunkDumpIndex ?? 0) + 1;
+      state.debugChunkDumpIndex = chunkIndex;
+
+      const chunkPath = path.join(dir, `decoded_pcm_chunk_${String(chunkIndex).padStart(4, '0')}.wav`);
+      try {
+        const wav = encodePcm16ToWav(chunk, sampleRateHz);
+        await fs.promises.writeFile(chunkPath, wav);
+
+        log.info(
+          {
+            event: 'stt_post_decode_chunk',
+            encoding,
+            sample_rate_hz: sampleRateHz,
+            samples: chunk.length,
+            ms: Number(((chunk.length / sampleRateHz) * 1000).toFixed(2)),
+            rms: Number(chunkStats.rms.toFixed(6)),
+            peak: Number(chunkStats.peak.toFixed(6)),
+            zero_ratio: Number((countZeroSamples(chunk) / chunk.length).toFixed(6)),
+            file_path: chunkPath,
+            ...(logContext ?? {}),
+          },
+          'stt post-decode chunk dump',
+        );
+      } catch (error) {
+        log.warn(
+          { event: 'stt_post_decode_chunk_dump_failed', encoding, file_path: chunkPath, err: error, ...(logContext ?? {}) },
+          'stt post-decode chunk dump failed',
+        );
+      }
+    }
+
+    /* --------------------- (B) 400ms WINDOW DUMP (best) --------------------- */
+
+    // reset accum if rate changes
+    const prevRate = state.debugPcmAccumSampleRateHz;
+    if (prevRate && prevRate !== sampleRateHz) {
+      state.debugPcmAccum = [];
+      state.debugPcmAccumSamples = 0;
+      state.debugRollingPcm16 = new Int16Array(0);
+    }
+    state.debugPcmAccumSampleRateHz = sampleRateHz;
+
+    const window = takeRollingWindowPcm16(state, samples, sampleRateHz, DEBUG_WINDOW_MS);
+    if (!window) return;
+
+    const winStats = computePcmStats(window);
+
+    // Optional: skip totally dead windows (but DO NOT gate chunk dump above)
+    // You can temporarily disable this line if you want *everything*:
+    // if (winStats.rms < 0.001) return;
+
+    const dumpIndex = (state.debugPcmDumpIndex ?? 0) + 1;
+    state.debugPcmDumpIndex = dumpIndex;
+
+    const winPath = path.join(dir, `decoded_pcm_400ms_${String(dumpIndex).padStart(4, '0')}.wav`);
+    try {
+      const wav = encodePcm16ToWav(window, sampleRateHz);
+      await fs.promises.writeFile(winPath, wav);
+
+      log.info(
+        {
+          event: 'stt_post_decode_400ms',
+          encoding,
+          sample_rate_hz: sampleRateHz,
+          samples: window.length,
+          ms: Number(((window.length / sampleRateHz) * 1000).toFixed(2)),
+          rms: Number(winStats.rms.toFixed(6)),
+          peak: Number(winStats.peak.toFixed(6)),
+          zero_ratio: Number((countZeroSamples(window) / window.length).toFixed(6)),
+          file_path: winPath,
+          ...(logContext ?? {}),
+        },
+        'stt post-decode 400ms window dump',
+      );
+    } catch (error) {
+      log.warn(
+        { event: 'stt_post_decode_dump_failed', encoding, file_path: winPath, err: error, ...(logContext ?? {}) },
+        'stt post-decode dump failed',
+      );
+    }
+  
 }
 
 async function maybeDumpPcm16(
@@ -861,6 +935,7 @@ class AmrWbFfmpegStream {
       'pipe:1',
     ];
 
+
     this.child = spawn(ffmpegPath, args, { stdio: ['pipe', 'pipe', 'pipe'] });
     this.child.stdout.on('data', (chunk) => this.handleStdout(chunk));
     this.child.stderr.on('data', (chunk) => this.handleStderr(chunk));
@@ -1062,6 +1137,10 @@ function expandAmrWbPcmWithSilence(pcm16: Int16Array, frameTypes: AmrWbFrameKind
 
 function getAmrWbStream(state: TelnyxCodecState | undefined, targetSampleRateHz: number): AmrWbFfmpegStream | null {
   if (!state || state.amrwbFfmpegStreamDisabled) return null;
+
+  // ✅ add this
+  if (parseBoolEnv(process.env.AMRWB_DISABLE_STREAM)) return null;
+
   if (state.amrwbFfmpegStream && state.amrwbFfmpegStreamRate === targetSampleRateHz) {
     return state.amrwbFfmpegStream;
   }
@@ -1072,6 +1151,7 @@ function getAmrWbStream(state: TelnyxCodecState | undefined, targetSampleRateHz:
   state.amrwbFfmpegStreamRate = targetSampleRateHz;
   return state.amrwbFfmpegStream;
 }
+
 
 async function decodeAmrWbWithFfmpeg(
   amrwbStorageBytes: Buffer,
@@ -1198,6 +1278,14 @@ export async function decodeTelnyxPayloadToPcm16(opts: DecodeTelnyxOptions): Pro
 
   // AMR-WB
   if (encoding === 'AMR-WB') {
+  if (parseBoolEnv(process.env.AMRWB_DECODE_TRACE)) {
+    log.info(
+      { event: 'amrwb_code_path_reached', encoding, ...(opts.logContext ?? {}) },
+      'AMR-WB decode path reached',
+    );
+  }
+
+
     if (!opts.allowAmrWb) return null;
 
     const candidates: AmrCandidate[] = [];
@@ -1205,7 +1293,7 @@ export async function decodeTelnyxPayloadToPcm16(opts: DecodeTelnyxOptions): Pro
     // 1) Run transcoder FIRST so we know packing (be vs octet vs already-storage-ish).
     const transcode = transcodeTelnyxAmrWbPayload(opts.payload);
 
-        // --- AMR-WB artifact capture (Step 2/3) ---
+    // --- AMR-WB artifact capture (Step 2/3) ---
     if (parseBoolEnv(process.env.TRUTH_CAPTURE_AMRWB) || parseBoolEnv(process.env.AMRWB_ARTIFACT_DEBUG)) {
       // Always capture the raw payload so we can reproduce failures.
       writeAmrwbArtifacts('amrwb_raw_payload', opts.payload, {
@@ -1239,15 +1327,15 @@ export async function decodeTelnyxPayloadToPcm16(opts: DecodeTelnyxOptions): Pro
     }
     // --- end artifact capture ---
 
-
     // If packing is BE, raw "octet" parsing is a trap: it may parse but will sound wrong.
-    const forceTranscodedOnly = transcode.packing === 'be';
+    // Also, MediaIngest can explicitly force BE for Telnyx PSTN.
+    const forceTranscodedOnly = opts.forceAmrWbBe === true || transcode.packing === 'be';
 
     if (!transcode.ok) {
       const invalidCount = (state.amrwbDepackInvalidCount ?? 0) + 1;
       state.amrwbDepackInvalidCount = invalidCount;
 
-      if (invalidCount <= 10) { 
+      if (invalidCount <= 10) {
         const hexPrefix = opts.payload.subarray(0, Math.min(32, opts.payload.length)).toString('hex');
         log.warn(
           {
@@ -1256,6 +1344,7 @@ export async function decodeTelnyxPayloadToPcm16(opts: DecodeTelnyxOptions): Pro
             payload_len: opts.payload.length,
             first_bytes_hex: hexPrefix,
             rtp_stripped: transcode.rtpStripped,
+            force_be: opts.forceAmrWbBe === true,
             ...(opts.logContext ?? {}),
           },
           `AMRWB_DEPACK invalid reason=${transcode.error} firstBytesHex=${hexPrefix} len=${opts.payload.length}`,
@@ -1263,9 +1352,16 @@ export async function decodeTelnyxPayloadToPcm16(opts: DecodeTelnyxOptions): Pro
       }
 
       state.amrwbLastError = 'amrwb_depack_invalid';
-      // NOTE: we can still try raw as a fallback when transcode fails.
+
+      // 🔒 if BE is forced/detected and transcode failed, STOP (raw fallback would be garbage)
+      if (forceTranscodedOnly) {
+        state.amrwbLastError = 'amrwb_forced_be_transcode_failed';
+        return null;
+      }
+
+      // NOTE: in non-forced mode we can still try raw fallback later (if env enabled).
     } else {
-      // Log depack once (or if you prefer, keep your existing gating)
+      // Log depack once
       if (!state.amrwbDepacketizeLogged) {
         state.amrwbDepacketizeLogged = true;
         log.info(
@@ -1277,13 +1373,27 @@ export async function decodeTelnyxPayloadToPcm16(opts: DecodeTelnyxOptions): Pro
             cmr_stripped: transcode.cmrStripped ?? false,
             total_bytes_in: transcode.totalBytesIn,
             total_bytes_out: transcode.totalBytesOut,
+            force_be: opts.forceAmrWbBe === true,
             ...(opts.logContext ?? {}),
           },
-          `AMRWB_DEPACK packing=${transcode.packing} rtpStripped=${transcode.rtpStripped} tocCount=${transcode.tocCount} totalBytesIn=${transcode.totalBytesIn} totalBytesOut=${transcode.totalBytesOut}`,
+          `AMRWB_DEPACK packing=${transcode.packing} rtpStripped=${transcode.rtpStripped} tocCount=${transcode.tocCount} cmrStripped=${Boolean(
+            transcode.cmrStripped,
+          )} totalBytesIn=${transcode.totalBytesIn} totalBytesOut=${transcode.totalBytesOut}`,
         );
       }
 
-      const dep2 = depacketizeAmrWbToStorage(transcode.output, { skipCmr: Boolean(transcode.cmrStripped) });
+      /**
+       * ✅ CRITICAL FIX:
+       * If the transcoder stripped CMR, we MUST tell the depacketizer to skip CMR,
+       * even when packing === 'be'.
+       *
+       * Your log showed: cmr_stripped=true + depacketize failure frame_overflow_ft_8.
+       * That happens when we *don't* skip CMR and the parser reads TOC as CMR.
+       */
+      const dep2 = depacketizeAmrWbToStorage(transcode.output, {
+        skipCmr: Boolean(transcode.cmrStripped),
+      });
+
       if (dep2.ok) {
         candidates.push({
           label: 'transcoded',
@@ -1299,6 +1409,7 @@ export async function decodeTelnyxPayloadToPcm16(opts: DecodeTelnyxOptions): Pro
               event: 'amrwb_depacketize_failed',
               payload_len: transcode.output.length,
               cmr_stripped: transcode.cmrStripped ?? false,
+              packing: transcode.packing,
               hex_prefix: transcode.output.subarray(0, Math.min(32, transcode.output.length)).toString('hex'),
               attempts: dep2.errors.map((error) => ({
                 offset: error.offset,
@@ -1311,15 +1422,14 @@ export async function decodeTelnyxPayloadToPcm16(opts: DecodeTelnyxOptions): Pro
           );
         }
 
-        // If BE and transcoded failed, do NOT fall back to raw; raw will be garbage.
-        if (transcode.packing === 'be') {
-          state.amrwbLastError = 'amrwb_be_transcode_failed';
+        // If BE is forced/detected and depacketize failed, do NOT fall back to raw.
+        if (forceTranscodedOnly) {
+          state.amrwbLastError = transcode.packing === 'be' ? 'amrwb_be_transcode_failed' : 'amrwb_forced_be_depacketize_failed';
           return null;
         }
       }
     }
 
-  
     // 2) Raw fallback is disabled by default.
     // Enable only if you are debugging a non-BE source.
     const allowRawFallback = parseBoolEnv(process.env.AMRWB_ALLOW_RAW_FALLBACK);
@@ -1335,25 +1445,150 @@ export async function decodeTelnyxPayloadToPcm16(opts: DecodeTelnyxOptions): Pro
       }
     }
 
-
     if (candidates.length === 0) {
       state.amrwbLastError = state.amrwbLastError ?? 'amrwb_no_candidates';
       return null;
     }
+    // ✅ FILTER OUT BROKEN CANDIDATES (header-only / no real frames)
+    const headerLen = AMRWB_STREAM_HEADER.length; // 9
+    const before = candidates.length;
+
+    const valid = candidates.filter((c) => {
+      // storage must be > header and frames must exist
+      if (!c.dep.storage || c.dep.storage.length <= headerLen) return false;
+      if (!c.dep.frames || c.dep.frames.length === 0) return false;
+      // if it claims speech, frames must align with that claim
+      if (c.dep.decodedFrames > 0 && c.dep.hasSpeechFrames !== true) return false;
+      return true;
+    });
+
+    if (valid.length !== before) {
+      log.warn(
+        {
+          event: 'AMRWB_CANDIDATE_FILTERED',
+          before,
+          after: valid.length,
+          removed: candidates
+            .filter((c) => !valid.includes(c))
+            .map((c) => ({
+              label: c.label,
+              mode: c.dep.mode,
+              storage_len: c.dep.storage?.length ?? -1,
+              frames_len: c.dep.frames?.length ?? -1,
+              speech_frames: c.dep.decodedFrames,
+              head_ascii: c.dep.storage ? c.dep.storage.slice(0, 9).toString('ascii') : null,
+            })),
+          ...(opts.logContext ?? {}),
+        },
+        'Filtered invalid AMR-WB candidates',
+      );
+    }
+
+    if (valid.length === 0) {
+      state.amrwbLastError = 'amrwb_no_valid_candidates';
+      return null;
+    }
+
+    // replace candidates with valid ones
+    candidates.length = 0;
+    candidates.push(...valid);
+
+    if (parseBoolEnv(process.env.AMRWB_DECODE_TRACE)) {
+      for (const c of candidates) {
+        log.info(
+          {
+            event: 'amrwb_candidate_inspect',
+            label: c.label,
+            mode: c.dep.mode,
+            storage_len: c.dep.storage.length,
+            frames_len: c.dep.frames.length,
+            total_frames: c.dep.totalFrames,
+            speech_frames: c.dep.decodedFrames,
+            sid_frames: c.dep.sidFrames,
+            no_data_frames: c.dep.noDataFrames,
+            speech_lost_frames: c.dep.speechLostFrames,
+            hasSpeechFrames: c.dep.hasSpeechFrames,
+            head_ascii: c.dep.storage.slice(0, 9).toString('ascii'),
+            ...(opts.logContext ?? {}),
+          },
+          'AMR-WB candidate inspect',
+        );
+      }
+    }
+
 
     // 3) Pick best candidate deterministically.
     candidates.sort((a, b) => scoreCandidate(b) - scoreCandidate(a));
     const chosen = candidates[0]!;
     const dep = chosen.dep;
+    if (!dep.storage || dep.storage.length <= AMRWB_STREAM_HEADER.length) {
+      log.error({ event: 'AMRWB_CHOSEN_INVALID_STORAGE', storage_len: dep.storage?.length ?? -1, ...(opts.logContext ?? {}) }, 'Chosen AMR-WB candidate had invalid storage');
+      return null;
+    }
 
-    // Always log packing + chosen path at least once (this is the smoking gun when things regress).
-    if (!state.amrwbDepacketizeLogged) {
-      state.amrwbDepacketizeLogged = true;
+    log.error(
+      {
+        event: 'AMRWB_CHOSEN_CANDIDATE',
+        mode: dep.mode,
+        frames: dep.totalFrames,
+        speech_frames: dep.decodedFrames,
+      }, 
+      '🔥 AMR-WB candidate chosen'
+    );
+
+    if (parseBoolEnv(process.env.AMRWB_ARTIFACT_DEBUG) || parseBoolEnv(process.env.TRUTH_CAPTURE_AMRWB)) {
+      const callId =
+        typeof opts.logContext?.call_control_id === 'string'
+          ? String(opts.logContext.call_control_id)
+          : 'unknown';
+
+      const dir = path.join(debugDir(), callId);
+      await fs.promises.mkdir(dir, { recursive: true });
+
+      state.amrwbDebugCount = (state.amrwbDebugCount ?? 0) + 1;
+      const idx = String(state.amrwbDebugCount).padStart(4, '0');
+      const outPath = path.join(dir, `runtime_selected_storage_${idx}.awb`);
+      log.error({
+        event: 'AMRWB_SELECTED_STORAGE_BYTES',
+        bytes: dep.storage?.length ?? -1,
+        head_hex: dep.storage ? dep.storage.slice(0, 16).toString('hex') : null,
+        head_ascii: dep.storage ? dep.storage.slice(0, 9).toString('ascii') : null,
+      }, 'selected storage buffer stats');
+
+      await fs.promises.writeFile(outPath, dep.storage);
+
+      log.error(
+        { event: 'AMRWB_RUNTIME_SELECTED_WRITTEN', outPath },
+        '🔥 runtime_selected_storage.awb written'
+      );
+    }
+
+
+    // DEBUG: dump the exact storage bytes we are about to decode (the real truth)
+    if (parseBoolEnv(process.env.AMRWB_DUMP_SELECTED_STORAGE) && opts.logContext?.call_control_id) {
+      try {
+        const callId = String(opts.logContext.call_control_id);
+        const dir = path.join(debugDir(), callId);
+        await fs.promises.mkdir(dir, { recursive: true });
+        const p = path.join(dir, 'runtime_selected_storage.awb');
+        await fs.promises.writeFile(p, dep.storage);
+        log.info({ event: 'amrwb_selected_storage_dumped', file_path: p, ...(opts.logContext ?? {}) }, 'dumped selected AMR-WB storage');
+      } catch (e) {
+        log.warn({ event: 'amrwb_selected_storage_dump_failed', err: e, ...(opts.logContext ?? {}) }, 'failed to dump selected storage');
+      }
+    }
+
+
+    // Always log packing + chosen path at least once (smoking gun when things regress).
+    if (!state.amrwbCandidateSelectedLogged) {
+      state.amrwbCandidateSelectedLogged = true;
       log.info(
         {
           event: 'amrwb_candidate_selected',
           packing: transcode.ok ? transcode.packing : 'transcode_failed',
+          cmr_stripped: transcode.ok ? Boolean(transcode.cmrStripped) : null,
           force_transcoded_only: forceTranscodedOnly,
+          forced_be: opts.forceAmrWbBe === true,
           chosen: chosen.label,
           chosen_mode: dep.mode,
           chosen_frames: dep.totalFrames,
@@ -1372,7 +1607,6 @@ export async function decodeTelnyxPayloadToPcm16(opts: DecodeTelnyxOptions): Pro
         'AMR-WB candidate selection',
       );
     }
-
 
     const samplesPerFrame = Math.max(1, Math.round(targetRate / AMRWB_FRAME_RATE));
     if (!dep.hasSpeechFrames) {
@@ -1496,8 +1730,6 @@ export async function decodeTelnyxPayloadToPcm16(opts: DecodeTelnyxOptions): Pro
       return null;
     }
 
-
-
     const actualSamples = decoded.pcm16.length;
     const zeroCount = countZeroSamples(decoded.pcm16);
     const zeroRatio = actualSamples > 0 ? zeroCount / actualSamples : 1;
@@ -1507,11 +1739,7 @@ export async function decodeTelnyxPayloadToPcm16(opts: DecodeTelnyxOptions): Pro
 
     if (shouldLogAmrwbDebug(state, Date.now(), dropout)) {
       const prefixSamples = Array.from(decoded.pcm16.subarray(0, 16));
-      const prefixBuf = Buffer.from(
-        decoded.pcm16.buffer,
-        decoded.pcm16.byteOffset,
-        Math.min(32, decoded.pcm16.byteLength),
-      );
+      const prefixBuf = Buffer.from(decoded.pcm16.buffer, decoded.pcm16.byteOffset, Math.min(32, decoded.pcm16.byteLength));
       log.info(
         {
           event: 'amrwb_decode_debug',
@@ -1575,6 +1803,7 @@ export async function decodeTelnyxPayloadToPcm16(opts: DecodeTelnyxOptions): Pro
       decodeFailures: 0,
     };
   }
+
 
   // G.722
   if (encoding === 'G722') {

@@ -16,12 +16,14 @@ const log_1 = require("./log");
 const wavInfo_1 = require("./audio/wavInfo");
 const playbackPipeline_1 = require("./audio/playbackPipeline");
 const codecDecode_1 = require("./audio/codecDecode");
+const mediaIngest_1 = require("./media/mediaIngest");
 const audioProbe_1 = require("./diagnostics/audioProbe");
 const health_1 = require("./routes/health");
 const telnyxWebhook_1 = require("./routes/telnyxWebhook");
 const webrtc_1 = require("./routes/webrtc");
 const kokoroTTS_1 = require("./tts/kokoroTTS");
 const metrics_1 = require("./metrics");
+const telnyxClient_1 = require("./telnyx/telnyxClient");
 function requestIdMiddleware(req, res, next) {
     const incomingId = req.header('x-request-id');
     const requestId = incomingId && incomingId.trim() !== '' ? incomingId : (0, crypto_1.randomUUID)();
@@ -46,12 +48,19 @@ function normalizeCodec(value) {
         return 'AMR-WB';
     return normalized;
 }
+function normalizeTelnyxTrack(track) {
+    const normalized = typeof track === 'string' ? track.trim().toLowerCase() : '';
+    if (normalized === 'inbound_track')
+        return 'inbound';
+    if (normalized === 'outbound_track')
+        return 'outbound';
+    return normalized;
+}
 function mapCodecToFormat(codec) {
     switch (codec) {
         case 'PCMU':
             return 'pcmu';
         case 'PCMA':
-            // PCMA is A-law.
             return 'alaw';
         case 'L16':
             return 'pcm16le';
@@ -217,31 +226,387 @@ function logTtsBytesReady(id, audio, contentType, context) {
 }
 const MEDIA_PATH_PREFIX = '/v1/telnyx/media/';
 let unsupportedEncodingCount = 0;
-const mediaDebugEnabled = () => {
-    const value = process.env.MEDIA_DEBUG;
-    if (!value) {
+const mediaDebugEnabled = () => parseBoolEnv(process.env.MEDIA_DEBUG);
+const mediaSchemaDebugEnabled = () => parseBoolEnv(process.env.TELNYX_DEBUG_MEDIA_SCHEMA);
+const telnyxTapRawEnabled = () => parseBoolEnv(process.env.TELNYX_DEBUG_TAP_RAW);
+const telnyxCaptureOnceEnabled = () => parseBoolEnv(process.env.TELNYX_CAPTURE_ONCE);
+const telnyxCaptureCallId = () => {
+    const raw = process.env.TELNYX_CAPTURE_CALL_ID;
+    return raw && raw.trim() !== '' ? raw.trim() : null;
+};
+const telnyxDebugDir = () => process.env.STT_DEBUG_DIR && process.env.STT_DEBUG_DIR.trim() !== '' ? process.env.STT_DEBUG_DIR.trim() : '/tmp/veralux-stt-debug';
+const TELNYX_CAPTURE_WINDOW_MS = 3000;
+const TELNYX_CAPTURE_MAX_FRAMES = 150;
+const TELNYX_CAPTURE_TINY_PAYLOAD_LIMIT = 10;
+const TELNYX_CAPTURE_TINY_PAYLOAD_LEN = 50;
+let captureConsumed = false;
+let captureActiveCallId = null;
+function parseBoolEnv(value) {
+    if (!value)
         return false;
-    }
     const normalized = value.trim().toLowerCase();
     return normalized === '1' || normalized === 'true' || normalized === 'yes';
-};
-function parseMediaRequest(request) {
-    if (!request.url) {
+}
+function shouldStartCapture(callControlId) {
+    if (captureConsumed)
+        return false;
+    const target = telnyxCaptureCallId();
+    if (target)
+        return target === callControlId;
+    if (!telnyxCaptureOnceEnabled())
+        return false;
+    if (!captureActiveCallId)
+        captureActiveCallId = callControlId;
+    return captureActiveCallId === callControlId;
+}
+function initCaptureState(callControlId) {
+    if (!shouldStartCapture(callControlId))
         return null;
-    }
-    const host = request.headers.host ?? 'localhost';
-    const url = new URL(request.url, `http://${host}`);
-    if (!url.pathname.startsWith(MEDIA_PATH_PREFIX)) {
-        return null;
-    }
-    const callControlId = url.pathname.slice(MEDIA_PATH_PREFIX.length);
-    if (!callControlId || callControlId.includes('/')) {
-        return null;
-    }
+    const dir = telnyxDebugDir();
+    const captureId = `${callControlId}_${Date.now()}`;
+    const ndjsonPath = path_1.default.join(dir, `telnyx_media_capture_${captureId}.ndjson`);
+    void fs_1.default.promises.mkdir(dir, { recursive: true });
     return {
         callControlId,
-        token: url.searchParams.get('token'),
+        captureId,
+        ndjsonPath,
+        dir,
+        firstEventMs: Date.now(),
+        frameCount: 0,
+        tinyPayloadFrames: 0,
+        notAudioFrames: 0,
+        eventCounts: {},
+        payloadLenBuckets: {},
+        decodedLenBuckets: {},
+        payloadSources: new Set(),
+        payloadSourceCounts: {},
+        trackCombos: new Set(),
+        payloadBase64Frames: 0,
+        payloadNotBase64Frames: 0,
+        mediaExamples: [],
     };
+}
+const SENSITIVE_KEY_REGEX = /(token|authorization|auth|signature|secret|api_key)/i;
+function redactInline(value) {
+    let redacted = value;
+    const token = process.env.MEDIA_STREAM_TOKEN;
+    if (token && redacted.includes(token))
+        redacted = redacted.split(token).join('[redacted]');
+    redacted = redacted.replace(/token=([^&\s]+)/gi, 'token=[redacted]');
+    return redacted;
+}
+function sanitizeForCapture(value, pathParts = []) {
+    if (typeof value === 'string') {
+        const key = pathParts[pathParts.length - 1] ?? '';
+        if (SENSITIVE_KEY_REGEX.test(key))
+            return '[redacted]';
+        if (key === 'payload') {
+            const trimmed = value.trim();
+            return `[payload len=${trimmed.length}]`;
+        }
+        return redactInline(value);
+    }
+    if (typeof value === 'number' || typeof value === 'boolean' || value === null)
+        return value;
+    if (Array.isArray(value))
+        return value.map((item, index) => sanitizeForCapture(item, pathParts.concat(String(index))));
+    if (value && typeof value === 'object') {
+        const obj = value;
+        const sanitized = {};
+        for (const [key, val] of Object.entries(obj))
+            sanitized[key] = sanitizeForCapture(val, pathParts.concat(key));
+        return sanitized;
+    }
+    return value;
+}
+function bucketLen(value) {
+    if (value < 10)
+        return '<10';
+    if (value < 50)
+        return '10-49';
+    if (value < 100)
+        return '50-99';
+    if (value < 200)
+        return '100-199';
+    if (value < 500)
+        return '200-499';
+    if (value < 1000)
+        return '500-999';
+    if (value < 2000)
+        return '1000-1999';
+    return '2000+';
+}
+function incrementBucket(target, value) {
+    const key = bucketLen(value);
+    target[key] = (target[key] ?? 0) + 1;
+}
+function looksLikeBase64(payload) {
+    const trimmed = payload.trim().replace(/=+$/, '');
+    if (trimmed.length < 8)
+        return false;
+    return /^[A-Za-z0-9+/_-]+$/.test(trimmed);
+}
+async function appendCaptureRecord(capture, record) {
+    try {
+        await fs_1.default.promises.appendFile(capture.ndjsonPath, `${JSON.stringify(record)}\n`);
+    }
+    catch (error) {
+        log_1.log.warn({ event: 'media_capture_write_failed', call_control_id: capture.callControlId, err: error }, 'media capture write failed');
+    }
+}
+async function dumpCaptureFrame(capture, callControlId, seq, buffer) {
+    const base = path_1.default.join(capture.dir, `capture_${callControlId}_${seq}_${Date.now()}`);
+    try {
+        await fs_1.default.promises.writeFile(`${base}.bin`, buffer);
+    }
+    catch (error) {
+        log_1.log.warn({ event: 'media_capture_dump_failed', call_control_id: callControlId, err: error }, 'media capture dump failed');
+    }
+}
+const AMRWB_FRAME_SIZES = [17, 23, 32, 36, 40, 46, 50, 58, 60];
+const AMRWB_SID_FRAME_BYTES = 5;
+function amrWbFrameSize(ft) {
+    if (ft >= 0 && ft < AMRWB_FRAME_SIZES.length)
+        return AMRWB_FRAME_SIZES[ft] ?? 0;
+    if (ft === 9)
+        return AMRWB_SID_FRAME_BYTES;
+    return 0;
+}
+function debugParseAmrWbOctetAligned(payload, startOffset) {
+    if (payload.length === 0)
+        return { frames: 0, reason: 'empty' };
+    if (startOffset >= payload.length)
+        return { frames: 0, reason: 'start_offset_out_of_range' };
+    let offset = startOffset;
+    const tocEntries = [];
+    let follow = true;
+    while (follow && offset < payload.length) {
+        const toc = payload[offset++];
+        follow = (toc & 0x80) !== 0;
+        const ft = (toc >> 3) & 0x0f;
+        tocEntries.push(ft);
+    }
+    let frames = 0;
+    for (const ft of tocEntries) {
+        const size = amrWbFrameSize(ft);
+        if (size === AMRWB_SID_FRAME_BYTES) {
+            if (offset + size > payload.length)
+                return { frames, reason: `sid_overflow_ft_${ft}` };
+            offset += size;
+            continue;
+        }
+        if (size <= 0)
+            return { frames, reason: `invalid_ft_${ft}` };
+        if (offset + size > payload.length)
+            return { frames, reason: `frame_overflow_ft_${ft}` };
+        frames += 1;
+        offset += size;
+    }
+    return { frames, reason: frames === 0 ? 'no_frames' : undefined };
+}
+function debugParseAmrWbPayload(payload) {
+    if (payload.length === 0)
+        return { ok: false, mode: 'empty', frames: 0, reason: 'empty' };
+    if (AMRWB_FRAME_SIZES.includes(payload.length))
+        return { ok: true, mode: 'single', frames: 1 };
+    if (payload.length === AMRWB_SID_FRAME_BYTES)
+        return { ok: true, mode: 'sid', frames: 0 };
+    if (payload.length < 2)
+        return { ok: false, mode: 'too_short', frames: 0, reason: 'payload_too_short' };
+    const withCmr = debugParseAmrWbOctetAligned(payload, 1);
+    if (!withCmr.reason && withCmr.frames >= 0)
+        return { ok: true, mode: 'octet_cmr', frames: withCmr.frames };
+    const withoutCmr = debugParseAmrWbOctetAligned(payload, 0);
+    if (!withoutCmr.reason && withoutCmr.frames >= 0)
+        return { ok: true, mode: 'octet_no_cmr', frames: withoutCmr.frames };
+    return {
+        ok: false,
+        mode: 'octet_failed',
+        frames: 0,
+        reason: `${withCmr.reason ?? 'unknown'}|${withoutCmr.reason ?? 'unknown'}`,
+    };
+}
+function summarizeCapture(capture, reason) {
+    const expectedTrack = process.env.TELNYX_STREAM_TRACK;
+    const trackCombos = Array.from(capture.trackCombos);
+    const payloadSources = Array.from(capture.payloadSources);
+    const likelyCauses = [];
+    if (expectedTrack && trackCombos.some((combo) => !combo.includes(`media:${expectedTrack}`)))
+        likelyCauses.push('track_mismatch');
+    if (capture.payloadNotBase64Frames > 0)
+        likelyCauses.push('payload_not_base64');
+    if (capture.notAudioFrames > 0)
+        likelyCauses.push('decoded_len_too_small');
+    if (capture.tinyPayloadFrames >= TELNYX_CAPTURE_TINY_PAYLOAD_LIMIT)
+        likelyCauses.push('payload_len_too_small');
+    log_1.log.info({
+        event: 'media_capture_summary',
+        call_control_id: capture.callControlId,
+        reason,
+        event_counts: capture.eventCounts,
+        payload_len_hist: capture.payloadLenBuckets,
+        decoded_len_hist: capture.decodedLenBuckets,
+        payload_sources: payloadSources,
+        payload_source_counts: capture.payloadSourceCounts,
+        track_combinations: trackCombos,
+        tiny_payload_frames: capture.tinyPayloadFrames,
+        not_audio_frames: capture.notAudioFrames,
+        payload_base64_frames: capture.payloadBase64Frames,
+        payload_not_base64_frames: capture.payloadNotBase64Frames,
+        media_examples: capture.mediaExamples,
+        capture_ndjson: capture.ndjsonPath,
+        likely_causes: likelyCauses,
+    }, 'media capture summary');
+}
+function finalizeCapture(capture, reason) {
+    if (capture.stopped)
+        return;
+    capture.stopped = true;
+    captureConsumed = true;
+    if (captureActiveCallId === capture.callControlId)
+        captureActiveCallId = null;
+    summarizeCapture(capture, reason);
+}
+function decodeTelnyxPayloadWithInfo(payload) {
+    let trimmed = payload.trim();
+    const useBase64Url = trimmed.includes('-') || trimmed.includes('_');
+    const encoding = useBase64Url ? 'base64url' : 'base64';
+    const mod = trimmed.length % 4;
+    if (mod !== 0)
+        trimmed += '='.repeat(4 - mod);
+    return { buffer: Buffer.from(trimmed, encoding), encoding, trimmed };
+}
+/**
+ * IMPORTANT FIX:
+ * Don’t “pick first” payload candidate. Score candidates and choose the one that decodes to real audio.
+ * This prevents the classic “payload_len=4 decoded_len=2” loop when a placeholder field exists.
+ */
+function pickBestPayloadCandidate(candidates, codec) {
+    const scored = candidates
+        .map((c) => {
+        const raw = c.value;
+        const trimmed = raw.trim();
+        const base64ish = looksLikeBase64(trimmed);
+        let decodedLen = 0;
+        let enc = null;
+        let ok = false;
+        if (base64ish) {
+            try {
+                const decoded = decodeTelnyxPayloadWithInfo(trimmed);
+                decodedLen = decoded.buffer.length;
+                enc = decoded.encoding;
+                // Reject “obviously not audio” (tiny buffers) for audio codecs
+                ok = decodedLen >= 10;
+                // For AMR-WB, even stricter: < 20 bytes is almost never a valid frame payload
+                if (codec === 'AMR-WB' && decodedLen < 20)
+                    ok = false;
+            }
+            catch {
+                ok = false;
+            }
+        }
+        // Primary sort keys:
+        // 1) ok (true first)
+        // 2) decodedLen (bigger first)
+        // 3) string length (bigger first)
+        return {
+            c,
+            base64ish,
+            ok,
+            decodedLen,
+            strLen: trimmed.length,
+            enc,
+        };
+    })
+        // Keep only candidates that at least look like base64
+        .filter((x) => x.base64ish)
+        .sort((a, b) => {
+        if (a.ok !== b.ok)
+            return a.ok ? -1 : 1;
+        if (b.decodedLen !== a.decodedLen)
+            return b.decodedLen - a.decodedLen;
+        return b.strLen - a.strLen;
+    });
+    return scored[0]?.c ?? null;
+}
+async function dumpTelnyxRawPayload(callControlId, payload, buffer) {
+    if (!telnyxTapRawEnabled())
+        return;
+    const dir = telnyxDebugDir();
+    const base = path_1.default.join(dir, `telnyx_raw_${callControlId}_${Date.now()}`);
+    try {
+        await fs_1.default.promises.mkdir(dir, { recursive: true });
+        await fs_1.default.promises.writeFile(`${base}.bin`, buffer);
+        await fs_1.default.promises.writeFile(`${base}.txt`, payload);
+    }
+    catch (error) {
+        log_1.log.warn({ event: 'telnyx_raw_dump_failed', call_control_id: callControlId, err: error }, 'telnyx raw dump failed');
+    }
+}
+const TELNYX_RAW_PAYLOAD_PATH = '/tmp/telnyx_payload_raw.bin';
+const rawPayloadInitPromises = new Map();
+async function initTelnyxRawPayloadCapture(callControlId) {
+    if (!telnyxTapRawEnabled())
+        return;
+    const existing = rawPayloadInitPromises.get(callControlId);
+    if (existing)
+        return existing;
+    const initPromise = (async () => {
+        try {
+            await fs_1.default.promises.writeFile(TELNYX_RAW_PAYLOAD_PATH, Buffer.alloc(0));
+            log_1.log.info({ event: 'telnyx_raw_capture_init', call_control_id: callControlId, path: TELNYX_RAW_PAYLOAD_PATH }, 'telnyx raw capture initialized');
+        }
+        catch (error) {
+            log_1.log.warn({ event: 'telnyx_raw_capture_init_failed', call_control_id: callControlId, err: error }, 'telnyx raw capture init failed');
+        }
+    })();
+    rawPayloadInitPromises.set(callControlId, initPromise);
+    return initPromise;
+}
+async function captureTelnyxRawPayloadFrame(callControlId, payload) {
+    if (!telnyxTapRawEnabled())
+        return;
+    try {
+        await initTelnyxRawPayloadCapture(callControlId);
+        const decoded = decodeTelnyxPayloadWithInfo(payload);
+        const buffer = decoded.buffer;
+        await fs_1.default.promises.appendFile(TELNYX_RAW_PAYLOAD_PATH, buffer);
+        log_1.log.info({
+            event: 'telnyx_raw_payload_frame',
+            call_control_id: callControlId,
+            decoded_len: buffer.length,
+            hex_prefix: buffer.subarray(0, 20).toString('hex'),
+        }, 'telnyx raw payload frame captured');
+    }
+    catch (error) {
+        log_1.log.warn({ event: 'telnyx_raw_payload_frame_failed', call_control_id: callControlId, err: error }, 'telnyx raw payload frame capture failed');
+    }
+}
+function parseMediaRequest(request) {
+    if (!request.url)
+        return null;
+    const host = request.headers.host ?? 'localhost';
+    const url = new URL(request.url, `http://${host}`);
+    if (!url.pathname.startsWith(MEDIA_PATH_PREFIX))
+        return null;
+    const callControlId = url.pathname.slice(MEDIA_PATH_PREFIX.length);
+    if (!callControlId || callControlId.includes('/'))
+        return null;
+    return { callControlId, token: url.searchParams.get('token') };
+}
+function buildMediaStreamUrl(callControlId) {
+    const trimmedBase = env_1.env.PUBLIC_BASE_URL.replace(/\/$/, '');
+    let wsBase = trimmedBase;
+    if (trimmedBase.startsWith('https://')) {
+        wsBase = `wss://${trimmedBase.slice('https://'.length)}`;
+    }
+    else if (trimmedBase.startsWith('http://')) {
+        wsBase = `ws://${trimmedBase.slice('http://'.length)}`;
+    }
+    else if (!trimmedBase.startsWith('ws://') && !trimmedBase.startsWith('wss://')) {
+        wsBase = `wss://${trimmedBase}`;
+    }
+    return `${wsBase}/v1/telnyx/media/${callControlId}?token=${encodeURIComponent(env_1.env.MEDIA_STREAM_TOKEN)}`;
 }
 function attachMediaWebSocketServer(server, sessionManager) {
     const wss = new ws_1.WebSocketServer({ noServer: true });
@@ -249,26 +614,6 @@ function attachMediaWebSocketServer(server, sessionManager) {
     const acceptCodecs = (0, codecDecode_1.parseTelnyxAcceptCodecs)(env_1.env.TELNYX_ACCEPT_CODECS);
     acceptCodecs.add('PCMU');
     acceptCodecs.add('PCMA');
-    const usePcm16Ingest = (0, codecDecode_1.shouldUsePcm16Ingest)(acceptCodecs, env_1.env.TELNYX_AMRWB_DECODE, env_1.env.TELNYX_G722_DECODE, env_1.env.TELNYX_OPUS_DECODE);
-    const targetSampleRateHz = env_1.env.TELNYX_TARGET_SAMPLE_RATE;
-    const isCodecSupported = (codec) => {
-        if (!acceptCodecs.has(codec)) {
-            return { supported: false, reason: 'codec_not_accepted' };
-        }
-        if (codec === 'AMR-WB' && !env_1.env.TELNYX_AMRWB_DECODE) {
-            return { supported: false, reason: 'amrwb_decode_disabled' };
-        }
-        if (codec === 'G722' && !env_1.env.TELNYX_G722_DECODE) {
-            return { supported: false, reason: 'g722_decode_disabled' };
-        }
-        if (codec === 'OPUS' && !env_1.env.TELNYX_OPUS_DECODE) {
-            return { supported: false, reason: 'opus_decode_disabled' };
-        }
-        if (!usePcm16Ingest && codec !== 'PCMU') {
-            return { supported: false, reason: 'pcmu_only_mode' };
-        }
-        return { supported: true };
-    };
     server.on('upgrade', (request, socket, head) => {
         const parsed = parseMediaRequest(request);
         if (!parsed) {
@@ -292,6 +637,57 @@ function attachMediaWebSocketServer(server, sessionManager) {
             return;
         }
         sessionManager.registerMediaConnection(callControlId, ws);
+        void initTelnyxRawPayloadCapture(callControlId);
+        const transportMode = sessionManager.getTransportMode(callControlId) ?? env_1.env.TRANSPORT_MODE;
+        const ingest = new mediaIngest_1.MediaIngest({
+            callControlId,
+            transportMode,
+            expectedTrack: env_1.env.TELNYX_STREAM_TRACK,
+            acceptCodecs,
+            targetSampleRateHz: env_1.env.TELNYX_TARGET_SAMPLE_RATE,
+            allowAmrWb: env_1.env.TELNYX_AMRWB_DECODE,
+            allowG722: env_1.env.TELNYX_G722_DECODE,
+            allowOpus: env_1.env.TELNYX_OPUS_DECODE,
+            maxRestartAttempts: env_1.env.TELNYX_STREAM_RESTART_MAX,
+            logContext: { call_control_id: callControlId },
+            isPlaybackActive: () => sessionManager.isPlaybackActive(callControlId),
+            isListening: () => sessionManager.isListening(callControlId),
+            getLastSpeechStartAtMs: () => sessionManager.getLastSpeechStartAtMs(callControlId),
+            onAcceptedPayload: (tap) => {
+                log_1.log.info({
+                    event: 'media_ingest_accepted_payload',
+                    call_control_id: tap.callControlId,
+                    codec: tap.codec,
+                    track: tap.track ?? null,
+                    seq: tap.seq ?? null,
+                    timestamp: tap.timestamp ?? null,
+                    payload_source: tap.payloadSource ?? null,
+                    decoded_len: tap.decodedLen,
+                    hex_prefix: tap.hexPrefix,
+                }, 'accepted payload (post-gating)');
+            },
+            onFrame: (frame) => {
+                const ok = sessionManager.pushPcm16Frame(callControlId, frame);
+                if (!ok)
+                    log_1.log.warn({ event: 'media_orphan_frame', call_control_id: callControlId }, 'media orphan frame');
+            },
+            onRestartStreaming: async (codec, reason) => {
+                if (!sessionManager.isCallActive(callControlId)) {
+                    log_1.log.warn({ event: 'media_ingest_restart_skipped_inactive', call_control_id: callControlId, reason }, 'media ingest restart skipped');
+                    return false;
+                }
+                const telnyx = new telnyxClient_1.TelnyxClient({ call_control_id: callControlId });
+                const streamUrl = buildMediaStreamUrl(callControlId);
+                await telnyx.startStreaming(callControlId, streamUrl, {
+                    streamCodec: codec,
+                    streamTrack: env_1.env.TELNYX_STREAM_TRACK,
+                });
+                return true;
+            },
+            onReprompt: (reason) => {
+                sessionManager.notifyIngestFailure(callControlId, reason);
+            },
+        });
         if (debugMedia) {
             log_1.log.info({
                 event: 'media_ws_connected',
@@ -300,141 +696,6 @@ function attachMediaWebSocketServer(server, sessionManager) {
                 url: request.url,
             }, 'media ws connected');
         }
-        const getString = (value) => typeof value === 'string' && value.trim() !== '' ? value : undefined;
-        const getNumber = (value) => typeof value === 'number' && Number.isFinite(value) ? value : undefined;
-        const logDecodeUnsupportedOnce = (codec, reason) => {
-            if (connection.decodeUnsupportedLogged) {
-                return;
-            }
-            connection.decodeUnsupportedLogged = true;
-            log_1.log.warn({
-                event: 'telnyx_codec_unsupported',
-                call_control_id: callControlId,
-                encoding: codec,
-                reason,
-            }, 'telnyx codec unsupported for decode');
-        };
-        const logDecodeFailedOnce = (codec, reason) => {
-            if (!connection.decodeFailedLogged) {
-                connection.decodeFailedLogged = new Set();
-            }
-            if (connection.decodeFailedLogged.has(codec)) {
-                return;
-            }
-            connection.decodeFailedLogged.add(codec);
-            if (codec === 'AMR-WB' && !connection.amrwbFallbackLogged) {
-                connection.amrwbFallbackLogged = true;
-                log_1.log.warn({
-                    event: 'amrwb_fallback',
-                    call_control_id: callControlId,
-                    reason,
-                    negotiated_codec: codec,
-                }, 'amr-wb decode failed; falling back');
-            }
-            if (codec === 'AMR-WB') {
-                connection.amrwbDecodeFailureCount = (connection.amrwbDecodeFailureCount ?? 0) + 1;
-                log_1.log.warn({
-                    event: 'amrwb_decode_failed',
-                    call_control_id: callControlId,
-                    reason,
-                    failure_count: connection.amrwbDecodeFailureCount,
-                }, 'amr-wb decode failed');
-            }
-            log_1.log.warn({
-                event: 'telnyx_codec_decode_failed',
-                call_control_id: callControlId,
-                encoding: codec,
-                reason,
-            }, 'telnyx codec decode failed');
-        };
-        const handleMediaPayload = async (buffer) => {
-            try {
-                const encoding = normalizeCodec(connection.mediaEncoding);
-                const probeMeta = buildProbeMeta(callControlId, connection);
-                (0, audioProbe_1.attachAudioMeta)(buffer, probeMeta);
-                if (!connection.diagRawLogged) {
-                    connection.diagRawLogged = true;
-                    if (shouldProbeRaw(probeMeta.codec)) {
-                        (0, audioProbe_1.probePcm)('rx.telnyx.raw', buffer, probeMeta);
-                    }
-                    else if ((0, audioProbe_1.diagnosticsEnabled)()) {
-                        // Skip PCM analysis for compressed codecs; keep the socket open for diagnostics.
-                        log_1.log.info({
-                            event: 'audio_probe_skipped',
-                            call_control_id: callControlId,
-                            encoding: probeMeta.codec,
-                            sample_rate: probeMeta.sampleRateHz,
-                            channels: probeMeta.channels,
-                        }, 'audio probe skipped for non-PCM codec');
-                    }
-                    (0, audioProbe_1.markAudioSpan)('rx', probeMeta);
-                }
-                if (connection.mediaUnsupported) {
-                    return;
-                }
-                if (!usePcm16Ingest) {
-                    const ok = sessionManager.pushAudio(callControlId, buffer);
-                    if (!ok) {
-                        log_1.log.warn({ event: 'media_orphan_frame', call_control_id: callControlId }, 'media orphan frame');
-                    }
-                    return;
-                }
-                if (!acceptCodecs.has(encoding)) {
-                    logDecodeUnsupportedOnce(encoding, 'codec_not_accepted');
-                    return;
-                }
-                const decodeResult = await (0, codecDecode_1.decodeTelnyxPayloadToPcm16)({
-                    encoding,
-                    payload: buffer,
-                    channels: connection.mediaChannels ?? 1,
-                    reportedSampleRateHz: connection.mediaSampleRate,
-                    targetSampleRateHz,
-                    allowAmrWb: env_1.env.TELNYX_AMRWB_DECODE,
-                    allowG722: env_1.env.TELNYX_G722_DECODE,
-                    allowOpus: env_1.env.TELNYX_OPUS_DECODE,
-                    state: connection.codecState ?? (connection.codecState = {}),
-                    logContext: { call_control_id: callControlId },
-                });
-                if (!decodeResult) {
-                    const failureReason = encoding === 'AMR-WB' && connection.codecState?.amrwbLastError
-                        ? connection.codecState.amrwbLastError
-                        : 'decode_failed';
-                    logDecodeFailedOnce(encoding, failureReason);
-                    return;
-                }
-                const pcmBuffer = Buffer.from(decodeResult.pcm16.buffer, decodeResult.pcm16.byteOffset, decodeResult.pcm16.byteLength);
-                const decodedMeta = {
-                    callId: callControlId,
-                    format: 'pcm16le',
-                    codec: encoding,
-                    sampleRateHz: decodeResult.sampleRateHz,
-                    channels: 1,
-                    bitDepth: 16,
-                    logContext: { call_control_id: callControlId },
-                    lineage: ['rx.decoded.pcm16'],
-                };
-                (0, audioProbe_1.attachAudioMeta)(pcmBuffer, decodedMeta);
-                if ((0, audioProbe_1.diagnosticsEnabled)() && !connection.diagDecodedLogged) {
-                    connection.diagDecodedLogged = true;
-                    (0, audioProbe_1.probePcm)('rx.decoded.pcm16', pcmBuffer, decodedMeta);
-                }
-                if (encoding === 'AMR-WB' && !connection.amrwbDecodeLogged) {
-                    connection.amrwbDecodeLogged = true;
-                    log_1.log.info({
-                        event: 'amrwb_decode_success',
-                        call_control_id: callControlId,
-                        sample_rate: decodeResult.sampleRateHz,
-                    }, 'amr-wb decode success');
-                }
-                const ok = sessionManager.pushPcm16(callControlId, decodeResult.pcm16, decodeResult.sampleRateHz);
-                if (!ok) {
-                    log_1.log.warn({ event: 'media_orphan_frame', call_control_id: callControlId }, 'media orphan frame');
-                }
-            }
-            catch (error) {
-                log_1.log.warn({ event: 'telnyx_media_decode_error', call_control_id: callControlId, err: error }, 'telnyx media decode error');
-            }
-        };
         ws.on('message', (data, isBinary) => {
             if (isBinary) {
                 const buffer = Buffer.isBuffer(data)
@@ -442,11 +703,7 @@ function attachMediaWebSocketServer(server, sessionManager) {
                     : Array.isArray(data)
                         ? Buffer.concat(data)
                         : Buffer.from(data);
-                connection.frameSeq = (connection.frameSeq ?? 0) + 1;
-                if (debugMedia && connection.frameSeq % 50 === 0) {
-                    log_1.log.info({ event: 'media_frame', call_control_id: callControlId, bytes: buffer.length, seq: connection.frameSeq }, 'media frame');
-                }
-                void handleMediaPayload(buffer);
+                ingest.handleBinary(buffer);
                 return;
             }
             const text = typeof data === 'string'
@@ -456,181 +713,30 @@ function attachMediaWebSocketServer(server, sessionManager) {
                     : Array.isArray(data)
                         ? Buffer.concat(data).toString('utf8')
                         : '';
-            if (!text) {
+            if (!text)
                 return;
-            }
             let message;
             try {
                 message = JSON.parse(text);
             }
             catch (error) {
-                if (debugMedia) {
+                if (debugMedia)
                     log_1.log.warn({ event: 'media_ws_parse_failed', call_control_id: callControlId, err: error }, 'media ws parse failed');
-                }
                 return;
             }
             const event = typeof message.event === 'string' ? message.event : undefined;
-            if (debugMedia) {
-                connection.msgSeq = (connection.msgSeq ?? 0) + 1;
-                if (connection.msgSeq % 25 === 0) {
-                    log_1.log.info({
-                        event: 'media_ws_msg',
-                        call_control_id: callControlId,
-                        msg_event: event,
-                        keys: Object.keys(message),
-                    }, 'media ws message');
-                }
-            }
-            if (event === 'connected') {
-                if (debugMedia) {
-                    log_1.log.info({ event: 'media_ws_event_connected', call_control_id: callControlId }, 'media ws connected event');
-                }
-                return;
-            }
-            if (event === 'start') {
-                const start = message.start && typeof message.start === 'object' ? message.start : {};
-                const mediaFormat = start.media_format ??
-                    message.media_format ??
-                    undefined;
-                const encoding = mediaFormat ? getString(mediaFormat.encoding) : undefined;
-                const sampleRate = mediaFormat
-                    ? getNumber(mediaFormat.sample_rate ?? mediaFormat.sampleRate)
-                    : undefined;
-                const channels = mediaFormat ? getNumber(mediaFormat.channels) : undefined;
-                const normalizedEncoding = normalizeCodec(encoding ?? connection.mediaEncoding);
-                if (encoding) {
-                    connection.mediaEncoding = normalizedEncoding;
-                    connection.mediaSampleRate = sampleRate ?? (normalizedEncoding === 'AMR-WB' ? 16000 : undefined);
-                    connection.mediaChannels = channels;
-                }
-                const support = isCodecSupported(normalizedEncoding);
-                connection.mediaUnsupported = !support.supported;
-                if ((0, audioProbe_1.diagnosticsEnabled)()) {
-                    log_1.log.info({
-                        event: 'audio_codec_info',
-                        direction: 'rx.telnyx',
-                        call_control_id: callControlId,
-                        encoding: normalizedEncoding,
-                        sample_rate: sampleRate,
-                        channels,
-                        expected_encoding: process.env.TELNYX_STREAM_CODEC ?? 'PCMU',
-                        expected_sample_rate: undefined,
-                        pcm16_ingest: usePcm16Ingest,
-                        target_sample_rate_hz: targetSampleRateHz,
-                        accept_codecs: Array.from(acceptCodecs),
-                        amrwb_decode_enabled: env_1.env.TELNYX_AMRWB_DECODE,
-                        g722_decode_enabled: env_1.env.TELNYX_G722_DECODE,
-                        opus_decode_enabled: env_1.env.TELNYX_OPUS_DECODE,
-                    }, 'audio codec info');
-                }
-                if (normalizedEncoding && !connection.mediaCodecLogged) {
-                    connection.mediaCodecLogged = true;
-                    if (normalizedEncoding !== 'AMR-WB' &&
-                        acceptCodecs.has('AMR-WB') &&
-                        env_1.env.TELNYX_AMRWB_DECODE &&
-                        !connection.amrwbFallbackLogged) {
-                        connection.amrwbFallbackLogged = true;
-                        log_1.log.warn({
-                            event: 'amrwb_fallback',
-                            call_control_id: callControlId,
-                            reason: 'carrier_downgrade',
-                            negotiated_codec: normalizedEncoding,
-                        }, 'amr-wb not negotiated; falling back');
-                    }
-                    if (normalizedEncoding === 'AMR-WB' && !env_1.env.TELNYX_AMRWB_DECODE && !connection.amrwbFallbackLogged) {
-                        connection.amrwbFallbackLogged = true;
-                        log_1.log.warn({
-                            event: 'amrwb_fallback',
-                            call_control_id: callControlId,
-                            reason: 'decode_disabled',
-                            negotiated_codec: normalizedEncoding,
-                        }, 'amr-wb negotiated but decode disabled');
-                    }
-                    log_1.log.info({
-                        event: 'media_ws_codec_confirmed',
-                        call_control_id: callControlId,
-                        codec: normalizedEncoding,
-                        encoding: normalizedEncoding,
-                        sample_rate: sampleRate ?? (normalizedEncoding === 'AMR-WB' ? 16000 : undefined),
-                    }, 'media ws codec confirmed');
-                    if (normalizedEncoding === 'AMR-WB' &&
-                        env_1.env.TELNYX_AMRWB_DECODE &&
-                        !connection.amrwbEnabledLogged) {
-                        connection.amrwbEnabledLogged = true;
-                        log_1.log.info({
-                            event: 'amrwb_decode_enabled',
-                            call_control_id: callControlId,
-                            sample_rate: 16000,
-                        }, 'amr-wb decode enabled');
-                    }
-                }
-                // Codec negotiation can vary by leg. Don't hard-fail the stream here.
-                // Log once so we can confirm what Telnyx reports, but keep the socket alive.
-                if (normalizedEncoding && normalizedEncoding !== 'PCMU') {
-                    unsupportedEncodingCount += 1;
-                    log_1.log.warn({
-                        event: 'non_pcmu_media_encoding_reported',
-                        call_control_id: callControlId,
-                        encoding: normalizedEncoding,
-                        sample_rate: sampleRate,
-                        channels,
-                        note: support.supported
-                            ? 'Stream reported non-PCMU. Decode path enabled if configured.'
-                            : `Stream reported non-PCMU. Unsupported (${support.reason ?? 'unknown'}). Keeping WS open for diagnostics.`,
-                        unsupported_encoding_count: unsupportedEncodingCount,
-                    }, 'Non-PCMU encoding reported (WS kept open for diagnostics)');
-                }
-                if (!support.supported) {
-                    logDecodeUnsupportedOnce(normalizedEncoding, support.reason ?? 'unsupported_codec');
-                }
-                // IMPORTANT: do NOT close the socket here.
-                if (debugMedia) {
-                    log_1.log.info({
-                        event: 'media_ws_event_start',
-                        call_control_id: callControlId,
-                        media_format: mediaFormat,
-                        start_keys: Object.keys(start),
-                    }, 'media ws start');
-                }
-                return;
-            }
+            ingest.handleMessage(message);
             if (event === 'stop') {
-                if (debugMedia) {
-                    log_1.log.info({ event: 'media_ws_event_stop', call_control_id: callControlId }, 'media ws stop');
-                }
                 ws.close(1000, 'media_stop');
-                return;
             }
-            if (event !== 'media') {
-                return;
-            }
-            const media = message.media && typeof message.media === 'object' ? message.media : undefined;
-            const payload = media?.payload ??
-                message.payload;
-            if (!payload) {
-                return;
-            }
-            let buffer;
-            try {
-                buffer = Buffer.from(payload, 'base64');
-            }
-            catch (error) {
-                if (debugMedia) {
-                    log_1.log.warn({ event: 'media_ws_decode_failed', call_control_id: callControlId, err: error }, 'media ws decode failed');
-                }
-                return;
-            }
-            connection.frameSeq = (connection.frameSeq ?? 0) + 1;
-            if (debugMedia && connection.frameSeq % 50 === 0) {
-                log_1.log.info({ event: 'media_frame', call_control_id: callControlId, bytes: buffer.length, seq: connection.frameSeq }, 'media frame');
-            }
-            void handleMediaPayload(buffer);
         });
         ws.on('close', () => {
             sessionManager.unregisterMediaConnection(callControlId, ws);
+            ingest.close('ws_close');
         });
         ws.on('error', (error) => {
             sessionManager.unregisterMediaConnection(callControlId, ws);
+            ingest.close('ws_error');
             log_1.log.error({ err: error, call_control_id: callControlId }, 'media websocket error');
         });
     });
@@ -645,9 +751,8 @@ async function ensureGreetingAsset() {
     }
     catch (error) {
         const code = error.code;
-        if (code && code !== 'ENOENT') {
+        if (code && code !== 'ENOENT')
             log_1.log.warn({ err: error, path: greetingPath }, 'greeting asset stat failed');
-        }
     }
     const voice = env_1.env.KOKORO_VOICE_ID ?? 'af_bella';
     try {
@@ -673,9 +778,8 @@ async function ensureGreetingAsset() {
             logContext: { path: greetingPath },
             lineage: ['pipeline:unknown'],
         };
-        if (pipelineApplied) {
+        if (pipelineApplied)
             (0, audioProbe_1.probeWav)('tts.out.telephonyOptimized', result.audio, pipelineMeta);
-        }
         (0, audioProbe_1.probeWav)('tx.telnyx.payload', result.audio, { ...pipelineMeta, kind: 'greeting.wav' });
         try {
             const info = (0, wavInfo_1.parseWavInfo)(result.audio);
@@ -710,7 +814,7 @@ async function ensureGreetingAsset() {
 function buildServer() {
     const app = (0, express_1.default)();
     const sessionManager = new sessionManager_1.SessionManager();
-    // --- Metrics first: capture full request time including JSON parsing + downstream work.
+    // Metrics first: capture full request time including JSON parsing + downstream work.
     app.use(metrics_1.metricsMiddleware);
     app.get('/metrics', metrics_1.metricsHandler);
     fs_1.default.mkdirSync(env_1.env.AUDIO_STORAGE_DIR, { recursive: true });
@@ -754,9 +858,8 @@ function buildServer() {
     app.use('/v1/webrtc', (0, webrtc_1.createWebRtcRouter)(sessionManager));
     const telnyxWebhookRouter = (0, telnyxWebhook_1.createTelnyxWebhookRouter)(sessionManager);
     const telnyxWebhookRoutes = ['/v1/telnyx/webhook', '/api/telnyx/call-control'];
-    for (const route of telnyxWebhookRoutes) {
+    for (const route of telnyxWebhookRoutes)
         app.use(route, telnyxWebhookRouter);
-    }
     log_1.log.info({ routes: telnyxWebhookRoutes }, 'telnyx webhook routes configured');
     app.use(errorHandler);
     const server = http_1.default.createServer(app);

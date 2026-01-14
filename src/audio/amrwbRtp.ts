@@ -452,12 +452,13 @@ export function depacketizeAmrWbBandwidthEfficient(payload: Buffer): BeDepacketi
     const bitLen = amrWbSpeechBits(entry.ft);
     if (bitLen === null) return { ok: false, error: `invalid_ft_${entry.ft}`, cmr };
 
-    let data = Buffer.alloc(0);
+    let data: Buffer = Buffer.alloc(0);
     if (bitLen > 0) {
       const bits = reader.readBitsToBuffer(bitLen);
       if (!bits) return { ok: false, error: `frame_truncated_ft_${entry.ft}`, cmr };
-      data = bits;
+      data = bits as Buffer;
     }
+
 
     frames.push({
       ft: entry.ft,
@@ -514,12 +515,13 @@ export function depacketizeAmrWbBandwidthEfficientNoCmr(
     const bitLen = amrWbSpeechBits(entry.ft);
     if (bitLen === null) return { ok: false, error: `invalid_ft_${entry.ft}`, cmr };
 
-    let data = Buffer.alloc(0);
+    let data: Buffer = Buffer.alloc(0);
     if (bitLen > 0) {
       const bits = reader.readBitsToBuffer(bitLen);
       if (!bits) return { ok: false, error: `frame_truncated_ft_${entry.ft}`, cmr };
-      data = bits;
+      data = bits as Buffer;
     }
+
 
     frames.push({
       ft: entry.ft,
