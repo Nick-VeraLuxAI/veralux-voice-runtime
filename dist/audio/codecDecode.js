@@ -12,6 +12,7 @@ exports.clearTelnyxCodecSession = clearTelnyxCodecSession;
 // src/audio/codecDecode.ts
 const fs_1 = __importDefault(require("fs"));
 const path_1 = __importDefault(require("path"));
+const crypto_1 = __importDefault(require("crypto"));
 const child_process_1 = require("child_process");
 const log_1 = require("../log");
 const g722_1 = require("./vendor/g722/g722");
@@ -421,12 +422,13 @@ function normalizeTelnyxEncoding(raw) {
  * 2) AMR-WB storage frames: [TOC(F=0)+speech...] (optionally preceded by "#!AMR-WB\n")
  *
  * Key behaviors:
- * - BE preferred via transcodeTelnyxAmrWbPayload().
- * - Optional octet fallback only when BE not active and env allows it.
- * - Always use libopencore_amrwb in ffmpeg paths.
+ * - transcodeTelnyxAmrWbPayload() is the SINGLE source of truth for Telnyx AMR-WB normalization.
+ * - transcoder output is ALWAYS storage frames bytes (NO header). We NEVER re-parse it as octet.
+ * - Optional raw octet fallback ONLY when BE is not active and env allows it.
  * - runtime_selected_storage.awb is append-only (no trimming; no rate-limit).
  * - IMPORTANT: Append VALIDATED SPEECH frames immediately when accepted (not only at decode flush),
  *   so the capture is complete even if the call ends before a batch flush.
+ * - De-dupe consecutive identical speech frames / appends to prevent "echo/overlap" artifacts.
  */
 const AMRWB_FRAME_SIZES = [17, 23, 32, 36, 40, 46, 50, 58, 60];
 const AMRWB_SID_FRAME_BYTES = 5;
@@ -706,6 +708,7 @@ function depacketizeAmrWbToStorage(payload, options) {
  * - Serialized per session (promise chain) to prevent interleaved writes.
  * - Writes header once if file is new/empty.
  * - No rate-limit (rate-limit causes incomplete recordings).
+ * - Dedupe consecutive identical appends to avoid overlap/echo.
  */
 function maybeAppendSelectedStorageFrames(state, framesNoHeader, logContext) {
     if (!(parseBoolEnv(process.env.AMRWB_ARTIFACT_DEBUG) || parseBoolEnv(process.env.TRUTH_CAPTURE_AMRWB)))
@@ -718,6 +721,15 @@ function maybeAppendSelectedStorageFrames(state, framesNoHeader, logContext) {
     const payload = framesNoHeader.length === 1 ? framesNoHeader[0] : Buffer.concat(framesNoHeader);
     if (!payload || payload.length === 0)
         return;
+    // Dedupe consecutive identical *append batches*
+    const batchSha1 = crypto_1.default.createHash('sha1').update(payload).digest('hex');
+    if (state.amrwbLastSelectedAppendSha1 && state.amrwbLastSelectedAppendSha1 === batchSha1) {
+        if (parseBoolEnv(process.env.AMRWB_DECODE_TRACE)) {
+            log_1.log.info({ event: 'amrwb_selected_storage_append_deduped', outPath, ...(logContext ?? {}) }, 'AMR-WB append deduped');
+        }
+        return;
+    }
+    state.amrwbLastSelectedAppendSha1 = batchSha1;
     const doWrite = async () => {
         try {
             await fs_1.default.promises.mkdir(dir, { recursive: true });
@@ -1072,7 +1084,7 @@ async function decodeTelnyxPayloadToPcm16(opts) {
         if (!opts.allowAmrWb)
             return null;
         const candidates = [];
-        // 1) Run transcoder FIRST
+        // 1) Run transcoder FIRST (single source of truth)
         const transcode = (0, amrwbRtp_1.transcodeTelnyxAmrWbPayload)(opts.payload);
         // artifact capture (optional)
         if (parseBoolEnv(process.env.TRUTH_CAPTURE_AMRWB) || parseBoolEnv(process.env.AMRWB_ARTIFACT_DEBUG)) {
@@ -1085,14 +1097,15 @@ async function decodeTelnyxPayloadToPcm16(opts) {
                 },
             });
             if (transcode.ok) {
+                // transcoder output is STORAGE frames bytes; treat as storage for artifact writer
                 (0, amrwbRtp_1.writeAmrwbArtifacts)('amrwb_transcoded_output', transcode.output, {
-                    hasCmr: transcode.cmrStripped !== true,
+                    hasCmr: false,
                     meta: {
                         packing: transcode.packing,
                         rtp_stripped: transcode.rtpStripped,
                         toc_count: transcode.tocCount,
                         cmr: transcode.cmr ?? null,
-                        cmr_stripped: transcode.cmrStripped ?? null,
+                        cmr_stripped: true,
                         total_bytes_in: transcode.totalBytesIn,
                         total_bytes_out: transcode.totalBytesOut,
                         ...(opts.logContext ?? {}),
@@ -1103,8 +1116,10 @@ async function decodeTelnyxPayloadToPcm16(opts) {
         const envDefaultBe = parseBoolEnv(process.env.TELNYX_AMRWB_DEFAULT_BE);
         const forcedBe = opts.forceAmrWbBe === true;
         const beActive = forcedBe || envDefaultBe || (transcode.ok && transcode.packing === 'be');
-        // If BE is active, do NOT allow octet fallback.
+        // If BE is active, do NOT allow raw octet fallback.
         const octetFallbackAllowed = !beActive && parseBoolEnv(process.env.AMRWB_ALLOW_OCTET_FALLBACK);
+        // Optional stricter enforcement: only allow BE when explicitly forced or env requires
+        const requireBe = forcedBe || parseBoolEnv(process.env.AMRWB_REQUIRE_BE);
         const logPathSelectOnce = (chosenPath) => {
             if (state.amrwbPathSelectedLogged)
                 return;
@@ -1114,8 +1129,9 @@ async function decodeTelnyxPayloadToPcm16(opts) {
                 be_active: beActive,
                 forced_be: forcedBe,
                 env_default_be: envDefaultBe,
+                require_be: requireBe,
                 transcode_packing: transcode.ok ? transcode.packing : 'transcode_failed',
-                cmr_stripped: transcode.ok ? Boolean(transcode.cmrStripped) : null,
+                cmr_stripped: transcode.ok ? true : null,
                 fallback_allowed: octetFallbackAllowed,
                 chosen_path: chosenPath,
                 ...(opts.logContext ?? {}),
@@ -1134,12 +1150,13 @@ async function decodeTelnyxPayloadToPcm16(opts) {
                     rtp_stripped: transcode.rtpStripped,
                     forced_be: forcedBe,
                     env_default_be: envDefaultBe,
+                    require_be: requireBe,
                     be_active: beActive,
                     ...(opts.logContext ?? {}),
                 }, `AMRWB_DEPACK invalid reason=${transcode.error} firstBytesHex=${hexPrefix} len=${opts.payload.length}`);
             }
             state.amrwbLastError = 'amrwb_depack_invalid';
-            if (beActive) {
+            if (beActive || requireBe) {
                 state.amrwbLastError = 'amrwb_be_transcode_failed';
                 logPathSelectOnce('be');
                 return null;
@@ -1153,123 +1170,85 @@ async function decodeTelnyxPayloadToPcm16(opts) {
                     packing: transcode.packing,
                     rtp_stripped: transcode.rtpStripped,
                     toc_count: transcode.tocCount,
-                    cmr_stripped: transcode.cmrStripped ?? false,
+                    cmr_stripped: true,
                     total_bytes_in: transcode.totalBytesIn,
                     total_bytes_out: transcode.totalBytesOut,
                     forced_be: forcedBe,
                     env_default_be: envDefaultBe,
+                    require_be: requireBe,
                     be_active: beActive,
                     ...(opts.logContext ?? {}),
-                }, `AMRWB_DEPACK packing=${transcode.packing} rtpStripped=${transcode.rtpStripped} tocCount=${transcode.tocCount} cmrStripped=${Boolean(transcode.cmrStripped)} totalBytesIn=${transcode.totalBytesIn} totalBytesOut=${transcode.totalBytesOut}`);
+                }, `AMRWB_DEPACK packing=${transcode.packing} rtpStripped=${transcode.rtpStripped} tocCount=${transcode.tocCount} totalBytesIn=${transcode.totalBytesIn} totalBytesOut=${transcode.totalBytesOut}`);
             }
-            let depStorage = null;
-            // Case A: transcoder output already looks like STORAGE frames (with or without header)
-            if (looksLikeAmrWbStorageFrames(transcode.output) || looksLikeAmrWbStorageFrames(ensureAmrWbStreamHeader(transcode.output))) {
-                const storageBytes = ensureAmrWbStreamHeader(transcode.output);
-                const parsedStorage = parseAmrWbStorageToFrames(storageBytes);
-                if (parsedStorage.ok) {
-                    if (parsedStorage.decodedFrames > 0) {
-                        depStorage = {
-                            ok: true,
-                            storage: storageBytes,
-                            frames: parsedStorage.frames,
-                            frameTypes: parsedStorage.frameTypes,
-                            totalFrames: parsedStorage.totalFrames,
-                            mode: 'storage',
-                            decodedFrames: parsedStorage.decodedFrames,
-                            sidFrames: parsedStorage.sidFrames,
-                            noDataFrames: parsedStorage.noDataFrames,
-                            speechLostFrames: parsedStorage.speechLostFrames,
-                            hasSpeechFrames: true,
-                        };
-                    }
-                    else if (parseBoolEnv(process.env.AMRWB_DECODE_TRACE)) {
-                        log_1.log.info({
-                            event: 'amrwb_transcoded_no_speech',
-                            total_frames: parsedStorage.totalFrames,
-                            decoded_frames: parsedStorage.decodedFrames,
-                            sid_frames: parsedStorage.sidFrames,
-                            no_data_frames: parsedStorage.noDataFrames,
-                            speech_lost_frames: parsedStorage.speechLostFrames,
-                            ...(opts.logContext ?? {}),
-                        }, 'AMR-WB transcoded chunk had no speech; ignored');
-                    }
+            // If we require BE and transcoder says octet, reject (no fallback)
+            if (requireBe && transcode.packing !== 'be') {
+                state.amrwbLastError = 'amrwb_require_be_mismatch';
+                logPathSelectOnce('be');
+                log_1.log.warn({
+                    event: 'amrwb_require_be_mismatch',
+                    packing: transcode.packing,
+                    payload_len: opts.payload.length,
+                    ...(opts.logContext ?? {}),
+                }, 'AMR-WB require-BE is enabled but input did not parse as BE');
+                return null;
+            }
+            // IMPORTANT: transcoder output is ALWAYS storage frames bytes (NO header).
+            // We ONLY parse it as storage. We NEVER treat it as octet.
+            const storageBytes = ensureAmrWbStreamHeader(transcode.output);
+            const parsedStorage = parseAmrWbStorageToFrames(storageBytes);
+            if (parsedStorage.ok) {
+                if (parsedStorage.decodedFrames > 0) {
+                    const depStorage = {
+                        ok: true,
+                        storage: storageBytes,
+                        frames: parsedStorage.frames,
+                        frameTypes: parsedStorage.frameTypes,
+                        totalFrames: parsedStorage.totalFrames,
+                        mode: 'storage',
+                        decodedFrames: parsedStorage.decodedFrames,
+                        sidFrames: parsedStorage.sidFrames,
+                        noDataFrames: parsedStorage.noDataFrames,
+                        speechLostFrames: parsedStorage.speechLostFrames,
+                        hasSpeechFrames: true,
+                    };
+                    candidates.push({
+                        label: 'transcoded',
+                        dep: depStorage,
+                        sourcePayloadLen: transcode.output.length,
+                        sourceHexPrefix: transcode.output.subarray(0, Math.min(32, transcode.output.length)).toString('hex'),
+                    });
                 }
-                else if (!state.amrwbDepacketizeFailedLogged) {
-                    state.amrwbDepacketizeFailedLogged = true;
-                    log_1.log.warn({
-                        event: 'amrwb_transcoded_storage_parse_failed',
-                        reason: parsedStorage.error.reason,
-                        invalid_ft: parsedStorage.error.invalidFt ?? null,
-                        payload_len: transcode.output.length,
-                        packing: transcode.packing,
-                        cmr_stripped: transcode.cmrStripped ?? false,
-                        hex_prefix: transcode.output.subarray(0, Math.min(32, transcode.output.length)).toString('hex'),
+                else if (parseBoolEnv(process.env.AMRWB_DECODE_TRACE)) {
+                    log_1.log.info({
+                        event: 'amrwb_transcoded_no_speech',
+                        total_frames: parsedStorage.totalFrames,
+                        decoded_frames: parsedStorage.decodedFrames,
+                        sid_frames: parsedStorage.sidFrames,
+                        no_data_frames: parsedStorage.noDataFrames,
+                        speech_lost_frames: parsedStorage.speechLostFrames,
                         ...(opts.logContext ?? {}),
-                    }, 'AMR-WB transcoded output looked like storage but did not parse');
+                    }, 'AMR-WB transcoded chunk had no speech; ignored');
                 }
             }
-            else {
-                // Case B: treat transcoder output as octet-ish (NO CMR) and convert -> storage frames.
-                const parsed = parseAmrWbOctetAlignedToStorageFrames(transcode.output, 0);
-                if (parsed.ok) {
-                    if (parsed.decodedFrames > 0) {
-                        const storageBytes = Buffer.concat([AMRWB_STREAM_HEADER, ...parsed.frames]);
-                        depStorage = {
-                            ok: true,
-                            storage: storageBytes,
-                            frames: parsed.frames,
-                            frameTypes: parsed.frameTypes,
-                            totalFrames: parsed.totalFrames,
-                            mode: 'storage',
-                            decodedFrames: parsed.decodedFrames,
-                            sidFrames: parsed.sidFrames,
-                            noDataFrames: parsed.noDataFrames,
-                            speechLostFrames: parsed.speechLostFrames,
-                            hasSpeechFrames: true,
-                        };
-                    }
-                    else if (parseBoolEnv(process.env.AMRWB_DECODE_TRACE)) {
-                        log_1.log.info({
-                            event: 'amrwb_transcoded_no_speech',
-                            total_frames: parsed.totalFrames,
-                            decoded_frames: parsed.decodedFrames,
-                            sid_frames: parsed.sidFrames,
-                            no_data_frames: parsed.noDataFrames,
-                            speech_lost_frames: parsed.speechLostFrames,
-                            ...(opts.logContext ?? {}),
-                        }, 'AMR-WB transcoded chunk had no speech; ignored');
-                    }
-                }
-                else if (!state.amrwbDepacketizeFailedLogged) {
-                    state.amrwbDepacketizeFailedLogged = true;
-                    log_1.log.warn({
-                        event: 'amrwb_transcoded_storage_parse_failed',
-                        reason: parsed.error.reason,
-                        invalid_ft: parsed.error.invalidFt ?? null,
-                        payload_len: transcode.output.length,
-                        packing: transcode.packing,
-                        cmr_stripped: transcode.cmrStripped ?? false,
-                        hex_prefix: transcode.output.subarray(0, Math.min(32, transcode.output.length)).toString('hex'),
-                        ...(opts.logContext ?? {}),
-                    }, 'AMR-WB transcoded output did not parse/convert to storage frames');
-                }
+            else if (!state.amrwbDepacketizeFailedLogged) {
+                state.amrwbDepacketizeFailedLogged = true;
+                log_1.log.warn({
+                    event: 'amrwb_transcoded_storage_parse_failed',
+                    reason: parsedStorage.error.reason,
+                    invalid_ft: parsedStorage.error.invalidFt ?? null,
+                    payload_len: transcode.output.length,
+                    packing: transcode.packing,
+                    hex_prefix: transcode.output.subarray(0, Math.min(32, transcode.output.length)).toString('hex'),
+                    ...(opts.logContext ?? {}),
+                }, 'AMR-WB transcoded output did not parse as storage frames');
             }
-            if (depStorage) {
-                candidates.push({
-                    label: 'transcoded',
-                    dep: depStorage,
-                    sourcePayloadLen: transcode.output.length,
-                    sourceHexPrefix: transcode.output.subarray(0, Math.min(32, transcode.output.length)).toString('hex'),
-                });
-            }
-            else if (beActive) {
+            if (candidates.length === 0 && (beActive || requireBe)) {
                 state.amrwbLastError = 'amrwb_be_storage_parse_failed';
                 logPathSelectOnce('be');
                 return null;
             }
         }
-        // Optional octet fallback (only if BE inactive AND env enables it)
+        // Optional raw octet fallback (ONLY if BE inactive AND env enables it)
         if (octetFallbackAllowed) {
             const rawDep = depacketizeAmrWbToStorage(opts.payload, { skipCmr: false });
             if (rawDep.ok) {
@@ -1282,7 +1261,7 @@ async function decodeTelnyxPayloadToPcm16(opts) {
             }
         }
         if (candidates.length === 0) {
-            logPathSelectOnce(beActive ? 'be' : 'octet');
+            logPathSelectOnce(beActive || requireBe ? 'be' : 'octet');
             state.amrwbLastError = state.amrwbLastError ?? 'amrwb_no_candidates';
             return null;
         }
@@ -1307,7 +1286,7 @@ async function decodeTelnyxPayloadToPcm16(opts) {
         const transcodedCandidate = candidates.find((candidate) => candidate.label === 'transcoded');
         const chosen = transcodedCandidate ?? candidates[0];
         const dep = chosen.dep;
-        const chosenPath = chosen.label === 'raw' ? 'octet' : transcode.ok && transcode.packing === 'be' ? 'be' : 'octet';
+        const chosenPath = chosen.label === 'raw' ? 'octet' : (transcode.ok && transcode.packing === 'be' ? 'be' : 'octet');
         logPathSelectOnce(chosenPath);
         if (chosen.label === 'raw' && !state.amrwbFallbackLogged) {
             state.amrwbFallbackLogged = true;
@@ -1342,6 +1321,12 @@ async function decodeTelnyxPayloadToPcm16(opts) {
             // Speech frames must match exact size (TOC + speech payload)
             if (expected <= 1 || frame.length !== expected)
                 continue;
+            // Dedupe consecutive identical speech frames to prevent overlap/echo
+            const frSha1 = crypto_1.default.createHash('sha1').update(frame).digest('hex');
+            if (state.amrwbLastAcceptedSpeechSha1 && state.amrwbLastAcceptedSpeechSha1 === frSha1) {
+                continue;
+            }
+            state.amrwbLastAcceptedSpeechSha1 = frSha1;
             state.amrwbFrameBuf.push(frame);
             state.amrwbFrameBufDecodedFrames = (state.amrwbFrameBufDecodedFrames ?? 0) + 1;
             acceptedSpeechFrames.push(frame);
