@@ -1,3 +1,4 @@
+// src/calls/sessionManager.ts
 import { release, type ReleaseParams } from '../limits/capacity';
 import { log } from '../log';
 import { incInboundAudioFrames, incInboundAudioFramesDropped } from '../metrics';
@@ -5,6 +6,7 @@ import { CallSession } from './callSession';
 import { CallSessionConfig, CallSessionId } from './types';
 import type { TransportMode, TransportSession } from '../transport/types';
 import type { Pcm16Frame } from '../media/types';
+import { clearTelnyxCodecSession } from '../audio/codecDecode';
 
 const DEFAULT_IDLE_TTL_MINUTES = 10;
 const DEFAULT_SWEEP_INTERVAL_MS = 60_000;
@@ -266,11 +268,15 @@ export class SessionManager {
   }
 
   public teardown(callControlId: CallSessionId, reason?: string, context: SessionLogContext = {}): void {
+    // ✅ Always clear codec session cache on teardown (session exists OR missing)
+    clearTelnyxCodecSession({ call_control_id: callControlId });
+
     const session = this.sessions.get(callControlId);
     if (!session) {
       this.inactiveCalls.set(callControlId, Date.now());
       this.closeMediaConnections(callControlId, reason ?? 'teardown');
       this.clearQueue(callControlId);
+
       const transport = this.transports.get(callControlId);
       if (transport) {
         this.transports.delete(callControlId);
@@ -278,6 +284,7 @@ export class SessionManager {
           log.warn({ err: error, call_control_id: callControlId }, 'transport stop failed');
         });
       }
+
       if (context.tenantId) {
         void this.capacityRelease({
           tenantId: context.tenantId,
@@ -292,6 +299,7 @@ export class SessionManager {
     this.inactiveCalls.set(callControlId, Date.now());
     session.end();
     this.sessions.delete(callControlId);
+
     const transport = this.transports.get(callControlId);
     if (transport) {
       this.transports.delete(callControlId);
@@ -299,8 +307,10 @@ export class SessionManager {
         log.warn({ err: error, call_control_id: callControlId }, 'transport stop failed');
       });
     }
+
     this.closeMediaConnections(callControlId, reason ?? 'teardown');
     this.clearQueue(callControlId);
+
     if (session.tenantId) {
       void this.capacityRelease({
         tenantId: session.tenantId,
@@ -413,7 +423,6 @@ export class SessionManager {
     session.onPcm16Frame(frame);
     return true;
   }
-
 
   public registerMediaConnection(callControlId: CallSessionId, connection: MediaConnection): void {
     const connections = this.mediaConnections.get(callControlId) ?? new Set<MediaConnection>();

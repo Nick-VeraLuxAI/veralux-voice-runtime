@@ -1,8 +1,7 @@
-// src/media/amrwbrtp.ts
+// src/media/amrwbRtp.ts
 import { log } from '../log';
 import fs from 'node:fs';
 import path from 'node:path';
-
 
 type RtpStripResult = { payload: Buffer; stripped: boolean };
 
@@ -55,6 +54,10 @@ export type BeDepacketizeResult =
 export type TranscodeAmrWbResult =
   | {
       ok: true;
+      /**
+       * packing indicates what we detected on input.
+       * output is ALWAYS AMR-WB "storage frames bytes" (no "#!AMR-WB\n" header).
+       */
       packing: 'octet' | 'be';
       rtpStripped: boolean;
       output: Buffer;
@@ -63,12 +66,10 @@ export type TranscodeAmrWbResult =
       totalBytesOut: number;
       /**
        * IMPORTANT SEMANTICS:
-       * - cmrStripped=true means: "no CMR byte is present in output" (TOC starts at byte 0)
-       * - cmrStripped=false means: "output includes a CMR byte at byte 0" (TOC starts at byte 1)
-       *
-       * Downstream must NOT attempt any "strip CMR" guessing when cmrStripped=true.
+       * - cmrStripped=true means: "no CMR byte is present in output" (storage frames start at byte 0)
+       *   (This module ALWAYS outputs storage frames, so cmrStripped is always true.)
        */
-      cmrStripped?: boolean;
+      cmrStripped: true;
       cmr?: number;
     }
   | {
@@ -87,11 +88,15 @@ const AMRWB_SID_BYTES = 5;
 // NOTE: 14 = Speech Lost, 15 = No Data. Both carry 0 bytes in octet-aligned form.
 const AMRWB_ZERO_LEN_FTS = new Set([14, 15]);
 
+const AMRWB_STREAM_HEADER = Buffer.from('#!AMR-WB\n', 'ascii');
+
 const AMRWB_REPACK_DEBUG_MAX = 30;
 const AMRWB_REPACK_DEBUG_INTERVAL_MS = 1000;
 
 let amrwbRepackDebugCount = 0;
 let amrwbRepackDebugLastLogAt = 0;
+
+/* ---------------------------------- utils --------------------------------- */
 
 function parseBoolEnv(value: string | undefined): boolean {
   if (!value) return false;
@@ -102,6 +107,7 @@ function parseBoolEnv(value: string | undefined): boolean {
 function amrwbRepackDebugEnabled(): boolean {
   return parseBoolEnv(process.env.AMRWB_REPACK_DEBUG);
 }
+
 function amrwbDebugDir(): string {
   return process.env.STT_DEBUG_DIR || process.env.AMRWB_DEBUG_DIR || '/tmp/veralux-stt-debug';
 }
@@ -113,54 +119,6 @@ function safeMkdir(dir: string): void {
     // ignore
   }
 }
-
-export function writeAmrwbArtifacts(
-  label: string,
-  payloadOctetAlignedRtp: Buffer,
-  opts: { hasCmr: boolean; meta?: Record<string, unknown> } = { hasCmr: true },
-): void {
-  const enabled = parseBoolEnv(process.env.AMRWB_ARTIFACT_DEBUG) || amrwbRepackDebugEnabled();
-  if (!enabled) return;
-
-  const dir = amrwbDebugDir();
-  safeMkdir(dir);
-
-  const stamp = Date.now();
-  const base = `${label}__${stamp}`;
-
-  const rtpPath = path.join(dir, `${base}__rtp_octet.bin`);
-  const storagePath = path.join(dir, `${base}__storage.awb`);
-
-  try {
-    fs.writeFileSync(rtpPath, payloadOctetAlignedRtp);
-
-    const storage = rtpOctetAlignedToAwbStorage(payloadOctetAlignedRtp, { hasCmr: opts.hasCmr });
-    if (storage.ok) {
-      fs.writeFileSync(storagePath, storage.awb);
-    } else {
-      log.warn(
-        { event: 'amrwb_artifact_storage_build_failed', label, error: storage.error, hasCmr: opts.hasCmr, ...(opts.meta ?? {}) },
-        'AMR-WB artifact: failed to build storage .awb',
-      );
-    }
-
-    log.info(
-      {
-        event: 'amrwb_artifacts_written',
-        label,
-        rtp_octet_bin: rtpPath,
-        storage_awb: storagePath,
-        rtp_len: payloadOctetAlignedRtp.length,
-        hasCmr: opts.hasCmr,
-        ...(opts.meta ?? {}),
-      },
-      'AMR-WB artifacts written',
-    );
-  } catch (err) {
-    log.warn({ event: 'amrwb_artifacts_write_failed', label, err: String(err) }, 'AMR-WB artifact write failed');
-  }
-}
-
 
 function shouldLogAmrwbRepackDebug(now: number): boolean {
   if (!amrwbRepackDebugEnabled()) return false;
@@ -175,6 +133,44 @@ function shouldLogAmrwbRepackDebug(now: number): boolean {
   }
   return false;
 }
+
+/* ----------------------------- RTP strip helper ---------------------------- */
+
+export function detectAndStripRtpHeader(buf: Buffer): RtpStripResult {
+  if (buf.length < 12) return { payload: buf, stripped: false };
+  const version = buf[0] >> 6;
+  if (version !== 2) return { payload: buf, stripped: false };
+
+  const hasPadding = (buf[0] & 0x20) !== 0;
+  const csrcCount = buf[0] & 0x0f;
+  const hasExtension = (buf[0] & 0x10) !== 0;
+
+  let headerLen = 12 + csrcCount * 4;
+  if (headerLen > buf.length) return { payload: buf, stripped: false };
+
+  if (hasExtension) {
+    if (headerLen + 4 > buf.length) return { payload: buf, stripped: false };
+    const extLenWords = buf.readUInt16BE(headerLen + 2);
+    headerLen += 4 + extLenWords * 4;
+    if (headerLen > buf.length) return { payload: buf, stripped: false };
+  }
+
+  if (headerLen >= buf.length) return { payload: buf, stripped: false };
+
+  let payloadEnd = buf.length;
+  if (hasPadding) {
+    const paddingLen = buf[buf.length - 1] ?? 0;
+    const maxPadding = buf.length - headerLen;
+    if (paddingLen > 0 && paddingLen <= maxPadding) {
+      payloadEnd = buf.length - paddingLen;
+    }
+  }
+
+  if (payloadEnd < headerLen) return { payload: buf, stripped: false };
+  return { payload: buf.subarray(headerLen, payloadEnd), stripped: true };
+}
+
+/* ------------------------------ AMR-WB tables ------------------------------ */
 
 function isAmrWbInvalidFt(ft: number): boolean {
   // Reserved/invalid for AMR-WB per RFC4867: 10..13
@@ -195,6 +191,8 @@ function amrWbSpeechBytes(ft: number): number | null {
   if (AMRWB_ZERO_LEN_FTS.has(ft)) return 0;
   return null;
 }
+
+/* -------------------------------- BitReader -------------------------------- */
 
 class BitReader {
   private bitOffset = 0;
@@ -250,82 +248,8 @@ class BitReader {
     return true;
   }
 }
-export function rtpOctetAlignedToAwbStorage(
-  payload: Buffer,
-  opts: { hasCmr?: boolean } = {},
-): { ok: true; awb: Buffer; frames: number } | { ok: false; error: string } {
-  const hasCmr = opts.hasCmr !== false; // default true
 
-  const parsed = hasCmr ? tryParseAmrWbOctetAligned(payload) : tryParseAmrWbOctetAlignedNoCmr(payload);
-  if (!parsed.ok) return { ok: false, error: parsed.error };
-
-  // Build .awb stream: "#!AMR-WB\n" + (frameHeaderByte + frameDataBytes)*N
-  // frameHeaderByte format (AMR file storage): (FT<<3) | (Q<<2)  with remaining bits = 0
-  const header = Buffer.from('#!AMR-WB\n', 'ascii');
-
-  // We need to split the data section into per-frame blobs
-  // For hasCmr=true: data starts after 1 (CMR) + tocBytes
-  // For hasCmr=false: data starts after tocBytes
-  const tocBytes = parsed.tocBytes;
-  const dataOffset = (hasCmr ? 1 : 0) + tocBytes;
-
-  let cursor = dataOffset;
-  const outParts: Buffer[] = [header];
-
-  for (const frame of parsed.frames) {
-    const ft = frame.ft & 0x0f;
-    const q = frame.q & 0x01;
-
-    const storageFrameHeader = Buffer.from([((ft << 3) & 0x78) | ((q << 2) & 0x04)]);
-    outParts.push(storageFrameHeader);
-
-    const size = frame.sizeBytes;
-    if (size > 0) {
-      if (cursor + size > payload.length) return { ok: false, error: 'data_truncated' };
-      outParts.push(payload.subarray(cursor, cursor + size));
-      cursor += size;
-    }
-  }
-
-  // cursor should land exactly at end of payload
-  if (cursor !== payload.length) return { ok: false, error: `data_cursor_mismatch_${cursor}_len_${payload.length}` };
-
-  return { ok: true, awb: Buffer.concat(outParts), frames: parsed.frames.length };
-}
-
-
-export function detectAndStripRtpHeader(buf: Buffer): RtpStripResult {
-  if (buf.length < 12) return { payload: buf, stripped: false };
-  const version = buf[0] >> 6;
-  if (version !== 2) return { payload: buf, stripped: false };
-
-  const hasPadding = (buf[0] & 0x20) !== 0;
-  const csrcCount = buf[0] & 0x0f;
-  const hasExtension = (buf[0] & 0x10) !== 0;
-  let headerLen = 12 + csrcCount * 4;
-  if (headerLen > buf.length) return { payload: buf, stripped: false };
-
-  if (hasExtension) {
-    if (headerLen + 4 > buf.length) return { payload: buf, stripped: false };
-    const extLenWords = buf.readUInt16BE(headerLen + 2);
-    headerLen += 4 + extLenWords * 4;
-    if (headerLen > buf.length) return { payload: buf, stripped: false };
-  }
-
-  if (headerLen >= buf.length) return { payload: buf, stripped: false };
-
-  let payloadEnd = buf.length;
-  if (hasPadding) {
-    const paddingLen = buf[buf.length - 1] ?? 0;
-    const maxPadding = buf.length - headerLen;
-    if (paddingLen > 0 && paddingLen <= maxPadding) {
-      payloadEnd = buf.length - paddingLen;
-    }
-  }
-
-  if (payloadEnd < headerLen) return { payload: buf, stripped: false };
-  return { payload: buf.subarray(headerLen, payloadEnd), stripped: true };
-}
+/* ----------------------- Octet-aligned RTP parsing ------------------------ */
 
 export function tryParseAmrWbOctetAligned(payload: Buffer): OctetAlignedParseResult {
   if (payload.length < 2) return { ok: false, error: 'payload_too_short' };
@@ -353,7 +277,7 @@ export function tryParseAmrWbOctetAligned(payload: Buffer): OctetAlignedParseRes
       sizeBytes,
       isSpeech: ft >= 0 && ft <= 8,
       isSid: ft === 9,
-      isNoData: ft === 15, // strictly "No Data"
+      isNoData: ft === 15,
     });
 
     if (!follow) break;
@@ -401,7 +325,7 @@ export function tryParseAmrWbOctetAlignedNoCmr(payload: Buffer): OctetAlignedPar
       sizeBytes,
       isSpeech: ft >= 0 && ft <= 8,
       isSid: ft === 9,
-      isNoData: ft === 15, // strictly "No Data"
+      isNoData: ft === 15,
     });
 
     if (!follow) break;
@@ -422,6 +346,8 @@ export function tryParseAmrWbOctetAlignedNoCmr(payload: Buffer): OctetAlignedPar
     dataBytes,
   };
 }
+
+/* -------------------- Bandwidth-Efficient (BE) parsing -------------------- */
 
 export function depacketizeAmrWbBandwidthEfficient(payload: Buffer): BeDepacketizeResult {
   if (payload.length === 0) return { ok: false, error: 'payload_too_short' };
@@ -459,7 +385,6 @@ export function depacketizeAmrWbBandwidthEfficient(payload: Buffer): BeDepacketi
       data = bits as Buffer;
     }
 
-
     frames.push({
       ft: entry.ft,
       q: entry.q,
@@ -478,20 +403,20 @@ export function depacketizeAmrWbBandwidthEfficient(payload: Buffer): BeDepacketi
   return { ok: true, frames, cmr, tocCount: tocEntries.length };
 }
 
+/**
+ * Back-compat export: some callers still import this.
+ *
+ * If opts.hasCmr=true (normal Telnyx BE), this is identical to depacketizeAmrWbBandwidthEfficient().
+ * If opts.hasCmr=false, we parse BE without consuming the initial 4-bit CMR (legacy/rare).
+ */
 export function depacketizeAmrWbBandwidthEfficientNoCmr(
   payload: Buffer,
-  opts: { hasCmr?: boolean } = {},
+  opts: { hasCmr: boolean } = { hasCmr: true },
 ): BeDepacketizeResult {
+  if (opts.hasCmr) return depacketizeAmrWbBandwidthEfficient(payload);
+
   if (payload.length === 0) return { ok: false, error: 'payload_too_short' };
   const reader = new BitReader(payload);
-
-  // If there is no CMR field, use "no preference" (15) by default.
-  let cmr = 15;
-  if (opts.hasCmr) {
-    const cmrBits = reader.readBits(4);
-    if (cmrBits === null) return { ok: false, error: 'cmr_truncated' };
-    cmr = cmrBits;
-  }
 
   const tocEntries: Array<{ ft: number; q: number; follow: number }> = [];
   let follow = 1;
@@ -501,27 +426,26 @@ export function depacketizeAmrWbBandwidthEfficientNoCmr(
     const ft = reader.readBits(4);
     const q = reader.readBits(1);
 
-    if (fBit === null || ft === null || q === null) return { ok: false, error: 'toc_truncated', cmr };
-    if (isAmrWbInvalidFt(ft)) return { ok: false, error: `invalid_ft_${ft}`, cmr };
+    if (fBit === null || ft === null || q === null) return { ok: false, error: 'toc_truncated' };
+    if (isAmrWbInvalidFt(ft)) return { ok: false, error: `invalid_ft_${ft}` };
 
     tocEntries.push({ ft, q, follow: fBit });
     follow = fBit;
   }
 
-  if (tocEntries.length === 0) return { ok: false, error: 'missing_toc', cmr };
+  if (tocEntries.length === 0) return { ok: false, error: 'missing_toc' };
 
   const frames: AmrWbFrameBitsMeta[] = [];
   for (const entry of tocEntries) {
     const bitLen = amrWbSpeechBits(entry.ft);
-    if (bitLen === null) return { ok: false, error: `invalid_ft_${entry.ft}`, cmr };
+    if (bitLen === null) return { ok: false, error: `invalid_ft_${entry.ft}` };
 
     let data: Buffer = Buffer.alloc(0);
     if (bitLen > 0) {
       const bits = reader.readBitsToBuffer(bitLen);
-      if (!bits) return { ok: false, error: `frame_truncated_ft_${entry.ft}`, cmr };
+      if (!bits) return { ok: false, error: `frame_truncated_ft_${entry.ft}` };
       data = bits as Buffer;
     }
-
 
     frames.push({
       ft: entry.ft,
@@ -535,289 +459,334 @@ export function depacketizeAmrWbBandwidthEfficientNoCmr(
   }
 
   if (reader.remainingBits() > 0 && !reader.remainingBitsAreZero()) {
-    return { ok: false, error: 'trailing_bits_nonzero', cmr };
+    return { ok: false, error: 'trailing_bits_nonzero' };
   }
 
-  return { ok: true, frames, cmr, tocCount: tocEntries.length };
-}
-
-export function repackToOctetAlignedFromBe(
-  beResult: Extract<BeDepacketizeResult, { ok: true }>,
-  opts: { includeCmr?: boolean } = {},
-): Buffer {
-  const includeCmr = opts.includeCmr !== false; // default true
-
-  const cmrByte = ((beResult.cmr ?? 15) & 0x0f) << 4;
-
-  const toc = Buffer.alloc(beResult.frames.length);
-  for (let i = 0; i < beResult.frames.length; i += 1) {
-    const frame = beResult.frames[i]!;
-    const follow = i < beResult.frames.length - 1 ? 1 : 0;
-    toc[i] = (follow << 7) | ((frame.ft & 0x0f) << 3) | ((frame.q & 0x01) << 2);
-  }
-
-  const dataParts = beResult.frames.filter((frame) => frame.data.length > 0).map((frame) => frame.data);
-
-  if (!includeCmr) return Buffer.concat([toc, ...dataParts]);
-  return Buffer.concat([Buffer.from([cmrByte]), toc, ...dataParts]);
-}
-
-function verifyRepacked(output: Buffer, opts: { includeCmr: boolean }): { ok: true; tocCount: number; cmr?: number } | { ok: false; error: string } {
-  const verify = opts.includeCmr ? tryParseAmrWbOctetAligned(output) : tryParseAmrWbOctetAlignedNoCmr(output);
-  if (!verify.ok) return { ok: false, error: verify.error };
-  return { ok: true, tocCount: verify.frames.length, cmr: verify.cmr };
+  // No CMR field present; preserve old return shape by setting cmr=0.
+  return { ok: true, frames, cmr: 0, tocCount: tocEntries.length };
 }
 
 /**
- * Telnyx AMR-WB notes:
- * - Telnyx can send AMR-WB in *bandwidth-efficient* (bit-packed) or *octet-aligned* form.
- * - This function must NEVER "guess-and-strip" a leading byte unless we have *fully validated*
- *   the layout by parsing end-to-end. A prior version could false-positive on BE payloads and
- *   corrupt the stream (robotic/crunchy audio).
+ * Back-compat export: tests/older code may import this.
+ * Converts BE frames -> OCTET-ALIGNED RTP payload bytes (optional 1-byte CMR).
  *
- * Output contract:
- * - If octet-aligned parses cleanly -> return payload untouched (do NOT strip CMR).
- * - Else if BE parses cleanly -> repack to octet-aligned (CMR + TOC bytes + padded frame bytes),
- *   or TOC-first if AMRWB_REPACK_INCLUDE_CMR=false, and verify using the matching parser.
- * - Else -> invalid.
+ * NOTE: main pipeline no longer needs this because we normalize to storage frames,
+ * but keeping it avoids refactors in tests.
+ */
+export function repackToOctetAlignedFromBe(
+  be: Extract<BeDepacketizeResult, { ok: true }>,
+  opts: { includeCmr: boolean } = { includeCmr: true },
+): Buffer {
+  const parts: Buffer[] = [];
+
+  if (opts.includeCmr) {
+    const cmrNibble = (be.cmr ?? 0) & 0x0f;
+    parts.push(Buffer.from([(cmrNibble << 4) & 0xf0]));
+  }
+
+  for (let i = 0; i < be.frames.length; i += 1) {
+    const fr = be.frames[i]!;
+    const isLast = i === be.frames.length - 1;
+    const fBit = isLast ? 0 : 1;
+    const toc = ((fBit & 0x01) << 7) | ((fr.ft & 0x0f) << 3) | ((fr.q & 0x01) << 2);
+    parts.push(Buffer.from([toc]));
+  }
+
+  for (const fr of be.frames) {
+    if (fr.data.length > 0) parts.push(fr.data);
+  }
+
+  return parts.length === 1 ? parts[0]! : Buffer.concat(parts);
+}
+
+/* ------------------------ Storage helpers + artifacts ------------------------ */
+
+function stripAmrWbHeaderIfPresent(buf: Buffer): Buffer {
+  if (buf.length >= AMRWB_STREAM_HEADER.length) {
+    const head = buf.subarray(0, AMRWB_STREAM_HEADER.length);
+    if (head.equals(AMRWB_STREAM_HEADER)) return buf.subarray(AMRWB_STREAM_HEADER.length);
+  }
+  return buf;
+}
+
+function looksLikeAmrWbStorageFrames(buf: Buffer): boolean {
+  const b = stripAmrWbHeaderIfPresent(buf);
+  if (b.length < 1) return false;
+
+  // Storage: TOC bytes have F=0 always.
+  const toc0 = b[0] as number;
+  if ((toc0 & 0x80) !== 0) return false;
+
+  const ft0 = (toc0 >> 3) & 0x0f;
+  if (isAmrWbInvalidFt(ft0)) return false;
+
+  const size0 = amrWbSpeechBytes(ft0);
+  if (size0 === null) return false;
+  if (size0 === 0) return true;
+  if (b.length < 1 + size0) return false;
+
+  // Quick plausibility check of next TOC (if any)
+  const nextOff = 1 + size0;
+  if (b.length > nextOff) {
+    const toc1 = b[nextOff] as number;
+    if ((toc1 & 0x80) !== 0) return false;
+    const ft1 = (toc1 >> 3) & 0x0f;
+    if (isAmrWbInvalidFt(ft1)) return false;
+  }
+  return true;
+}
+
+function ensureAmrWbStreamHeader(buf: Buffer): Buffer {
+  if (buf.length >= AMRWB_STREAM_HEADER.length && buf.subarray(0, AMRWB_STREAM_HEADER.length).equals(AMRWB_STREAM_HEADER)) {
+    return buf;
+  }
+  return Buffer.concat([AMRWB_STREAM_HEADER, buf]);
+}
+
+/**
+ * Convert octet-aligned RTP payload (with or without CMR) -> storage frames bytes (no header).
+ * Storage TOC bytes MUST have F=0.
+ */
+function buildStorageFromOctetAligned(
+  payload: Buffer,
+  parsed: Extract<OctetAlignedParseResult, { ok: true }>,
+  hasCmr: boolean,
+): Buffer {
+  const tocBytes = parsed.tocBytes;
+  const dataOffset = (hasCmr ? 1 : 0) + tocBytes;
+
+  let cursor = dataOffset;
+  const outParts: Buffer[] = [];
+
+  for (const f of parsed.frames) {
+    // storage TOC byte: F=0, FT, Q, rest 0
+    const tocByte = ((f.ft & 0x0f) << 3) | ((f.q & 0x01) << 2);
+    outParts.push(Buffer.from([tocByte]));
+
+    if (f.sizeBytes > 0) {
+      outParts.push(payload.subarray(cursor, cursor + f.sizeBytes));
+      cursor += f.sizeBytes;
+    }
+  }
+
+  return outParts.length === 1 ? outParts[0]! : Buffer.concat(outParts);
+}
+
+/**
+ * Convert storage frames bytes -> .awb storage file bytes (with "#!AMR-WB\n")
+ * If frames already include header, keep it.
+ */
+function storageFramesToAwb(storageBytesOrAwb: Buffer): Buffer {
+  return ensureAmrWbStreamHeader(storageBytesOrAwb);
+}
+
+/**
+ * For artifact writing:
+ * - If input is already storage frames (or has "#!AMR-WB\n"), write it directly.
+ * - Else treat as octet-aligned RTP and convert to storage .awb using hasCmr flag.
+ */
+export function writeAmrwbArtifacts(
+  label: string,
+  payloadOrStorage: Buffer,
+  opts: { hasCmr: boolean; meta?: Record<string, unknown> } = { hasCmr: true },
+): void {
+  const enabled = parseBoolEnv(process.env.AMRWB_ARTIFACT_DEBUG) || amrwbRepackDebugEnabled();
+  if (!enabled) return;
+
+  const dir = amrwbDebugDir();
+  safeMkdir(dir);
+
+  const stamp = Date.now();
+  const base = `${label}__${stamp}`;
+
+  const rawPath = path.join(dir, `${base}__bytes.bin`);
+  const awbPath = path.join(dir, `${base}__storage.awb`);
+
+  try {
+    fs.writeFileSync(rawPath, payloadOrStorage);
+
+    // If it already looks like storage frames or already includes "#!AMR-WB\n", just prefix header and write.
+    if (looksLikeAmrWbStorageFrames(payloadOrStorage) || stripAmrWbHeaderIfPresent(payloadOrStorage) !== payloadOrStorage) {
+      const awb = storageFramesToAwb(payloadOrStorage);
+      fs.writeFileSync(awbPath, awb);
+
+      log.info(
+        {
+          event: 'amrwb_artifacts_written',
+          label,
+          raw_bytes: rawPath,
+          storage_awb: awbPath,
+          bytes_len: payloadOrStorage.length,
+          treated_as: 'storage',
+          ...(opts.meta ?? {}),
+        },
+        'AMR-WB artifacts written (storage)',
+      );
+      return;
+    }
+
+    // Otherwise, treat as octet-aligned RTP payload and convert.
+    const parsed = opts.hasCmr ? tryParseAmrWbOctetAligned(payloadOrStorage) : tryParseAmrWbOctetAlignedNoCmr(payloadOrStorage);
+    if (!parsed.ok) {
+      log.warn(
+        {
+          event: 'amrwb_artifact_storage_build_failed',
+          label,
+          error: parsed.error,
+          hasCmr: opts.hasCmr,
+          ...(opts.meta ?? {}),
+        },
+        'AMR-WB artifact: failed to parse octet-aligned bytes for .awb',
+      );
+      return;
+    }
+
+    const storageFrames = buildStorageFromOctetAligned(payloadOrStorage, parsed, opts.hasCmr);
+    const awb = storageFramesToAwb(storageFrames);
+    fs.writeFileSync(awbPath, awb);
+
+    log.info(
+      {
+        event: 'amrwb_artifacts_written',
+        label,
+        raw_bytes: rawPath,
+        storage_awb: awbPath,
+        bytes_len: payloadOrStorage.length,
+        treated_as: 'octet_aligned',
+        hasCmr: opts.hasCmr,
+        toc_count: parsed.frames.length,
+        ...(opts.meta ?? {}),
+      },
+      'AMR-WB artifacts written (octet-aligned)',
+    );
+  } catch (err) {
+    log.warn({ event: 'amrwb_artifacts_write_failed', label, err: String(err) }, 'AMR-WB artifact write failed');
+  }
+}
+
+/* ------------------------------ Main transcoder ----------------------------- */
+/**
+ * Contract:
+ * - Input may include RTP header or may be payload-only.
+ * - Detect BE first; if BE parses cleanly, output storage frames bytes (no header).
+ * - Else try strict octet-aligned with CMR, then strict octet-aligned without CMR; if parses, convert to storage frames bytes.
+ * - Else invalid.
+ *
+ * Output is ALWAYS "storage frames bytes" (no "#!AMR-WB\n" header), suitable for:
+ *   ensureAmrWbStreamHeader(transcode.output) in codecDecode.ts
  */
 export function transcodeTelnyxAmrWbPayload(input: Buffer): TranscodeAmrWbResult {
   const stripped = detectAndStripRtpHeader(input);
   const payload = stripped.payload;
   const now = Date.now();
 
-  // Global knob for repack output layout:
-  // - default true: emit CMR byte then TOC then data (classic octet-aligned-with-CMR)
-  // - false: emit TOC then data (octet-aligned-no-CMR layout)
-  const includeCmr = process.env.AMRWB_REPACK_INCLUDE_CMR !== 'false';
-
-  /**
-   * OPTION A (Normalization First):
-   * If BE depacketization succeeds (with/without CMR), we ALWAYS normalize through BE->octet,
-   * even if octet parsing would also succeed, because octet parsing can be a false-positive
-   * on bit-packed payloads and produce robotic/crunchy audio.
-   */
-
   // --- 0) Try Bandwidth-Efficient (bit-packed) first ---
   const be = depacketizeAmrWbBandwidthEfficient(payload);
   if (be.ok) {
-    const output = repackToOctetAlignedFromBe(be, { includeCmr });
-    const verify = verifyRepacked(output, { includeCmr });
-    if (verify.ok) {
-      if (shouldLogAmrwbRepackDebug(now)) {
-        log.info(
-          {
-            event: 'amrwb_repack_path',
-            path: 'be_normalized_first',
-            payload_len: payload.length,
-            rtp_stripped: stripped.stripped,
-            toc_count: be.frames.length,
-            cmr: be.cmr ?? null,
-            repacked_len: output.length,
-            include_cmr: includeCmr,
-          },
-          'AMR-WB repack path selected',
-        );
-      }
-      return {
-        ok: true,
-        packing: 'be',
-        rtpStripped: stripped.stripped,
-        output,
-        tocCount: verify.tocCount,
-        totalBytesIn: input.length,
-        totalBytesOut: output.length,
-        cmr: be.cmr ?? undefined,
-        cmrStripped: !includeCmr,
-      };
+    // Build storage frames bytes from BE frames (each gets a storage TOC byte with F=0).
+    const outParts: Buffer[] = [];
+    for (const fr of be.frames) {
+      const tocByte = ((fr.ft & 0x0f) << 3) | ((fr.q & 0x01) << 2); // F=0
+      outParts.push(Buffer.from([tocByte]));
+      if (fr.data.length > 0) outParts.push(fr.data);
     }
+    const output = outParts.length === 1 ? outParts[0]! : Buffer.concat(outParts);
 
     if (shouldLogAmrwbRepackDebug(now)) {
       log.info(
         {
           event: 'amrwb_repack_path',
-          path: 'be_normalized_first_verify_failed',
+          path: 'be_to_storage',
           payload_len: payload.length,
           rtp_stripped: stripped.stripped,
-          toc_count: be.frames.length,
+          toc_count: be.tocCount,
           cmr: be.cmr ?? null,
-          repacked_len: output.length,
-          include_cmr: includeCmr,
-          verify_error: verify.error,
+          total_bytes_out: output.length,
         },
-        'AMR-WB repack verify failed',
+        'AMR-WB repack path selected',
       );
     }
-    // fall through to try other modes
-  }
 
-  const beNoCmr = depacketizeAmrWbBandwidthEfficientNoCmr(payload, { hasCmr: false });
-  if (beNoCmr.ok) {
-    const output = repackToOctetAlignedFromBe(beNoCmr, { includeCmr });
-    const verify = verifyRepacked(output, { includeCmr });
-    if (verify.ok) {
-      if (shouldLogAmrwbRepackDebug(now)) {
-        log.info(
-          {
-            event: 'amrwb_repack_path',
-            path: 'be_no_cmr_normalized_first',
-            payload_len: payload.length,
-            rtp_stripped: stripped.stripped,
-            toc_count: beNoCmr.frames.length,
-            cmr: beNoCmr.cmr ?? null,
-            repacked_len: output.length,
-            include_cmr: includeCmr,
-          },
-          'AMR-WB repack path selected',
-        );
-      }
-      return {
-        ok: true,
-        packing: 'be',
-        rtpStripped: stripped.stripped,
-        output,
-        tocCount: verify.tocCount,
-        totalBytesIn: input.length,
-        totalBytesOut: output.length,
-        cmr: beNoCmr.cmr ?? undefined,
-        cmrStripped: !includeCmr,
-      };
-    }
-
-    if (shouldLogAmrwbRepackDebug(now)) {
-      log.info(
-        {
-          event: 'amrwb_repack_path',
-          path: 'be_no_cmr_normalized_first_verify_failed',
-          payload_len: payload.length,
-          rtp_stripped: stripped.stripped,
-          toc_count: beNoCmr.frames.length,
-          cmr: beNoCmr.cmr ?? null,
-          repacked_len: output.length,
-          include_cmr: includeCmr,
-          verify_error: verify.error,
-        },
-        'AMR-WB repack verify failed',
-      );
-    }
-    // fall through
-  }
-
-  const beAltHasCmr = depacketizeAmrWbBandwidthEfficientNoCmr(payload, { hasCmr: true });
-  if (beAltHasCmr.ok) {
-    const output = repackToOctetAlignedFromBe(beAltHasCmr, { includeCmr });
-    const verify = verifyRepacked(output, { includeCmr });
-    if (verify.ok) {
-      if (shouldLogAmrwbRepackDebug(now)) {
-        log.info(
-          {
-            event: 'amrwb_repack_path',
-            path: 'be_alt_has_cmr_normalized_first',
-            payload_len: payload.length,
-            rtp_stripped: stripped.stripped,
-            toc_count: beAltHasCmr.frames.length,
-            cmr: beAltHasCmr.cmr ?? null,
-            repacked_len: output.length,
-            include_cmr: includeCmr,
-          },
-          'AMR-WB repack path selected',
-        );
-      }
-      return {
-        ok: true,
-        packing: 'be',
-        rtpStripped: stripped.stripped,
-        output,
-        tocCount: verify.tocCount,
-        totalBytesIn: input.length,
-        totalBytesOut: output.length,
-        cmr: beAltHasCmr.cmr ?? undefined,
-        cmrStripped: !includeCmr,
-      };
-    }
-
-    if (shouldLogAmrwbRepackDebug(now)) {
-      log.info(
-        {
-          event: 'amrwb_repack_path',
-          path: 'be_alt_has_cmr_normalized_first_verify_failed',
-          payload_len: payload.length,
-          rtp_stripped: stripped.stripped,
-          toc_count: beAltHasCmr.frames.length,
-          cmr: beAltHasCmr.cmr ?? null,
-          repacked_len: output.length,
-          include_cmr: includeCmr,
-          verify_error: verify.error,
-        },
-        'AMR-WB repack verify failed',
-      );
-    }
-    // fall through
+    return {
+      ok: true,
+      packing: 'be',
+      rtpStripped: stripped.stripped,
+      output,
+      tocCount: be.tocCount,
+      totalBytesIn: input.length,
+      totalBytesOut: output.length,
+      cmr: be.cmr ?? undefined,
+      cmrStripped: true,
+    };
   }
 
   // --- 1) Strict octet-aligned with CMR ---
   const octet = tryParseAmrWbOctetAligned(payload);
   if (octet.ok) {
+    const output = buildStorageFromOctetAligned(payload, octet, true);
+
     if (shouldLogAmrwbRepackDebug(now)) {
       log.info(
         {
           event: 'amrwb_repack_path',
-          path: 'octet_aligned_with_cmr',
+          path: 'octet_with_cmr_to_storage',
           payload_len: payload.length,
           rtp_stripped: stripped.stripped,
           toc_count: octet.frames.length,
           cmr: octet.cmr ?? null,
-          expected_data_bytes: octet.frames.reduce((s, f) => s + f.sizeBytes, 0),
-          data_bytes: octet.dataBytes,
+          total_bytes_out: output.length,
         },
         'AMR-WB repack path selected',
       );
     }
+
     return {
       ok: true,
       packing: 'octet',
       rtpStripped: stripped.stripped,
-      output: payload,
+      output,
       tocCount: octet.frames.length,
       totalBytesIn: input.length,
-      totalBytesOut: payload.length,
+      totalBytesOut: output.length,
       cmr: octet.cmr ?? undefined,
-      cmrStripped: false,
+      cmrStripped: true,
     };
   }
 
   // --- 2) Strict octet-aligned without CMR ---
-  const octetNoCmr2 = tryParseAmrWbOctetAlignedNoCmr(payload);
-  if (octetNoCmr2.ok) {
+  const octetNoCmr = tryParseAmrWbOctetAlignedNoCmr(payload);
+  if (octetNoCmr.ok) {
+    const output = buildStorageFromOctetAligned(payload, octetNoCmr, false);
+
     if (shouldLogAmrwbRepackDebug(now)) {
       log.info(
         {
           event: 'amrwb_repack_path',
-          path: 'octet_aligned_no_cmr',
+          path: 'octet_no_cmr_to_storage',
           payload_len: payload.length,
           rtp_stripped: stripped.stripped,
-          toc_count: octetNoCmr2.frames.length,
-          expected_data_bytes: octetNoCmr2.frames.reduce((s, f) => s + f.sizeBytes, 0),
-          data_bytes: octetNoCmr2.dataBytes,
+          toc_count: octetNoCmr.frames.length,
+          total_bytes_out: output.length,
         },
         'AMR-WB repack path selected',
       );
     }
+
     return {
       ok: true,
       packing: 'octet',
       rtpStripped: stripped.stripped,
-      output: payload,
-      tocCount: octetNoCmr2.frames.length,
+      output,
+      tocCount: octetNoCmr.frames.length,
       totalBytesIn: input.length,
-      totalBytesOut: payload.length,
-      cmrStripped: true,
+      totalBytesOut: output.length,
       cmr: undefined,
+      cmrStripped: true,
     };
   }
 
   // Invalid
-  const error = `be:${be.ok ? 'ok_but_verify_failed' : be.error};beNoCmr:${beNoCmr.ok ? 'ok_but_verify_failed' : beNoCmr.error};beAlt:${beAltHasCmr.ok ? 'ok_but_verify_failed' : beAltHasCmr.error};octet:${octet.error};octetNoCmr:${octetNoCmr2.error}`;
+  const error = `be:${be.error};octet:${octet.error};octetNoCmr:${octetNoCmr.error}`;
 
   if (shouldLogAmrwbRepackDebug(now)) {
     log.info(
@@ -840,3 +809,6 @@ export function transcodeTelnyxAmrWbPayload(input: Buffer): TranscodeAmrWbResult
     totalBytesIn: input.length,
   };
 }
+
+// (Optional) exported for reuse elsewhere if needed
+export { ensureAmrWbStreamHeader };

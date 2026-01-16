@@ -1,10 +1,12 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.SessionManager = void 0;
+// src/calls/sessionManager.ts
 const capacity_1 = require("../limits/capacity");
 const log_1 = require("../log");
 const metrics_1 = require("../metrics");
 const callSession_1 = require("./callSession");
+const codecDecode_1 = require("../audio/codecDecode");
 const DEFAULT_IDLE_TTL_MINUTES = 10;
 const DEFAULT_SWEEP_INTERVAL_MS = 60000;
 class SessionManager {
@@ -172,6 +174,8 @@ class SessionManager {
         this.teardown(callControlId, reason ?? 'hangup', context);
     }
     teardown(callControlId, reason, context = {}) {
+        // ✅ Always clear codec session cache on teardown (session exists OR missing)
+        (0, codecDecode_1.clearTelnyxCodecSession)({ call_control_id: callControlId });
         const session = this.sessions.get(callControlId);
         if (!session) {
             this.inactiveCalls.set(callControlId, Date.now());
