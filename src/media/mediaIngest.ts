@@ -1,13 +1,17 @@
+// src/media/mediaIngest.ts
 import fs from 'fs';
 import path from 'path';
+import crypto from 'crypto';
+
 import { closeTelnyxCodecState, decodeTelnyxPayloadToPcm16, type TelnyxCodecState } from '../audio/codecDecode';
 import { depacketizeAmrWbBandwidthEfficientNoCmr } from '../audio/amrwbRtp';
 import { prepareAmrWbPayload } from '../audio/prepareAmrWbPayload';
+import { DebugAudioTap } from '../audio/debugAudioTap';
+
 import { attachAudioMeta, diagnosticsEnabled, markAudioSpan, probePcm } from '../diagnostics/audioProbe';
 import type { AudioMeta } from '../diagnostics/audioProbe';
 import { log } from '../log';
 import type { TransportMode } from '../transport/types';
-import { DebugAudioTap } from '../audio/debugAudioTap';
 
 type Base64Encoding = 'base64' | 'base64url';
 
@@ -101,10 +105,13 @@ const DEFAULT_HEALTH_MIN_FRAMES = 10;
 const DEFAULT_HEALTH_MIN_EMIT_CHUNKS = 10;
 const DEFAULT_HEALTH_TINY_PAYLOAD_LIMIT = 10;
 const DEFAULT_HEALTH_DECODE_FAILURE_LIMIT = 5;
+
 const DEFAULT_EMIT_MS = 100;
 const MIN_EMIT_MS = 80;
 const MAX_EMIT_MS = 200;
+
 const DEFAULT_DEBUG_DUMP_COUNT = 20;
+
 const AMRWB_EMIT_DEBUG_MAX = 30;
 const AMRWB_EMIT_DEBUG_INTERVAL_MS = 1000;
 const AMRWB_NEAR_ZERO_THRESHOLD = 1;
@@ -226,6 +233,11 @@ function getHexPrefix(buf: Buffer, len = 16): string {
 function looksLikeAmrWbMagic(buf: Buffer): boolean {
   const magic = Buffer.from('#!AMR-WB\n', 'ascii');
   return buf.length >= magic.length && buf.subarray(0, magic.length).equals(magic);
+}
+
+/** Telnyx PSTN inbound AMR-WB speech payloads observed as 33 bytes. */
+function isLikelyAmrwbSpeechPayload(payload: Buffer): boolean {
+  return payload.length === 33;
 }
 
 function looksLikeTelnyxNoCmrToc33(buf: Buffer): boolean {
@@ -397,7 +409,7 @@ function pickBestPayloadCandidate(candidates: PayloadCandidate[], codec: string)
           const decoded = decodeTelnyxPayloadWithInfo(trimmed);
           decodedLen = decoded.buffer.length;
           if (codec === 'AMR-WB') {
-            ok = decodedLen >= 2;
+            ok = decodedLen >= 20;
           } else {
             ok = decodedLen >= 10;
           }
@@ -532,7 +544,7 @@ async function dumpCaptureFrame(
   const base = path.join(capture.dir, `capture_${callControlId}_${seq}_${Date.now()}`);
   try {
     const decoded = decodeTelnyxPayloadWithInfo(payloadBase64);
-    const rawBuf = decoded.buffer; // full decoded bytes (base64 or base64url)
+    const rawBuf = decoded.buffer;
     const rawPrefixHex = rawBuf.subarray(0, 32).toString('hex');
 
     await fs.promises.writeFile(`${base}.raw.bin`, rawBuf);
@@ -691,7 +703,7 @@ export class MediaIngestHealthMonitor {
   public recordPayload(payloadLen: number, decodedLen: number, rms: number, peak: number, decodeOk: boolean): void {
     if (this.disabled) return;
 
-    // Keep these referenced so TS builds pass with noUnusedParameters enabled.
+    // referenced to satisfy noUnusedParameters builds in some configs
     void payloadLen;
     void rms;
     void peak;
@@ -707,7 +719,6 @@ export class MediaIngestHealthMonitor {
 
   public recordEmittedChunk(rms: number, peak: number): void {
     if (this.disabled) return;
-    // Health/silence logic must use buffered chunks (>=100ms), not 20ms decode frames.
     this.emittedChunks += 1;
     if (rms < DEFAULT_HEALTH_RMS_FLOOR) this.silentFrames += 1;
     this.lastRms = rms;
@@ -768,6 +779,32 @@ export class MediaIngestHealthMonitor {
 
 /* --------------------------------- ingest --------------------------------- */
 
+class SlidingHashDedupe {
+  private readonly max: number;
+  private readonly q: string[] = [];
+  private readonly set = new Set<string>();
+
+  constructor(max = 1024) {
+    this.max = Math.max(64, max);
+  }
+
+  /** returns true if this key is already present */
+  seen(key: string): boolean {
+    if (this.set.has(key)) return true;
+    this.set.add(key);
+    this.q.push(key);
+    while (this.q.length > this.max) {
+      const old = this.q.shift();
+      if (old) this.set.delete(old);
+    }
+    return false;
+  }
+}
+
+function sha1Hex(buf: Buffer): string {
+  return crypto.createHash('sha1').update(buf).digest('hex');
+}
+
 export class MediaIngest {
   private readonly callControlId: string;
   private readonly transportMode: TransportMode;
@@ -792,7 +829,7 @@ export class MediaIngest {
 
   private readonly healthMonitor = new MediaIngestHealthMonitor();
 
-  // ✅ AUDIO TAP belongs to MediaIngest (NOT HealthMonitor)
+  // ✅ AUDIO TAP belongs to MediaIngest
   private readonly audioTap?: DebugAudioTap;
   private tappedFirstDecoded = false;
 
@@ -815,6 +852,9 @@ export class MediaIngest {
   private amrwbCaptureParseFailedLogged = false;
   private mediaPayloadDebugCount = 0;
 
+  private activeStreamId: string | null = null;
+  private lastSeqByStream = new Map<string, number>();
+
   private readonly dumpFramesEnabled: boolean;
   private readonly dumpFramesMax: number;
   private readonly dumpFramesDir: string;
@@ -827,10 +867,17 @@ export class MediaIngest {
   private readonly amrwbCaptureDir: string;
   private amrwbCaptureChain: Promise<void> = Promise.resolve();
   private amrwbCaptureDirReady = false;
-  private amrwbCaptureOctetHeaderWritten = false;
   private amrwbCaptureBeHeaderWritten = false;
   private amrwbCaptureDisabled = false;
   private amrwbCaptureErrorLogged = false;
+
+  // ---- Telnyx duplicate payload defense ----
+  private readonly telnyxDedupe = new SlidingHashDedupe(2048);
+  private telnyxDupDropped = 0;
+  private telnyxDupKept = 0;
+
+  // Optional: hard pin codec to prevent flip-flop (policy)
+  private pinnedCodec?: string;
 
   private frameSeq = 0;
   private captureState?: TelnyxMediaCaptureState;
@@ -982,6 +1029,61 @@ export class MediaIngest {
 
     if (event !== 'media') return;
 
+    // -------------------- STREAM ISOLATION (drop old/out-of-order) --------------------
+    const msgStreamId = this.getTelnyxStreamId(message);
+    const seqNum = this.getTelnyxSequence(message);
+
+    // Adopt if needed
+    if (!this.activeStreamId && msgStreamId) {
+      this.activeStreamId = msgStreamId;
+      this.lastSeqByStream.set(msgStreamId, -1);
+      log.info(
+        {
+          event: 'telnyx_stream_adopted',
+          call_control_id: this.callControlId,
+          stream_id: msgStreamId,
+          ...(this.logContext ?? {}),
+        },
+        'adopted Telnyx stream_id from media frame',
+      );
+    }
+
+    // Drop old stream frames
+    if (this.activeStreamId && msgStreamId && msgStreamId !== this.activeStreamId) {
+      log.warn(
+        {
+          event: 'telnyx_stream_old_frame_dropped',
+          call_control_id: this.callControlId,
+          stream_id: msgStreamId,
+          active_stream_id: this.activeStreamId,
+          ...(this.logContext ?? {}),
+        },
+        'dropping media frame from old Telnyx stream_id (restart overlap defense)',
+      );
+      return;
+    }
+
+    // Drop duplicates/out-of-order by seq
+    if (this.activeStreamId && seqNum !== undefined) {
+      const last = this.lastSeqByStream.get(this.activeStreamId) ?? -1;
+      if (seqNum <= last) {
+        log.warn(
+          {
+            event: 'telnyx_seq_dup_or_reorder_dropped',
+            call_control_id: this.callControlId,
+            stream_id: this.activeStreamId,
+            seq: seqNum,
+            last_seq: last,
+            ...(this.logContext ?? {}),
+          },
+          'dropping duplicate/out-of-order Telnyx media frame by sequence_number',
+        );
+        return;
+      }
+      this.lastSeqByStream.set(this.activeStreamId, seqNum);
+    }
+    // -------------------------------------------------------------------------------
+
     const media = message.media && typeof message.media === 'object' ? (message.media as Record<string, unknown>) : undefined;
     const mediaData = media?.data && typeof media.data === 'object' ? (media.data as Record<string, unknown>) : undefined;
 
@@ -1096,16 +1198,38 @@ export class MediaIngest {
     const payloadLooksBase64 = looksLikeBase64(trimmedPayload);
     const base64Len = trimmedPayload.length;
 
+    // Strong dedupe: base64 string OR decoded bytes
     try {
       const decoded = decodeTelnyxPayloadWithInfo(trimmedPayload);
       buffer = decoded.buffer;
       encodingUsed = decoded.encoding;
       trimmedPayload = decoded.trimmed;
+
+      const dedupeKey = sha1Hex(buffer);
+      if (this.telnyxDedupe.seen(dedupeKey)) {
+        this.telnyxDupDropped += 1;
+        log.warn(
+          {
+            event: 'telnyx_payload_dedup_dropped',
+            call_control_id: this.callControlId,
+            seq: this.frameSeq,
+            decoded_len: buffer.length,
+            dropped_total: this.telnyxDupDropped,
+            kept_total: this.telnyxDupKept,
+            ...(this.logContext ?? {}),
+          },
+          'dropping duplicate Telnyx media payload by hash',
+        );
+        return;
+      }
+      this.telnyxDupKept += 1;
     } catch (error) {
       this.logMediaPayloadDebug(base64Len, null, payloadSource, 'decode_failed');
       log.warn({ event: 'media_ws_decode_failed', call_control_id: this.callControlId, err: error }, 'media ws decode failed');
       return;
     }
+
+    // --------------------------------------------------------------------------
 
     void this.maybeDumpMediaFrame(trimmedPayload, buffer);
     this.queueAmrwbTruthCapture(buffer, this.frameSeq);
@@ -1117,7 +1241,10 @@ export class MediaIngest {
     if (capture && !capture.stopped) {
       const payloadLen = trimmedPayload.length;
       capture.frameCount += 1;
-      if (payloadLen < TELNYX_CAPTURE_TINY_PAYLOAD_LEN) capture.tinyPayloadFrames += 1;
+      const isTinyForCapture = currentCodec === 'AMR-WB' ? buffer.length < 6 : payloadLen < TELNYX_CAPTURE_TINY_PAYLOAD_LEN;
+
+      if (isTinyForCapture) capture.tinyPayloadFrames += 1;
+
       if (payloadLooksBase64) capture.payloadBase64Frames += 1;
       else capture.payloadNotBase64Frames += 1;
 
@@ -1134,7 +1261,7 @@ export class MediaIngest {
 
       const payloadPrefix = redactInline(trimmedPayload.slice(0, 64));
       const decodedPrefixHex = buffer.subarray(0, 32).toString('hex');
-      const seqNum = this.frameSeq;
+      const seqForCap = this.frameSeq;
       const timestamp = typeof media?.timestamp === 'number' ? (media.timestamp as number) : undefined;
 
       const notAudio = currentCodec === 'AMR-WB' ? buffer.length < 20 : buffer.length < 10;
@@ -1180,18 +1307,18 @@ export class MediaIngest {
           data_track: trackFields.dataTrack ?? null,
           resolved_track: resolvedTrack ?? null,
         },
-        seq: seqNum,
+        seq: seqForCap,
         timestamp,
         payload_base64: payloadLooksBase64,
         not_audio: notAudio,
         amrwb_parse: amrwbParse,
       });
 
-      void dumpCaptureFrame(capture, this.callControlId, seqNum, trimmedPayload);
+      void dumpCaptureFrame(capture, this.callControlId, seqForCap, trimmedPayload);
 
       if (capture.startedAtMs && (Date.now() > (capture.endAtMs ?? 0) || capture.frameCount >= TELNYX_CAPTURE_MAX_FRAMES)) {
         finalizeCapture(capture, 'capture_window_elapsed');
-      } else if (capture.tinyPayloadFrames >= TELNYX_CAPTURE_TINY_PAYLOAD_LIMIT) {
+      } else if (capture.tinyPayloadFrames >= TELNYX_CAPTURE_TINY_PAYLOAD_LIMIT && currentCodec !== 'AMR-WB') {
         finalizeCapture(capture, 'tiny_payloads_exceeded');
       }
     }
@@ -1259,7 +1386,12 @@ export class MediaIngest {
       });
     } catch (error) {
       log.warn(
-        { event: 'media_ingest_onAcceptedPayload_failed', call_control_id: this.callControlId, err: error, ...(this.logContext ?? {}) },
+        {
+          event: 'media_ingest_onAcceptedPayload_failed',
+          call_control_id: this.callControlId,
+          err: error,
+          ...(this.logContext ?? {}),
+        },
         'media ingest onAcceptedPayload hook failed',
       );
     }
@@ -1287,143 +1419,162 @@ export class MediaIngest {
       });
   }
 
-  private flushPendingPcm(reason: string): void {
-    if (!this.pendingPcm || this.pendingPcm.length === 0) {
+  /* --------------------------- AMR-WB BE truth capture -------------------------- */
+
+
+  // AMR-WB storage (AWB) frames are: [1-byte frame header] + [speech bytes]
+  // Telnyx BE RTP single-frame payloads are: [1-byte TOC] + [speech bytes]
+  private buildBeConvertedCandidate(payload: Buffer): Buffer | null {
+    // Only accept the Telnyx single-frame BE speech packets we observed.
+    if (payload.length !== 33) return null;
+
+    const toc = payload[0] ?? 0;
+    const ft = (toc >> 3) & 0x0f;          // frame type
+    const q = (toc & 0x04) !== 0;          // quality bit
+
+    // Reject non-speech / invalid
+    if (ft >= 10 && ft <= 13) return null; // invalid reserved
+    if (ft === 14 || ft === 15) return null; // speech lost / no data
+
+    const speech = payload.subarray(1);
+
+    // For payload_len=33, the only valid speech size is 32 bytes (WB FT=2)
+    if (speech.length !== 32) return null;
+
+    // AWB frame header byte: (FT << 3) | Qbit(0x04)
+    const awbHdr = ((ft & 0x0f) << 3) | (q ? 0x04 : 0x00);
+    return Buffer.concat([Buffer.from([awbHdr]), speech]);
+  }
+
+
+  private logAmrwbCaptureErrorOnce(error: unknown, note: string): void {
+    if (this.amrwbCaptureErrorLogged) return;
+    this.amrwbCaptureErrorLogged = true;
+    log.warn(
+      { event: 'amrwb_truth_capture_error', call_control_id: this.callControlId, note, err: error, ...(this.logContext ?? {}) },
+      'amrwb truth capture failed',
+    );
+  }
+
+  private queueAmrwbTruthCapture(payload: Buffer, frameIndex: number): void {
+    if (!this.amrwbCaptureEnabled || this.amrwbCaptureDisabled) return;
+    this.amrwbCaptureChain = this.amrwbCaptureChain
+      .then(() => this.captureAmrwbTruthPayload(payload, frameIndex))
+      .catch((error) => {
+        this.amrwbCaptureDisabled = true;
+        this.logAmrwbCaptureErrorOnce(error, 'capture');
+      });
+  }
+
+  private async captureAmrwbTruthPayload(payload: Buffer, frameIndex: number): Promise<void> {
+    if (!this.amrwbCaptureEnabled || this.amrwbCaptureDisabled) return;
+
+    if (!this.amrwbCaptureDirReady) {
+      try {
+        await fs.promises.mkdir(this.amrwbCaptureDir, { recursive: true });
+      } catch (error) {
+        this.amrwbCaptureDisabled = true;
+        this.logAmrwbCaptureErrorOnce(error, 'mkdir');
+        return;
+      }
+      this.amrwbCaptureDirReady = true;
+    }
+
+    const rawPath = path.join(this.amrwbCaptureDir, 'raw_frames.bin');
+    const bePath = path.join(this.amrwbCaptureDir, 'be_converted.awb');
+
+    try {
+      if (!this.amrwbCaptureBeHeaderWritten) {
+        await fs.promises.writeFile(bePath, AMRWB_FILE_HEADER);
+        this.amrwbCaptureBeHeaderWritten = true;
+      }
+      await fs.promises.appendFile(rawPath, payload);
+    } catch (error) {
+      this.amrwbCaptureDisabled = true;
+      this.logAmrwbCaptureErrorOnce(error, 'write_raw');
       return;
     }
-    const pending = this.pendingPcm;
-    const sampleRateHz = this.pendingPcmSampleRateHz ?? this.targetSampleRateHz;
-    this.pendingPcm = undefined;
-    this.pendingPcmSampleRateHz = undefined;
 
-    // Emit leftover audio on close so we never drop trailing speech.
-    this.maybeLogEmitDebug(pending, pending, sampleRateHz, undefined, `flush_${reason}`);
+    // ✅ Gate BE capture: only speech frames (33 bytes) should be appended
+    const isSpeech = isLikelyAmrwbSpeechPayload(payload);
 
-    if (this.audioTap && pending.length > 0) {
-      const frameBuf = Buffer.from(pending.buffer, pending.byteOffset, pending.byteLength);
-      this.audioTap.push('EMITTED_BUFFERED', frameBuf);
+    let beAppended = false;
+    let droppedNonSpeech = false;
+
+    if (!isSpeech) {
+      droppedNonSpeech = true;
+    } else {
+      const beCandidate = this.buildBeConvertedCandidate(payload);
+      if (beCandidate) {
+        try {
+          await fs.promises.appendFile(bePath, beCandidate);
+          beAppended = true;
+        } catch (error) {
+          this.amrwbCaptureDisabled = true;
+          this.logAmrwbCaptureErrorOnce(error, 'write_be');
+        }
+      }
     }
 
-    if (!this.decodedProbeLogged && diagnosticsEnabled()) {
-      this.decodedProbeLogged = true;
-      const pcmBuffer = Buffer.from(pending.buffer, pending.byteOffset, pending.byteLength);
-      const meta: AudioMeta = {
-        callId: this.callControlId,
-        format: 'pcm16le',
-        codec: this.mediaEncoding ?? 'unknown',
-        sampleRateHz,
-        channels: 1,
-        bitDepth: 16,
-        logContext: { call_control_id: this.callControlId, ...(this.logContext ?? {}) },
-        lineage: ['rx.decoded.pcm16'],
-      };
-      attachAudioMeta(pcmBuffer, meta);
-      probePcm('rx.decoded.pcm16', pcmBuffer, meta);
-    }
-
-    this.onFrame({
-      callControlId: this.callControlId,
-      pcm16: pending,
-      sampleRateHz,
-      channels: 1,
-    });
-  }
-
-  private maybeLogEmitDebug(
-    accumulated: Int16Array,
-    emitted: Int16Array,
-    sampleRateHz: number,
-    seq?: number,
-    note?: string,
-  ): void {
-    if (!emitChunkDebugEnabled()) return;
-    const now = Date.now();
-    if (now - this.lastEmitLogAt < 1000) return;
-    this.lastEmitLogAt = now;
-    try {
-      const accumulatedStats = computePcmStats(accumulated);
-      const emittedStats = computePcmStats(emitted);
-      const accumulatedMs = Math.round((accumulated.length / sampleRateHz) * 1000);
-      const emittedMs = Math.round((emitted.length / sampleRateHz) * 1000);
-      log.info(
-        {
-          event: 'media_ingest_emit_debug',
-          call_control_id: this.callControlId,
-          frame_seq: seq ?? null,
-          sample_rate_hz: sampleRateHz,
-          accumulated_samples: accumulated.length,
-          accumulated_ms: accumulatedMs,
-          accumulated_rms: Number(accumulatedStats.rms.toFixed(6)),
-          accumulated_peak: Number(accumulatedStats.peak.toFixed(6)),
-          emitted_samples: emitted.length,
-          emitted_ms: emittedMs,
-          emitted_rms: Number(emittedStats.rms.toFixed(6)),
-          emitted_peak: Number(emittedStats.peak.toFixed(6)),
-          emit_chunk_ms: this.emitChunkMs,
-          note: note ?? null,
-          ...(this.logContext ?? {}),
+    const first8Hex = getHexPrefix(payload, 8);
+    log.info(
+      {
+        event: 'amrwb_truth_capture_frame',
+        call_control_id: this.callControlId,
+        frame_index: frameIndex,
+        payload_len: payload.length,
+        first8_hex: first8Hex,
+        is_speech: isSpeech,
+        dropped_non_speech: droppedNonSpeech,
+        appended_streams: {
+          raw: true,
+          be: beAppended,
         },
-        'media ingest buffered emit',
-      );
-    } catch (error) {
-      log.warn(
-        { event: 'media_ingest_emit_debug_failed', call_control_id: this.callControlId, err: error, ...(this.logContext ?? {}) },
-        'media ingest emit debug failed',
-      );
-    }
+        ...(this.logContext ?? {}),
+      },
+      `amrwb truth capture callId=${this.callControlId} frame_index=${frameIndex} payload_len=${payload.length} first8_hex=${first8Hex} speech=${isSpeech} dropped_non_speech=${droppedNonSpeech} appended_raw=true appended_be=${beAppended}`,
+    );
   }
 
-  private shouldLogAmrwbEmitDebug(now: number): boolean {
-    if (this.amrwbEmitDebugCount < AMRWB_EMIT_DEBUG_MAX) {
-      this.amrwbEmitDebugCount += 1;
-      this.amrwbEmitDebugLastLogAt = now;
-      return true;
-    }
-    if (now - this.amrwbEmitDebugLastLogAt >= AMRWB_EMIT_DEBUG_INTERVAL_MS) {
-      this.amrwbEmitDebugLastLogAt = now;
-      return true;
-    }
-    return false;
+  /* ------------------------------ low-level helpers ----------------------------- */
+
+  private getTelnyxStreamId(message: Record<string, unknown>): string | undefined {
+    const media = message.media && typeof message.media === 'object' ? (message.media as Record<string, unknown>) : undefined;
+    const start = message.start && typeof message.start === 'object' ? (message.start as Record<string, unknown>) : undefined;
+
+    return (
+      this.getString(message.stream_id) ||
+      this.getString(message.streamId) ||
+      this.getString(media?.stream_id) ||
+      this.getString(media?.streamId) ||
+      this.getString(start?.stream_id) ||
+      this.getString(start?.streamId)
+    );
   }
 
-  private countNearZeroSamples(samples: Int16Array, threshold: number): { zero: number; nearZero: number } {
-    let zero = 0;
-    let nearZero = 0;
-    for (let i = 0; i < samples.length; i += 1) {
-      const value = samples[i] ?? 0;
-      if (value === 0) zero += 1;
-      if (Math.abs(value) <= threshold) nearZero += 1;
-    }
-    return { zero, nearZero };
+  private getTelnyxSequence(message: Record<string, unknown>): number | undefined {
+    const media = message.media && typeof message.media === 'object' ? (message.media as Record<string, unknown>) : undefined;
+    const mediaData = media?.data && typeof media.data === 'object' ? (media.data as Record<string, unknown>) : undefined;
+
+    return (
+      this.getNumber(message.sequence_number) ??
+      this.getNumber(message.sequenceNumber) ??
+      this.getNumber(media?.sequence_number) ??
+      this.getNumber(media?.sequenceNumber) ??
+      this.getNumber(mediaData?.sequence_number) ??
+      this.getNumber(mediaData?.sequenceNumber)
+    );
   }
 
-  private logMediaPayloadDebug(base64Len: number, buffer: Buffer | null, payloadSource: string | undefined, note?: string): void {
-    if (this.mediaPayloadDebugCount >= 20) return;
-    this.mediaPayloadDebugCount += 1;
-    try {
-      const decodedLen = buffer ? buffer.length : null;
-      const decodedPrefixHex = buffer ? buffer.subarray(0, 16).toString('hex') : null;
-      log.info(
-        {
-          event: 'media_payload_debug',
-          call_control_id: this.callControlId,
-          payload_source: payloadSource ?? null,
-          base64_len: base64Len,
-          decoded_len: decodedLen,
-          decoded_prefix_hex: decodedPrefixHex,
-          note: note ?? (buffer ? undefined : 'decoded_payload_unavailable'),
-          frame_seq: this.frameSeq,
-          ...(this.logContext ?? {}),
-        },
-        buffer ? 'MEDIA_PAYLOAD_DEBUG raw payload' : 'MEDIA_PAYLOAD_DEBUG decoded payload unavailable',
-      );
-    } catch (error) {
-      log.warn(
-        { event: 'media_payload_debug_failed', call_control_id: this.callControlId, err: error, ...(this.logContext ?? {}) },
-        'MEDIA_PAYLOAD_DEBUG logging failed',
-      );
-    }
+  private getString(value: unknown): string | undefined {
+    return typeof value === 'string' && value.trim() !== '' ? value : undefined;
   }
+
+  private getNumber(value: unknown): number | undefined {
+    return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
+  }
+
+  /* ------------------------------ dump frames ----------------------------- */
 
   private dumpFramesActive(): boolean {
     return this.dumpFramesEnabled && !this.dumpFramesDisabled;
@@ -1508,8 +1659,6 @@ export class MediaIngest {
       return;
     }
 
-    // AMR-WB: ffmpeg -f amrwb -i frame_0001.prepared.bin out.wav (or raw.bin if no prepared)
-    // Unknown: use `file` and `xxd` to inspect the raw payload bytes.
     log.info(
       {
         event: 'media_dump',
@@ -1529,133 +1678,7 @@ export class MediaIngest {
     );
   }
 
-  private logAmrwbCaptureErrorOnce(error: unknown, note: string): void {
-    if (this.amrwbCaptureErrorLogged) return;
-    this.amrwbCaptureErrorLogged = true;
-    log.warn(
-      { event: 'amrwb_truth_capture_error', call_control_id: this.callControlId, note, err: error, ...(this.logContext ?? {}) },
-      'amrwb truth capture failed',
-    );
-  }
-
-  private queueAmrwbTruthCapture(payload: Buffer, frameIndex: number): void {
-    if (!this.amrwbCaptureEnabled || this.amrwbCaptureDisabled) return;
-    this.amrwbCaptureChain = this.amrwbCaptureChain
-      .then(() => this.captureAmrwbTruthPayload(payload, frameIndex))
-      .catch((error) => {
-        this.amrwbCaptureDisabled = true;
-        this.logAmrwbCaptureErrorOnce(error, 'capture');
-      });
-  }
-
-  private buildOctetAlignedCandidate(payload: Buffer): Buffer | null {
-    if (payload.length === 33) return payload;
-    if (payload.length === 34) return payload.subarray(1);
-    return null;
-  }
-
-  private buildBeConvertedCandidate(payload: Buffer): Buffer | null {
-    let be = depacketizeAmrWbBandwidthEfficientNoCmr(payload, { hasCmr: true });
-    if (!be.ok) be = depacketizeAmrWbBandwidthEfficientNoCmr(payload, { hasCmr: false });
-    if (!be.ok) return null;
-
-    const parts: Buffer[] = [];
-    for (const frame of be.frames) {
-      const toc = ((frame.ft & 0x0f) << 3) | ((frame.q & 0x01) << 2);
-      parts.push(Buffer.from([toc]));
-      if (frame.data.length > 0) parts.push(frame.data);
-    }
-    return parts.length > 0 ? Buffer.concat(parts) : null;
-  }
-
-  private async captureAmrwbTruthPayload(payload: Buffer, frameIndex: number): Promise<void> {
-    if (!this.amrwbCaptureEnabled || this.amrwbCaptureDisabled) return;
-
-    if (!this.amrwbCaptureDirReady) {
-      try {
-        await fs.promises.mkdir(this.amrwbCaptureDir, { recursive: true });
-      } catch (error) {
-        this.amrwbCaptureDisabled = true;
-        this.logAmrwbCaptureErrorOnce(error, 'mkdir');
-        return;
-      }
-      this.amrwbCaptureDirReady = true;
-    }
-
-    const rawPath = path.join(this.amrwbCaptureDir, 'raw_frames.bin');
-    const octetPath = path.join(this.amrwbCaptureDir, 'octet_aligned.awb');
-    const bePath = path.join(this.amrwbCaptureDir, 'be_converted.awb');
-
-
-
-    try {
-      if (!this.amrwbCaptureOctetHeaderWritten) {
-        await fs.promises.writeFile(octetPath, AMRWB_FILE_HEADER);
-        this.amrwbCaptureOctetHeaderWritten = true;
-      }
-      if (!this.amrwbCaptureBeHeaderWritten) {
-        await fs.promises.writeFile(bePath, AMRWB_FILE_HEADER);
-        this.amrwbCaptureBeHeaderWritten = true;
-      }
-
-      await fs.promises.appendFile(rawPath, payload);
-    } catch (error) {
-      this.amrwbCaptureDisabled = true;
-      this.logAmrwbCaptureErrorOnce(error, 'write_raw');
-      return;
-    }
-
-    const octetCandidate = this.buildOctetAlignedCandidate(payload);
-    let octetAppended = false;
-    if (octetCandidate) {
-      try {
-        await fs.promises.appendFile(octetPath, octetCandidate);
-        octetAppended = true;
-      } catch (error) {
-        this.amrwbCaptureDisabled = true;
-        this.logAmrwbCaptureErrorOnce(error, 'write_octet');
-        return;
-      }
-    }
-
-    const beCandidate = this.buildBeConvertedCandidate(payload);
-    let beAppended = false;
-    if (beCandidate) {
-      try {
-        await fs.promises.appendFile(bePath, beCandidate);
-        beAppended = true;
-      } catch (error) {
-        this.amrwbCaptureDisabled = true;
-        this.logAmrwbCaptureErrorOnce(error, 'write_be');
-      }
-    }
-
-    const first8Hex = getHexPrefix(payload, 8);
-    log.info(
-      {
-        event: 'amrwb_truth_capture_frame',
-        call_control_id: this.callControlId,
-        frame_index: frameIndex,
-        payload_len: payload.length,
-        first8_hex: first8Hex,
-        appended_streams: {
-          raw: true,
-          octet: octetAppended,
-          be: beAppended,
-        },
-        ...(this.logContext ?? {}),
-      },
-      `amrwb truth capture callId=${this.callControlId} frame_index=${frameIndex} payload_len=${payload.length} first8_hex=${first8Hex} appended_raw=true appended_octet=${octetAppended} appended_be=${beAppended}`,
-    );
-  }
-
-  private getString(value: unknown): string | undefined {
-    return typeof value === 'string' && value.trim() !== '' ? value : undefined;
-  }
-
-  private getNumber(value: unknown): number | undefined {
-    return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
-  }
+  /* ------------------------------ policy: force BE ----------------------------- */
 
   private maybeEnableForceBe(encoding: string, source: 'start' | 'defaulted' | 'payload'): void {
     if (this.forceAmrWbBe) return;
@@ -1680,33 +1703,60 @@ export class MediaIngest {
     }
   }
 
+  /* ------------------------------ start event ----------------------------- */
+
   private handleStartEvent(message: Record<string, unknown>): void {
     this.maybeDumpStartEvent(message);
+
     const start = message.start && typeof message.start === 'object' ? (message.start as Record<string, unknown>) : {};
+    const streamId = this.getString(start.stream_id) ?? this.getString(message.stream_id);
+
+    if (streamId) {
+      this.activeStreamId = streamId;
+      this.lastSeqByStream.set(streamId, -1);
+
+      log.info(
+        { event: 'telnyx_stream_active', call_control_id: this.callControlId, stream_id: streamId, ...(this.logContext ?? {}) },
+        'active stream set',
+      );
+    }
+
     const mediaFormat =
       (start.media_format as Record<string, unknown> | undefined) ??
       (message.media_format as Record<string, unknown> | undefined) ??
       undefined;
 
-    const encoding = mediaFormat ? this.getString((mediaFormat as Record<string, unknown>).encoding) : undefined;
+    const encoding = mediaFormat ? this.getString(mediaFormat.encoding) : undefined;
 
     const sampleRate =
-      mediaFormat && typeof (mediaFormat as Record<string, unknown>).sample_rate === 'number'
-        ? ((mediaFormat as Record<string, unknown>).sample_rate as number)
-        : mediaFormat && typeof (mediaFormat as Record<string, unknown>).sampleRate === 'number'
-          ? ((mediaFormat as Record<string, unknown>).sampleRate as number)
+      mediaFormat && typeof mediaFormat.sample_rate === 'number'
+        ? (mediaFormat.sample_rate as number)
+        : mediaFormat && typeof mediaFormat.sampleRate === 'number'
+          ? (mediaFormat.sampleRate as number)
           : undefined;
 
-    const channels = mediaFormat ? this.getNumber((mediaFormat as Record<string, unknown>).channels) : undefined;
+    const channels = mediaFormat ? this.getNumber(mediaFormat.channels) : undefined;
 
-    const normalizedEncoding = normalizeCodec(encoding ?? this.mediaEncoding);
-    if (encoding) {
+    let normalizedEncoding = normalizeCodec(encoding ?? this.mediaEncoding);
+
+    // Optional: force PSTN to AMR-WB
+    if (
+      this.transportMode === 'pstn' &&
+      parseBoolEnv(process.env.TELNYX_FORCE_AMRWB_PSTN) &&
+      this.allowAmrWb &&
+      this.acceptCodecs.has('AMR-WB')
+    ) {
+      normalizedEncoding = 'AMR-WB';
+      this.pinnedCodec = 'AMR-WB';
+    }
+
+    if (encoding || !this.mediaEncoding) {
       this.mediaEncoding = normalizedEncoding;
       this.mediaSampleRate = sampleRate ?? (normalizedEncoding === 'AMR-WB' ? 16000 : undefined);
       this.mediaChannels = channels;
     }
 
-    // ✅ If this is Telnyx PSTN AMR-WB, declare "BE as received" at the ingest layer.
+    // ✅ If this is Telnyx PSTN AMR-WB, declare "BE as received" at ingest layer.
     this.maybeEnableForceBe(normalizedEncoding, 'start');
 
     if (!this.mediaCodecLogged) {
@@ -1716,7 +1766,7 @@ export class MediaIngest {
           event: 'media_ingest_codec_detected',
           call_control_id: this.callControlId,
           codec: normalizedEncoding,
-          sample_rate: sampleRate ?? (normalizedEncoding === 'AMR-WB' ? 16000 : undefined),
+          sample_rate: this.mediaSampleRate,
           channels,
           ...(this.logContext ?? {}),
         },
@@ -1734,6 +1784,8 @@ export class MediaIngest {
     if (codec === 'OPUS' && !this.allowOpus) return { supported: false, reason: 'opus_decode_disabled' };
     return { supported: true };
   }
+
+  /* ------------------------------ ingest core ----------------------------- */
 
   private handleEncodedPayload(buffer: Buffer, timestamp?: number, seq?: number, payloadSource?: string): void {
     if (!this.mediaEncoding) {
@@ -1754,21 +1806,14 @@ export class MediaIngest {
     }
 
     const explicit = this.mediaEncoding;
-    const encoding = normalizeCodec(explicit);
+    let encoding = normalizeCodec(explicit);
+
+    if (this.pinnedCodec) {
+      encoding = this.pinnedCodec;
+    }
 
     // ✅ If we defaulted to AMR-WB on PSTN, still lock BE policy here.
     this.maybeEnableForceBe(encoding, explicit ? 'payload' : 'defaulted');
-
-    log.info(
-      {
-        event: 'media_ingest_codec_effective',
-        call_control_id: this.callControlId,
-        explicit_encoding: explicit ?? null,
-        effective_encoding: encoding,
-        ...(this.logContext ?? {}),
-      },
-      'media ingest codec effective',
-    );
 
     const support = this.isCodecSupported(encoding);
     if (!support.supported) {
@@ -1826,15 +1871,148 @@ export class MediaIngest {
       .then(() => this.decodeAndEmit(buffer, encoding, timestamp, seq, payloadSource))
       .catch((err: unknown) => {
         log.warn(
-          {
-            event: 'media_ingest_decode_chain_error',
-            call_control_id: this.callControlId,
-            err,
-            ...(this.logContext ?? {}),
-          },
+          { event: 'media_ingest_decode_chain_error', call_control_id: this.callControlId, err, ...(this.logContext ?? {}) },
           'media ingest decode chain error',
         );
       });
+  }
+
+  private flushPendingPcm(reason: string): void {
+    if (!this.pendingPcm || this.pendingPcm.length === 0) return;
+
+    const pending = this.pendingPcm;
+    const sampleRateHz = this.pendingPcmSampleRateHz ?? this.targetSampleRateHz;
+    this.pendingPcm = undefined;
+    this.pendingPcmSampleRateHz = undefined;
+
+    this.maybeLogEmitDebug(pending, pending, sampleRateHz, undefined, `flush_${reason}`);
+
+    if (this.audioTap && pending.length > 0) {
+      const frameBuf = Buffer.from(pending.buffer, pending.byteOffset, pending.byteLength);
+      this.audioTap.push('EMITTED_BUFFERED', frameBuf);
+    }
+
+    if (!this.decodedProbeLogged && diagnosticsEnabled()) {
+      this.decodedProbeLogged = true;
+      const pcmBuffer = Buffer.from(pending.buffer, pending.byteOffset, pending.byteLength);
+      const meta: AudioMeta = {
+        callId: this.callControlId,
+        format: 'pcm16le',
+        codec: this.mediaEncoding ?? 'unknown',
+        sampleRateHz,
+        channels: 1,
+        bitDepth: 16,
+        logContext: { call_control_id: this.callControlId, ...(this.logContext ?? {}) },
+        lineage: ['rx.decoded.pcm16'],
+      };
+      attachAudioMeta(pcmBuffer, meta);
+      probePcm('rx.decoded.pcm16', pcmBuffer, meta);
+    }
+
+    this.onFrame({
+      callControlId: this.callControlId,
+      pcm16: pending,
+      sampleRateHz,
+      channels: 1,
+    });
+  }
+
+  private maybeLogEmitDebug(
+    accumulated: Int16Array,
+    emitted: Int16Array,
+    sampleRateHz: number,
+    seq?: number,
+    note?: string,
+  ): void {
+    if (!emitChunkDebugEnabled()) return;
+    const now = Date.now();
+    if (now - this.lastEmitLogAt < 1000) return;
+    this.lastEmitLogAt = now;
+
+    try {
+      const accumulatedStats = computePcmStats(accumulated);
+      const emittedStats = computePcmStats(emitted);
+      const accumulatedMs = Math.round((accumulated.length / sampleRateHz) * 1000);
+      const emittedMs = Math.round((emitted.length / sampleRateHz) * 1000);
+
+      log.info(
+        {
+          event: 'media_ingest_emit_debug',
+          call_control_id: this.callControlId,
+          frame_seq: seq ?? null,
+          sample_rate_hz: sampleRateHz,
+          accumulated_samples: accumulated.length,
+          accumulated_ms: accumulatedMs,
+          accumulated_rms: Number(accumulatedStats.rms.toFixed(6)),
+          accumulated_peak: Number(accumulatedStats.peak.toFixed(6)),
+          emitted_samples: emitted.length,
+          emitted_ms: emittedMs,
+          emitted_rms: Number(emittedStats.rms.toFixed(6)),
+          emitted_peak: Number(emittedStats.peak.toFixed(6)),
+          emit_chunk_ms: this.emitChunkMs,
+          note: note ?? null,
+          ...(this.logContext ?? {}),
+        },
+        'media ingest buffered emit',
+      );
+    } catch (error) {
+      log.warn(
+        { event: 'media_ingest_emit_debug_failed', call_control_id: this.callControlId, err: error, ...(this.logContext ?? {}) },
+        'media ingest emit debug failed',
+      );
+    }
+  }
+
+  private shouldLogAmrwbEmitDebug(now: number): boolean {
+    if (this.amrwbEmitDebugCount < AMRWB_EMIT_DEBUG_MAX) {
+      this.amrwbEmitDebugCount += 1;
+      this.amrwbEmitDebugLastLogAt = now;
+      return true;
+    }
+    if (now - this.amrwbEmitDebugLastLogAt >= AMRWB_EMIT_DEBUG_INTERVAL_MS) {
+      this.amrwbEmitDebugLastLogAt = now;
+      return true;
+    }
+    return false;
+  }
+
+  private countNearZeroSamples(samples: Int16Array, threshold: number): { zero: number; nearZero: number } {
+    let zero = 0;
+    let nearZero = 0;
+    for (let i = 0; i < samples.length; i += 1) {
+      const value = samples[i] ?? 0;
+      if (value === 0) zero += 1;
+      if (Math.abs(value) <= threshold) nearZero += 1;
+    }
+    return { zero, nearZero };
+  }
+
+  private logMediaPayloadDebug(base64Len: number, buffer: Buffer | null, payloadSource: string | undefined, note?: string): void {
+    if (this.mediaPayloadDebugCount >= 20) return;
+    this.mediaPayloadDebugCount += 1;
+    try {
+      const decodedLen = buffer ? buffer.length : null;
+      const decodedPrefixHex = buffer ? buffer.subarray(0, 16).toString('hex') : null;
+      log.info(
+        {
+          event: 'media_payload_debug',
+          call_control_id: this.callControlId,
+          payload_source: payloadSource ?? null,
+          base64_len: base64Len,
+          decoded_len: decodedLen,
+          decoded_prefix_hex: decodedPrefixHex,
+          note: note ?? (buffer ? undefined : 'decoded_payload_unavailable'),
+          frame_seq: this.frameSeq,
+          ...(this.logContext ?? {}),
+        },
+        buffer ? 'MEDIA_PAYLOAD_DEBUG raw payload' : 'MEDIA_PAYLOAD_DEBUG decoded payload unavailable',
+      );
+    } catch (error) {
+      log.warn(
+        { event: 'media_payload_debug_failed', call_control_id: this.callControlId, err: error, ...(this.logContext ?? {}) },
+        'MEDIA_PAYLOAD_DEBUG logging failed',
+      );
+    }
   }
 
   private async decodeAndEmit(
@@ -1860,13 +2038,14 @@ export class MediaIngest {
       state: this.codecState,
       logContext: { call_control_id: this.callControlId, ...(this.logContext ?? {}) },
 
-      // ✅ NEW: enforce Telnyx PSTN AMR-WB as Bandwidth-Efficient (BE) "as received".
-      // codecDecode.ts will use this to bypass any CMR strip / octet-align repack path.
+      // ✅ enforce Telnyx PSTN AMR-WB as Bandwidth-Efficient (BE) "as received".
       forceAmrWbBe: this.forceAmrWbBe,
     });
 
     if (!decodeResult) {
-      this.healthMonitor.recordPayload(buffer.length, 0, 0, 0, false);
+      // Don't mark AMR-WB frames as "tiny" just because decode failed.
+      const pseudoDecodedLen = encoding === 'AMR-WB' ? 999 : 0;
+      this.healthMonitor.recordPayload(buffer.length, pseudoDecodedLen, 0, 0, false);
       this.checkHealth(encoding);
       return;
     }
@@ -1904,6 +2083,7 @@ export class MediaIngest {
     decodeOk = true;
 
     const sampleRateHz = decodeResult.sampleRateHz;
+
     if (
       this.pendingPcm &&
       this.pendingPcm.length > 0 &&
@@ -1925,7 +2105,7 @@ export class MediaIngest {
       this.pendingPcmSampleRateHz = undefined;
     }
 
-    // Buffer decoded PCM so Whisper sees contiguous 80–200ms chunks rather than 20ms shards.
+    // Buffer decoded PCM so Whisper sees contiguous 80–200ms chunks
     let offset = 0;
     let framesEmitted = 0;
     let loggedEmitStats = false;
@@ -1941,7 +2121,6 @@ export class MediaIngest {
         loggedEmitStats = true;
       }
 
-      // -------------------- AUDIO TAP: buffered chunks emitted downstream --------------------
       if (this.audioTap && slice.length > 0) {
         const frameBuf = Buffer.from(slice.buffer, slice.byteOffset, slice.byteLength);
         this.audioTap.push('EMITTED_BUFFERED', frameBuf);
@@ -2013,9 +2192,7 @@ export class MediaIngest {
       this.pendingPcmSampleRateHz = sampleRateHz;
     }
 
-    // record decoded_len as the *decoded* length (bytes) for health logic
     this.healthMonitor.recordPayload(buffer.length, pcm16.byteLength, rms, peak, decodeOk);
-
     this.checkHealth(encoding);
 
     const now = Date.now();
@@ -2042,6 +2219,8 @@ export class MediaIngest {
           rx_frames_outbound_skipped: this.rxFramesOutboundSkipped,
           rx_frames_unknown_track_skipped: this.rxFramesUnknownTrackSkipped,
           force_amrwb_be: this.forceAmrWbBe,
+          telnyx_dedupe_kept: this.telnyxDupKept,
+          telnyx_dedupe_dropped: this.telnyxDupDropped,
           ...(this.logContext ?? {}),
         },
         'media ingest decode stats',
@@ -2057,7 +2236,6 @@ export class MediaIngest {
     const stats = this.healthMonitor.getStats();
     this.ingestUnhealthyLogged = true;
 
-    // -------------------- AUDIO TAP: dump last N seconds on unhealthy --------------------
     try {
       this.audioTap?.flush('IN_DECODED_PCM', `unhealthy_${reason}_decoded`);
       this.audioTap?.flush('EMITTED_BUFFERED', `unhealthy_${reason}_emitted`);
@@ -2089,8 +2267,12 @@ export class MediaIngest {
   }
 
   private async handleUnhealthy(reason: MediaIngestUnhealthyReason, codec: string): Promise<void> {
+    // AMR-WB payloads are naturally small; never restart stream for "tiny_payloads".
+    if (codec === 'AMR-WB' && reason === 'tiny_payloads') {
+      this.onReprompt?.(reason);
+      return;
+    }
     if (reason === 'low_rms') {
-      // Avoid destructive restarts on brief low-energy spans; low_rms is now evaluated on buffered chunks.
       this.onReprompt?.(reason);
       return;
     }
@@ -2098,12 +2280,10 @@ export class MediaIngest {
       this.onReprompt?.(reason);
       return;
     }
-
     if (this.restartAttempts >= this.maxRestartAttempts) {
       this.onReprompt?.(reason);
       return;
     }
-
     if (!this.onRestartStreaming) {
       this.onReprompt?.(reason);
       return;
@@ -2126,7 +2306,19 @@ export class MediaIngest {
     );
 
     try {
-      const ok = await this.onRestartStreaming(codec, reason);
+      const requestedCodec =
+        this.transportMode === 'pstn' && this.allowAmrWb && this.acceptCodecs.has('AMR-WB') ? 'AMR-WB' : codec;
+
+      this.activeStreamId = null;
+      this.lastSeqByStream.clear();
+
+      const ok = await this.onRestartStreaming(requestedCodec, reason);
+
+      if (ok && requestedCodec === 'AMR-WB') {
+        this.pinnedCodec = 'AMR-WB';
+        this.maybeEnableForceBe('AMR-WB', 'payload');
+      }
+
       if (!ok) {
         log.warn(
           { event: 'media_ingest_restart_failed', call_control_id: this.callControlId, reason, ...(this.logContext ?? {}) },
@@ -2136,7 +2328,13 @@ export class MediaIngest {
       }
     } catch (error) {
       log.warn(
-        { event: 'media_ingest_restart_failed', call_control_id: this.callControlId, reason, err: error, ...(this.logContext ?? {}) },
+        {
+          event: 'media_ingest_restart_failed',
+          call_control_id: this.callControlId,
+          reason,
+          err: error,
+          ...(this.logContext ?? {}),
+        },
         'media ingest restart failed',
       );
       this.onReprompt?.(reason);
