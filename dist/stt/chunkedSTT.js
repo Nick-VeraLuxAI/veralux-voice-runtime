@@ -5,6 +5,7 @@ const env_1 = require("../env");
 const log_1 = require("../log");
 const metrics_1 = require("../metrics");
 const audioProbe_1 = require("../diagnostics/audioProbe");
+const postprocess_1 = require("../audio/postprocess");
 const DEFAULT_PARTIAL_INTERVAL_MS = 250;
 const DEFAULT_SILENCE_END_MS = 900;
 const DEFAULT_PRE_ROLL_MS = 300;
@@ -13,9 +14,11 @@ const DEFAULT_MIN_SECONDS = 0.6;
 const DEFAULT_SILENCE_MIN_SECONDS = 0.45;
 const DEFAULT_FINAL_TAIL_CUSHION_MS = 120;
 const DEFAULT_FINAL_MIN_SECONDS = 1.0;
+const DEFAULT_PARTIAL_MIN_MS = 600;
+const DEFAULT_HIGHPASS_CUTOFF_HZ = 100;
 // Speech detection defaults (your env.ts may override)
 const DEFAULT_SPEECH_RMS_FLOOR = 0.03;
-const DEFAULT_SPEECH_PEAK_FLOOR = 0.08;
+const DEFAULT_SPEECH_PEAK_FLOOR = 0.1;
 const DEFAULT_SPEECH_FRAMES_REQUIRED = 8;
 function clamp(n, min, max) {
     return Math.min(max, Math.max(min, n));
@@ -41,6 +44,13 @@ function parseBool(value) {
         return false;
     const normalized = value.trim().toLowerCase();
     return normalized === 'true' || normalized === '1' || normalized === 'yes' || normalized === 'y';
+}
+function computeHighpassAlpha(sampleRateHz, cutoffHz) {
+    const safeSampleRate = sampleRateHz > 0 ? sampleRateHz : 8000;
+    const safeCutoff = cutoffHz > 0 ? cutoffHz : DEFAULT_HIGHPASS_CUTOFF_HZ;
+    const rc = 1 / (2 * Math.PI * safeCutoff);
+    const dt = 1 / safeSampleRate;
+    return rc / (rc + dt);
 }
 function isAbortError(error) {
     if (!error || typeof error !== 'object')
@@ -111,11 +121,16 @@ class ChunkedSTT {
         this.lastPartialAt = 0;
         this.lastPartialTranscript = '';
         this.lastNonEmptyPartialAt = 0;
+        this.rollingRms = 0;
+        this.rollingPeak = 0;
+        this.lastGateLogAtMs = 0;
         this.finalFlushAt = 0;
         this.finalTranscriptAccepted = false;
         this.inFlight = false;
         this.inFlightToken = 0;
         this.decodedProbeLogged = false;
+        this.hpfPrevX = 0;
+        this.hpfPrevY = 0;
         this.provider = opts.provider;
         this.whisperUrl = opts.whisperUrl;
         this.language = opts.language;
@@ -137,16 +152,27 @@ class ChunkedSTT {
         const computedFinalMinBytes = Math.round(this.bytesPerSecond * Math.max(0, finalMinSeconds));
         const finalMinBytes = safeNum(env_1.env.FINAL_MIN_BYTES, computedFinalMinBytes);
         this.finalMinBytes = Math.max(0, Math.round(finalMinBytes));
-        this.partialMinBytes = Math.round(this.bytesPerSecond * 0.5);
+        this.partialMinMs = clamp(safeNum(env_1.env.STT_PARTIAL_MIN_MS, DEFAULT_PARTIAL_MIN_MS), 200, 5000);
+        this.partialMinBytes = Math.max(0, Math.round((this.bytesPerSecond * this.partialMinMs) / 1000));
         this.onTranscript = opts.onTranscript;
         this.onSpeechStart = opts.onSpeechStart;
+        this.isPlaybackActive = opts.isPlaybackActive;
+        this.isListening = opts.isListening;
+        this.getTrack = opts.getTrack;
+        this.getCodec = opts.getCodec;
         this.partialIntervalMs = clamp(safeNum(opts.partialIntervalMs, env_1.env.STT_PARTIAL_INTERVAL_MS ?? DEFAULT_PARTIAL_INTERVAL_MS), 100, 10000);
         this.preRollMaxMs = clamp(safeNum(opts.preRollMs, env_1.env.STT_PRE_ROLL_MS ?? DEFAULT_PRE_ROLL_MS), 0, 2000);
         this.silenceEndMs = clamp(safeNum(opts.silenceEndMs, env_1.env.STT_SILENCE_END_MS ?? DEFAULT_SILENCE_END_MS), 100, 8000);
         this.maxUtteranceMs = clamp(safeNum(opts.maxUtteranceMs, env_1.env.STT_MAX_UTTERANCE_MS ?? DEFAULT_MAX_UTTERANCE_MS), 2000, 60000);
-        this.speechRmsFloor = safeNum(opts.speechRmsFloor, env_1.env.STT_SPEECH_RMS_FLOOR ?? DEFAULT_SPEECH_RMS_FLOOR);
-        this.speechPeakFloor = safeNum(opts.speechPeakFloor, env_1.env.STT_SPEECH_PEAK_FLOOR ?? DEFAULT_SPEECH_PEAK_FLOOR);
-        this.speechFramesRequired = clamp(safeNum(opts.speechFramesRequired, env_1.env.STT_SPEECH_FRAMES_REQUIRED ?? DEFAULT_SPEECH_FRAMES_REQUIRED), 1, 6);
+        this.highpassEnabled = env_1.env.STT_HIGHPASS_ENABLED ?? true;
+        this.highpassCutoffHz = clamp(safeNum(env_1.env.STT_HIGHPASS_CUTOFF_HZ, DEFAULT_HIGHPASS_CUTOFF_HZ), 20, 300);
+        this.highpassAlpha = computeHighpassAlpha(this.sampleRate, this.highpassCutoffHz);
+        const rmsFloorEnv = env_1.env.STT_RMS_FLOOR ?? env_1.env.STT_SPEECH_RMS_FLOOR ?? DEFAULT_SPEECH_RMS_FLOOR;
+        const peakFloorEnv = env_1.env.STT_PEAK_FLOOR ?? env_1.env.STT_SPEECH_PEAK_FLOOR ?? DEFAULT_SPEECH_PEAK_FLOOR;
+        this.speechRmsFloor = safeNum(opts.speechRmsFloor, rmsFloorEnv);
+        this.speechPeakFloor = safeNum(opts.speechPeakFloor, peakFloorEnv);
+        this.speechFramesRequired = clamp(safeNum(opts.speechFramesRequired, env_1.env.STT_SPEECH_FRAMES_REQUIRED ?? DEFAULT_SPEECH_FRAMES_REQUIRED), 1, 30);
+        this.disableGates = env_1.env.STT_DISABLE_GATES ?? false;
         log_1.log.info({
             event: 'stt_tuning',
             stt_tuning: {
@@ -155,11 +181,15 @@ class ChunkedSTT {
                 frames_required: this.speechFramesRequired,
                 chunk_ms: this.fallbackFrameMs,
                 partial_interval_ms: this.partialIntervalMs,
+                partial_min_ms: this.partialMinMs,
                 pre_roll_ms: this.preRollMaxMs,
                 silence_end_ms: this.silenceEndMs,
                 max_utt_ms: this.maxUtteranceMs,
                 final_tail_cushion_ms: this.finalTailCushionMs,
                 final_min_bytes: this.finalMinBytes,
+                highpass_enabled: this.highpassEnabled,
+                highpass_cutoff_hz: this.highpassCutoffHz,
+                disable_gates: this.disableGates,
             },
             ...(this.logContext ?? {}),
         }, 'stt tuning');
@@ -198,6 +228,102 @@ class ChunkedSTT {
             this.mergeLineageFromBuffer(frame.buffer);
         }
     }
+    applyHighpassPcm16(pcm16le) {
+        if (!this.highpassEnabled || pcm16le.length < 2) {
+            return pcm16le;
+        }
+        const out = Buffer.allocUnsafe(pcm16le.length);
+        const samples = Math.floor(pcm16le.length / 2);
+        let prevX = this.hpfPrevX;
+        let prevY = this.hpfPrevY;
+        const alpha = this.highpassAlpha;
+        for (let i = 0; i < samples; i += 1) {
+            const x = pcm16le.readInt16LE(i * 2) / 32768;
+            const y = alpha * (prevY + x - prevX);
+            prevX = x;
+            prevY = y;
+            out.writeInt16LE(clampInt16(Math.round(y * 32767)), i * 2);
+        }
+        this.hpfPrevX = prevX;
+        this.hpfPrevY = prevY;
+        return out;
+    }
+    estimateSilenceMs(frames) {
+        let leadingMs = 0;
+        for (const frame of frames) {
+            const stats = computeRmsAndPeak(frame.buffer);
+            if (stats.rms >= this.speechRmsFloor)
+                break;
+            leadingMs += frame.ms;
+        }
+        let trailingMs = 0;
+        for (let i = frames.length - 1; i >= 0; i -= 1) {
+            const stats = computeRmsAndPeak(frames[i].buffer);
+            if (stats.rms >= this.speechRmsFloor)
+                break;
+            trailingMs += frames[i].ms;
+        }
+        return { leadingMs, trailingMs };
+    }
+    updateRollingStats(stats) {
+        const alpha = 0.1;
+        this.rollingRms = this.rollingRms === 0 ? stats.rms : this.rollingRms * (1 - alpha) + stats.rms * alpha;
+        this.rollingPeak = this.rollingPeak === 0 ? stats.peak : this.rollingPeak * (1 - alpha) + stats.peak * alpha;
+    }
+    resolveGateClosedReason(gateRms, gatePeak, streak) {
+        if (!gateRms)
+            return 'below_rms_floor';
+        if (!gatePeak)
+            return 'below_peak_floor';
+        if (streak < this.speechFramesRequired)
+            return 'insufficient_frames';
+        return null;
+    }
+    maybeLogGateClosed(reason, stats, frameMs) {
+        const now = Date.now();
+        if (now - this.lastGateLogAtMs < 1000)
+            return;
+        this.lastGateLogAtMs = now;
+        const playbackActive = this.isPlaybackActive?.();
+        const listening = this.isListening?.();
+        const codec = this.getCodec?.() ?? this.inputCodec;
+        const track = this.getTrack?.();
+        log_1.log.info({
+            event: 'stt_gate_closed',
+            reason,
+            codec,
+            track,
+            playback_active: playbackActive,
+            listening,
+            rms: stats.rms,
+            peak: stats.peak,
+            rolling_rms: this.rollingRms,
+            rolling_peak: this.rollingPeak,
+            rms_floor: this.speechRmsFloor,
+            peak_floor: this.speechPeakFloor,
+            speech_frames_required: this.speechFramesRequired,
+            speech_frame_streak: this.speechFrameStreak,
+            frame_ms: Math.round(frameMs),
+            sample_rate_hz: this.sampleRate,
+            disable_gates: this.disableGates,
+            ...(this.logContext ?? {}),
+        }, 'stt gate closed');
+    }
+    ingestPcm16(pcm16, sampleRateHz) {
+        if (!pcm16 || pcm16.length === 0)
+            return;
+        if (sampleRateHz !== this.sampleRate) {
+            log_1.log.warn({
+                event: 'chunked_stt_sample_rate_mismatch',
+                expected_hz: this.sampleRate,
+                got_hz: sampleRateHz,
+                ...(this.logContext ?? {}),
+            }, 'chunked stt sample rate mismatch');
+            return;
+        }
+        const buf = Buffer.from(pcm16.buffer, pcm16.byteOffset, pcm16.byteLength);
+        this.ingest(buf);
+    }
     ingest(pcm) {
         if (!pcm || pcm.length === 0)
             return;
@@ -230,9 +356,29 @@ class ChunkedSTT {
             });
             (0, audioProbe_1.attachAudioMeta)(pcm, rawMeta);
         }
-        const frame = this.inputCodec === 'pcmu' ? pcmuToPcm16le(pcm) : pcm;
-        const decodedMeta = (0, audioProbe_1.appendLineage)(rawMeta, this.inputCodec === 'pcmu' ? 'decode:pcmu->pcm16le' : 'passthrough:pcm16le');
+        let frame = this.inputCodec === 'pcmu'
+            ? pcmuToPcm16le(pcm)
+            : pcm;
+        // 🔑 APPLY RX POSTPROCESS HERE
+        // 🔑 APPLY RX POSTPROCESS HERE (SAFE LE PCM16 <-> Int16)
+        const sampleCount = Math.floor(frame.length / 2);
+        const safePcm = new Int16Array(sampleCount);
+        for (let i = 0; i < sampleCount; i += 1) {
+            safePcm[i] = frame.readInt16LE(i * 2);
+        }
+        const processed = (0, postprocess_1.postprocessPcm16)(safePcm, this.sampleRate);
+        const out = Buffer.allocUnsafe(processed.samples.length * 2);
+        for (let i = 0; i < processed.samples.length; i += 1) {
+            out.writeInt16LE(processed.samples[i], i * 2);
+        }
+        frame = out;
+        let decodedMeta = (0, audioProbe_1.appendLineage)(rawMeta, this.inputCodec === 'pcmu' ? 'decode:pcmu->pcm16le' : 'passthrough:pcm16le');
         (0, audioProbe_1.attachAudioMeta)(frame, decodedMeta);
+        if (this.highpassEnabled) {
+            frame = this.applyHighpassPcm16(frame);
+            decodedMeta = (0, audioProbe_1.appendLineage)(decodedMeta, `filter:highpass_${this.highpassCutoffHz}hz`);
+            (0, audioProbe_1.attachAudioMeta)(frame, decodedMeta);
+        }
         if (!this.decodedProbeLogged) {
             this.decodedProbeLogged = true;
             (0, audioProbe_1.probePcm)('rx.decoded.pcm', frame, {
@@ -244,7 +390,10 @@ class ChunkedSTT {
             });
         }
         const stats = computeRmsAndPeak(frame);
-        const isSpeech = stats.rms >= this.speechRmsFloor;
+        this.updateRollingStats(stats);
+        const gateRms = stats.rms >= this.speechRmsFloor;
+        const gatePeak = stats.peak >= this.speechPeakFloor;
+        const isSpeech = this.disableGates ? true : gateRms && gatePeak;
         if (this.inFlight && this.inFlightKind === 'final' && isSpeech) {
             this.abortInFlight('barge_in');
             this.resetUtteranceState();
@@ -262,8 +411,20 @@ class ChunkedSTT {
             }
             if (isSpeech && this.speechFrameStreak >= this.speechFramesRequired) {
                 this.startSpeech(stats, frameMs);
-                if (this.onSpeechStart)
-                    this.onSpeechStart();
+                if (this.onSpeechStart) {
+                    this.onSpeechStart({
+                        rms: stats.rms,
+                        peak: stats.peak,
+                        frameMs,
+                        streak: this.speechFrameStreak,
+                    });
+                }
+            }
+            else if (!this.disableGates) {
+                const reason = this.resolveGateClosedReason(gateRms, gatePeak, this.speechFrameStreak);
+                if (reason) {
+                    this.maybeLogGateClosed(reason, stats, frameMs);
+                }
             }
             return;
         }
@@ -402,9 +563,38 @@ class ChunkedSTT {
         if (this.lastPartialAt > 0 && now - this.lastPartialAt < this.partialIntervalMs)
             return;
         const payload = this.concatFrames(this.utteranceFrames);
-        if (payload.length < this.partialMinBytes)
+        if (payload.length < this.partialMinBytes) {
+            const stats = computeRmsAndPeak(payload);
+            const silence = this.estimateSilenceMs(this.utteranceFrames);
+            const audioMs = Math.round((payload.length / this.bytesPerSecond) * 1000);
+            log_1.log.info({
+                event: 'stt_partial_skip_short',
+                audio_ms: audioMs,
+                audio_bytes: payload.length,
+                rms: Number(stats.rms.toFixed(6)),
+                peak: Number(stats.peak.toFixed(6)),
+                leading_silence_ms: Math.round(silence.leadingMs),
+                trailing_silence_ms: Math.round(silence.trailingMs),
+                min_ms: this.partialMinMs,
+                min_bytes: this.partialMinBytes,
+                ...(this.logContext ?? {}),
+            }, 'stt partial skipped (too short)');
             return;
+        }
         this.lastPartialAt = now;
+        const stats = computeRmsAndPeak(payload);
+        const silence = this.estimateSilenceMs(this.utteranceFrames);
+        const audioMs = Math.round((payload.length / this.bytesPerSecond) * 1000);
+        log_1.log.info({
+            event: 'stt_partial_submit',
+            audio_ms: audioMs,
+            audio_bytes: payload.length,
+            rms: Number(stats.rms.toFixed(6)),
+            peak: Number(stats.peak.toFixed(6)),
+            leading_silence_ms: Math.round(silence.leadingMs),
+            trailing_silence_ms: Math.round(silence.trailingMs),
+            ...(this.logContext ?? {}),
+        }, 'stt partial submit');
         this.enqueueTranscription(payload, {
             reason: 'partial',
             isFinal: false,
@@ -434,6 +624,9 @@ class ChunkedSTT {
         const trimmedFrames = this.trimTrailingSilence(this.utteranceFrames);
         const trimmedMs = trimmedFrames.reduce((sum, frame) => sum + frame.ms, 0);
         const payload = this.concatFrames(trimmedFrames);
+        const stats = computeRmsAndPeak(payload);
+        const silence = this.estimateSilenceMs(trimmedFrames);
+        const audioMs = Math.round((payload.length / this.bytesPerSecond) * 1000);
         (0, metrics_1.observeStageDuration)('stt_finalize_audio_ms', this.tenantLabel, trimmedMs);
         log_1.log.info({
             event: 'stt_final_flush_forced',
@@ -441,6 +634,11 @@ class ChunkedSTT {
             utterance_bytes: payload.length,
             utterance_ms: this.utteranceMs,
             duration_ms_estimate: Math.round(trimmedMs),
+            audio_ms: audioMs,
+            rms: Number(stats.rms.toFixed(6)),
+            peak: Number(stats.peak.toFixed(6)),
+            leading_silence_ms: Math.round(silence.leadingMs),
+            trailing_silence_ms: Math.round(silence.trailingMs),
             below_floor: payload.length < this.finalMinBytes,
             ...(this.logContext ?? {}),
         }, 'stt final flush forced');

@@ -1,14 +1,28 @@
 "use strict";
+var __importDefault = (this && this.__importDefault) || function (mod) {
+    return (mod && mod.__esModule) ? mod : { "default": mod };
+};
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.WhisperHttpProvider = void 0;
+const fs_1 = __importDefault(require("fs"));
+const path_1 = __importDefault(require("path"));
 const env_1 = require("../../env");
 const log_1 = require("../../log");
 const metrics_1 = require("../../metrics");
 const audioProbe_1 = require("../../diagnostics/audioProbe");
+const wavGuard_1 = require("../wavGuard");
+const preWhisperGate_1 = require("../../audio/preWhisperGate");
 const WAV_SAMPLE_RATE_HZ = 16000;
 const PCM_8K_SAMPLE_RATE_HZ = 8000;
 const wavDebugLogged = new Set();
 let wavDebugLoggedAnonymous = false;
+const whisperDumpCounters = new Map();
+function parseBoolEnv(value) {
+    if (!value)
+        return false;
+    const normalized = value.trim().toLowerCase();
+    return normalized === '1' || normalized === 'true' || normalized === 'yes';
+}
 const mediaDebugEnabled = () => {
     const value = process.env.MEDIA_DEBUG;
     if (!value)
@@ -16,6 +30,34 @@ const mediaDebugEnabled = () => {
     const normalized = value.trim().toLowerCase();
     return normalized === '1' || normalized === 'true' || normalized === 'yes';
 };
+const whisperDumpEnabled = () => parseBoolEnv(process.env.STT_DEBUG_DUMP_WHISPER_WAVS);
+const preWhisperGateEnabled = () => parseBoolEnv(process.env.STT_PREWHISPER_GATE);
+function debugDir() {
+    return process.env.STT_DEBUG_DIR && process.env.STT_DEBUG_DIR.trim() !== ''
+        ? process.env.STT_DEBUG_DIR.trim()
+        : '/tmp/veralux-stt-debug';
+}
+function sanitizeFilePart(value) {
+    return value.replace(/[^A-Za-z0-9._-]/g, '_');
+}
+async function maybeDumpWhisperWav(wavPayload, kind, logContext) {
+    if (!whisperDumpEnabled())
+        return;
+    const callControlId = extractCallControlId(logContext) ?? 'unknown';
+    const safeId = sanitizeFilePart(callControlId);
+    const seq = (whisperDumpCounters.get(safeId) ?? 0) + 1;
+    whisperDumpCounters.set(safeId, seq);
+    const dir = debugDir();
+    const filePath = path_1.default.join(dir, `whisper_${safeId}_${kind}_${seq}_${Date.now()}.wav`);
+    try {
+        await fs_1.default.promises.mkdir(dir, { recursive: true });
+        await fs_1.default.promises.writeFile(filePath, wavPayload);
+        log_1.log.info({ event: 'stt_whisper_wav_dumped', file_path: filePath, kind, ...(logContext ?? {}) }, 'stt whisper wav dumped');
+    }
+    catch (error) {
+        log_1.log.warn({ event: 'stt_whisper_wav_dump_failed', file_path: filePath, err: error, ...(logContext ?? {}) }, 'stt whisper wav dump failed');
+    }
+}
 function clampInt16(n) {
     if (n > 32767)
         return 32767;
@@ -229,8 +271,46 @@ class WhisperHttpProvider {
             logContext: opts.logContext ?? opts.audioMeta?.logContext,
             kind: opts.isPartial ? 'partial' : 'final',
         };
-        const { wav: wavPayload, meta: wavMeta } = prepareWavPayload(audio, baseMeta);
-        const audioMs = computeAudioMs(audio, wavPayload);
+        const gateEnabled = preWhisperGateEnabled();
+        const callControlId = extractCallControlId(opts.logContext) ?? 'unknown';
+        let wavPayload;
+        let wavMeta;
+        let audioForMetrics = audio;
+        let logEncoding = audio.encoding;
+        let logSampleRateHz = audio.sampleRateHz;
+        if (gateEnabled) {
+            const gate = await (0, preWhisperGate_1.preWhisperGate)({
+                buf: audio.audio,
+                hints: {
+                    codec: opts.audioMeta?.codec ?? audio.encoding,
+                    sampleRate: audio.sampleRateHz,
+                    channels: audio.channels ?? 1,
+                    callId: callControlId,
+                },
+            });
+            wavPayload = gate.wav16kMono;
+            wavMeta = (0, audioProbe_1.appendLineage)(baseMeta, 'prewhisper_gate');
+            wavMeta = { ...wavMeta, sampleRateHz: WAV_SAMPLE_RATE_HZ, channels: 1, bitDepth: 16, format: 'wav' };
+            audioForMetrics = {
+                audio: wavPayload,
+                sampleRateHz: WAV_SAMPLE_RATE_HZ,
+                encoding: 'wav',
+                channels: 1,
+            };
+            logEncoding = 'wav';
+            logSampleRateHz = WAV_SAMPLE_RATE_HZ;
+        }
+        else {
+            const prepared = prepareWavPayload(audio, baseMeta);
+            wavPayload = prepared.wav;
+            wavMeta = prepared.meta;
+        }
+        (0, wavGuard_1.assertLooksLikeWav)(wavPayload, {
+            provider: 'whisper_http',
+            wav_bytes: wavPayload.length,
+            ...(opts.logContext ?? {}),
+        });
+        const audioMs = computeAudioMs(audioForMetrics, wavPayload);
         const tenantLabel = typeof opts.logContext?.tenant_id === 'string' ? opts.logContext.tenant_id : 'unknown';
         const whisperStage = opts.isPartial ? 'partial' : 'final';
         const stageLabel = opts.isPartial ? 'stt_whisper_http_partial' : 'stt_whisper_http_final';
@@ -239,11 +319,12 @@ class WhisperHttpProvider {
             ...wavMeta,
             kind: whisperStage,
         });
+        await maybeDumpWhisperWav(wavPayload, whisperStage, opts.logContext);
         if (mediaDebugEnabled()) {
             logWavDebug(wavPayload, opts.logContext);
             log_1.log.info({
                 event: 'whisper_request',
-                encoding: audio.encoding,
+                encoding: logEncoding,
                 wav_bytes: wavPayload.length,
             }, 'whisper request');
         }
@@ -252,6 +333,18 @@ class WhisperHttpProvider {
         let response;
         let httpMs = 0;
         try {
+            log_1.log.info({
+                event: 'stt_whisper_http_request_start',
+                tenant_id: tenantLabel,
+                kind: whisperStage,
+                whisper_url: whisperUrl,
+                encoding: logEncoding,
+                sampleRateHz: logSampleRateHz,
+                wav_bytes: wavPayload.length,
+                audio_ms: audioMs,
+                language: opts.language ?? null,
+                ...(opts.logContext ?? {}),
+            }, 'stt whisper http request start');
             response = await fetch(whisperUrl, {
                 method: 'POST',
                 headers: {
@@ -269,8 +362,8 @@ class WhisperHttpProvider {
                 tenant_id: tenantLabel,
                 kind: whisperStage,
                 whisper_stage: whisperStage,
-                encoding: audio.encoding,
-                sampleRateHz: audio.sampleRateHz,
+                encoding: logEncoding,
+                sampleRateHz: logSampleRateHz,
                 audio_bytes: wavPayload.length,
                 audio_ms: audioMs,
                 http_ms: httpMs,
@@ -290,8 +383,8 @@ class WhisperHttpProvider {
             tenant_id: tenantLabel,
             kind: whisperStage,
             whisper_stage: whisperStage,
-            encoding: audio.encoding,
-            sampleRateHz: audio.sampleRateHz,
+            encoding: logEncoding,
+            sampleRateHz: logSampleRateHz,
             audio_bytes: wavPayload.length,
             audio_ms: audioMs,
             http_ms: httpMs,

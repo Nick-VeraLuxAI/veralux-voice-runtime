@@ -1,26 +1,87 @@
+// src/audio/codecDecode.ts
 import fs from 'fs';
 import path from 'path';
+import crypto from 'crypto';
+import { spawn, type ChildProcessWithoutNullStreams } from 'child_process';
 import { log } from '../log';
-import { AmrWbDecoder } from './vendor/amrwb/AmrWbDecoder';
 import { G722Decoder } from './vendor/g722/g722';
-import OpusDecoder from './vendor/opus/OpusDecoder';
 import { encodePcm16ToWav } from './postprocess';
+import { OpusPacketDecoder } from './opusDecoder';
+import { resample48kTo16k } from './resample48kTo16k';
+import { transcodeTelnyxAmrWbPayload, writeAmrwbArtifacts } from './amrwbRtp';
 
 export interface TelnyxCodecState {
-  amrwb?: AmrWbDecoder;
-  amrwbReady?: Promise<void>;
-  amrwbFailed?: boolean;
+  // AMR-WB (ffmpeg) state + log gating
+  amrwbFfmpegChecked?: boolean;
+  amrwbFfmpegUsable?: boolean;
   amrwbLastError?: string;
+  amrwbDepacketizeLogged?: boolean;
+  amrwbDepacketizeFailedLogged?: boolean;
+  amrwbDepackInvalidCount?: number;
+  amrwbFfmpegOkLogged?: boolean;
+  amrwbFfmpegFailedLogged?: boolean;
+  amrwbFfmpegStream?: AmrWbFfmpegStream;
+  amrwbFfmpegStreamRate?: number;
+  amrwbFfmpegStreamDisabled?: boolean;
+  amrwbFfmpegStreamOkLogged?: boolean;
+  amrwbFfmpegStreamFailedLogged?: boolean;
+  amrwbDebugCount?: number;
+  amrwbDebugDropoutCount?: number;
+  amrwbDebugLastLogAt?: number;
+  amrwbShortPcmCount?: number;
+  amrwbCandidateSelectedLogged?: boolean;
+  amrwbPathSelectedLogged?: boolean;
+  amrwbFallbackLogged?: boolean;
+
+  // AMR-WB buffering (stitch frames across packets; decode in batches)
+  amrwbFrameBuf?: Buffer[]; // storage frames (TOC+speech), NO header
+  amrwbFrameBufDecodedFrames?: number; // count of speech frames in buffer
+  amrwbFrameBufLastFlushMs?: number; // NOTE: used as "buffer start ms" (not last flush)
+
+  // AMR-WB selected storage debug artifact (append-only; no trimming to avoid mid-frame corruption)
+  amrwbSelectedStorageLastDumpMs?: number; // retained for compatibility/log gating (no longer used to skip writes)
+  amrwbSelectedStorageWrite?: Promise<void>;
+
+  // AMR-WB de-dupe guards (prevents overlapping/echo from duplicate consecutive chunks)
+  amrwbLastAcceptedSpeechSha1?: string; // dedupe consecutive *speech frames* pushed to buffer
+  amrwbLastSelectedAppendSha1?: string; // dedupe consecutive *artifact appends* (batch)
+  amrwbLastDecodedStorageFrameSha1?: string;
+  amrwbDecodeDedupeDropped?: number;
+  amrwbDecodeDedupeKept?: number;
+
+  // AMR-WB artifact frame de-dupe (sliding window; prevents repeated frames across time)
+  amrwbSelectedSeen?: Set<string>;
+  amrwbSelectedQueue?: string[];
+  amrwbSelectedDropped?: number;
+  amrwbSelectedKept?: number;
+
+  // G.722
   g722?: G722Decoder;
-  opus?: any;
-  opusReady?: Promise<void>;
+
+  // Opus
+  opus?: OpusPacketDecoder;
   opusFailed?: boolean;
+  opusChannels?: number;
+
+  // Debug + log gating
+  ingestLogged?: boolean;
+  opusLogged?: boolean;
+
   debugLastPostDecodeMs?: number;
+  debugLastPcmDumpMs?: number;
+  debugPcmAccum?: Int16Array[];
+  debugPcmAccumSamples?: number;
+  debugPcmAccumSampleRateHz?: number;
+  debugPcmDumpIndex?: number;
+  debugRollingPcm16?: Int16Array;
+  debugLastChunkDumpMs?: number;
+  debugChunkDumpIndex?: number;
 }
 
 export interface DecodeTelnyxOptions {
   encoding: string;
   payload: Buffer;
+  forceAmrWbBe?: boolean;
   channels?: number;
   reportedSampleRateHz?: number;
   targetSampleRateHz: number;
@@ -31,20 +92,69 @@ export interface DecodeTelnyxOptions {
   logContext?: Record<string, unknown>;
 }
 
+export interface DecodeTelnyxResult {
+  pcm16: Int16Array;
+  sampleRateHz: number;
+  decodedFrames?: number;
+  decodeFailures?: number;
+}
+
+const SESSION_STATE_CACHE = new Map<string, TelnyxCodecState>();
+
+function getSessionKey(logContext?: Record<string, unknown>): string | null {
+  const id =
+    (typeof logContext?.call_control_id === 'string' && (logContext.call_control_id as string)) ||
+    (typeof logContext?.sessionId === 'string' && (logContext.sessionId as string)) ||
+    (typeof logContext?.callId === 'string' && (logContext.callId as string)) ||
+    null;
+
+  return id ? String(id) : null;
+}
+
+function getOrCreateSessionState(
+  provided: TelnyxCodecState | undefined,
+  logContext?: Record<string, unknown>,
+): TelnyxCodecState {
+  if (provided) return provided;
+
+  const key = getSessionKey(logContext);
+  if (!key) return {};
+
+  const existing = SESSION_STATE_CACHE.get(key);
+  if (existing) return existing;
+
+  const created: TelnyxCodecState = {};
+  SESSION_STATE_CACHE.set(key, created);
+
+  // keep cache bounded
+  const max = Number.parseInt(process.env.CODEC_STATE_CACHE_MAX ?? '128', 10);
+  const maxSessions = Number.isFinite(max) && max > 0 ? max : 128;
+  if (SESSION_STATE_CACHE.size > maxSessions) {
+    const firstKey = SESSION_STATE_CACHE.keys().next().value as string | undefined;
+    if (firstKey) SESSION_STATE_CACHE.delete(firstKey);
+  }
+
+  return created;
+}
+
+/**
+ * Accept-Codecs header normalization used upstream.
+ */
 export function parseTelnyxAcceptCodecs(raw: string | undefined): Set<string> {
   const set = new Set<string>();
-  if (!raw) {
-    return set;
-  }
+  if (!raw) return set;
+
   for (const part of raw.split(',')) {
     const normalized = part.trim().toUpperCase();
-    if (normalized) {
-      set.add(normalized === 'AMRWB' || normalized === 'AMR_WB' ? 'AMR-WB' : normalized);
-    }
+    if (!normalized) continue;
+    set.add(normalized === 'AMRWB' || normalized === 'AMR_WB' ? 'AMR-WB' : normalized);
   }
   return set;
 }
 
+/**
+ * Should we ingest PCM16 from Telnyx (vs PCMU-only)?
+ */
 export function shouldUsePcm16Ingest(
   acceptCodecs: Set<string>,
   allowAmrWb: boolean,
@@ -52,15 +162,31 @@ export function shouldUsePcm16Ingest(
   allowOpus: boolean,
 ): boolean {
   for (const codec of acceptCodecs) {
-    if (codec !== 'PCMU') {
-      return true;
-    }
+    if (codec !== 'PCMU') return true;
   }
   return allowAmrWb || allowG722 || allowOpus;
 }
 
 const DEFAULT_OPUS_SAMPLE_RATE = 48000;
 const DEBUG_POST_DECODE_INTERVAL_MS = 1000;
+const DEBUG_CHUNK_MIN_MS = 50;
+const DEBUG_CHUNK_MAX_MS = 120;
+const DEBUG_CHUNK_INTERVAL_MS = 300;
+const DEBUG_WINDOW_MS = 400;
+
+const AMRWB_STREAM_HEADER = Buffer.from('#!AMR-WB\n', 'ascii');
+const AMRWB_FRAME_RATE = 50;
+const AMRWB_STREAM_STDERR_MAX_BYTES = 4096;
+const AMRWB_DEBUG_MAX_FRAMES = 30;
+const AMRWB_DEBUG_MAX_DROPOUTS = 50;
+const AMRWB_DEBUG_INTERVAL_MS = 1000;
+const AMRWB_MIN_DECODE_FRAMES = Number.parseInt(process.env.AMRWB_MIN_DECODE_FRAMES ?? '10', 10); // ~200ms
+const AMRWB_MAX_BUFFER_MS = Number.parseInt(process.env.AMRWB_MAX_BUFFER_MS ?? '500', 10); // safety flush
+
+// Sliding-window de-dupe for AMR-WB artifact frames
+const AMRWB_SELECTED_DEDUPE_MAX = Number.parseInt(process.env.AMRWB_SELECTED_DEDUPE_MAX ?? '2048', 10);
+
+/* ---------------------------------- utils --------------------------------- */
 
 function parseBoolEnv(value: string | undefined): boolean {
   if (!value) return false;
@@ -70,15 +196,85 @@ function parseBoolEnv(value: string | undefined): boolean {
 
 function debugPostDecodeEnabled(): boolean {
   return (
-    parseBoolEnv(process.env.TELNYX_DEBUG_TAP_POST_DECODE) ||
-    parseBoolEnv(process.env.STT_DEBUG_DUMP_POST_DECODE)
+    parseBoolEnv(process.env.TELNYX_DEBUG_TAP_POST_DECODE) || parseBoolEnv(process.env.STT_DEBUG_DUMP_POST_DECODE)
   );
+}
+
+function debugPcmDumpEnabled(): boolean {
+  return parseBoolEnv(process.env.STT_DEBUG_DUMP_PCM16);
+}
+
+function amrwbDecodeDebugEnabled(): boolean {
+  return parseBoolEnv(process.env.AMRWB_DECODE_DEBUG);
+}
+
+function amrwbStrictDecodeEnabled(): boolean {
+  return parseBoolEnv(process.env.AMRWB_STRICT_DECODE);
 }
 
 function debugDir(): string {
   return process.env.STT_DEBUG_DIR && process.env.STT_DEBUG_DIR.trim() !== ''
     ? process.env.STT_DEBUG_DIR.trim()
     : '/tmp/veralux-stt-debug';
+}
+
+function dedupeConsecutiveFramesForDecode(
+  state: TelnyxCodecState,
+  frames: Buffer[],
+): { frames: Buffer[]; dropped: number; kept: number } {
+  if (!frames || frames.length === 0) return { frames, dropped: 0, kept: 0 };
+
+  const out: Buffer[] = [];
+  let dropped = 0;
+
+  for (const fr of frames) {
+    const h = sha1Hex(fr);
+    if (state.amrwbLastDecodedStorageFrameSha1 && state.amrwbLastDecodedStorageFrameSha1 === h) {
+      dropped += 1;
+      continue;
+    }
+    out.push(fr);
+    state.amrwbLastDecodedStorageFrameSha1 = h;
+  }
+
+  const kept = out.length;
+  state.amrwbDecodeDedupeDropped = (state.amrwbDecodeDedupeDropped ?? 0) + dropped;
+  state.amrwbDecodeDedupeKept = (state.amrwbDecodeDedupeKept ?? 0) + kept;
+
+  return { frames: out, dropped, kept };
+}
+
+
+function sha1Hex(buf: Buffer): string {
+  return crypto.createHash('sha1').update(buf).digest('hex');
+}
+
+function dedupeKeyForFrame(frame: Buffer): string {
+  // include length to avoid collisions across different frame sizes
+  return `${frame.length}:${sha1Hex(frame)}`;
+}
+
+function ensureDedupeState(state: TelnyxCodecState): void {
+  if (!state.amrwbSelectedSeen) state.amrwbSelectedSeen = new Set<string>();
+  if (!state.amrwbSelectedQueue) state.amrwbSelectedQueue = [];
+}
+
+function hasSeenFrameRecently(state: TelnyxCodecState, key: string, max: number): boolean {
+  ensureDedupeState(state);
+  const set = state.amrwbSelectedSeen!;
+  const q = state.amrwbSelectedQueue!;
+
+  if (set.has(key)) return true;
+
+  set.add(key);
+  q.push(key);
+
+  // enforce bounded memory
+  while (q.length > max) {
+    const old = q.shift();
+    if (old) set.delete(old);
+  }
+  return false;
 }
 
 function computePcmStats(samples: Int16Array): { rms: number; peak: number } {
@@ -94,6 +290,58 @@ function computePcmStats(samples: Int16Array): { rms: number; peak: number } {
   return { rms: Math.sqrt(sumSquares / samples.length), peak };
 }
 
+function countZeroSamples(samples: Int16Array): number {
+  let count = 0;
+  for (let i = 0; i < samples.length; i += 1) {
+    if (samples[i] === 0) count += 1;
+  }
+  return count;
+}
+
+function shouldLogAmrwbDebug(state: TelnyxCodecState, now: number, isDropout: boolean): boolean {
+  if (!amrwbDecodeDebugEnabled()) return false;
+  const lastLogAt = state.amrwbDebugLastLogAt ?? 0;
+  const count = state.amrwbDebugCount ?? 0;
+  const dropoutCount = state.amrwbDebugDropoutCount ?? 0;
+
+  if (isDropout && dropoutCount < AMRWB_DEBUG_MAX_DROPOUTS) {
+    state.amrwbDebugDropoutCount = dropoutCount + 1;
+    state.amrwbDebugLastLogAt = now;
+    return true;
+  }
+
+  if (count < AMRWB_DEBUG_MAX_FRAMES || now - lastLogAt >= AMRWB_DEBUG_INTERVAL_MS) {
+    state.amrwbDebugCount = count + 1;
+    state.amrwbDebugLastLogAt = now;
+    return true;
+  }
+
+  return false;
+}
+
+function takeRollingWindowPcm16(
+  state: TelnyxCodecState,
+  pcm16: Int16Array,
+  sampleRateHz: number,
+  windowMs: number,
+): Int16Array | null {
+  const winSamples = Math.max(1, Math.round((sampleRateHz * windowMs) / 1000));
+  const prev = state.debugRollingPcm16 ?? new Int16Array(0);
+
+  const merged = new Int16Array(prev.length + pcm16.length);
+  merged.set(prev, 0);
+  merged.set(pcm16, prev.length);
+
+  const start = Math.max(0, merged.length - winSamples);
+  const sliced = merged.subarray(start);
+
+  state.debugRollingPcm16 = new Int16Array(sliced);
+
+  if (merged.length < winSamples) return null;
+
+  return state.debugRollingPcm16;
+}
+
 async function maybeDumpPostDecode(
   samples: Int16Array,
   sampleRateHz: number,
@@ -102,24 +350,139 @@ async function maybeDumpPostDecode(
   logContext: Record<string, unknown> | undefined,
 ): Promise<void> {
   if (!debugPostDecodeEnabled()) return;
-  const now = Date.now();
-  if (state?.debugLastPostDecodeMs && now - state.debugLastPostDecodeMs < DEBUG_POST_DECODE_INTERVAL_MS) {
+  if (!state) return;
+  if (!samples || samples.length === 0 || sampleRateHz <= 0) return;
+
+  const callId = typeof logContext?.call_control_id === 'string' ? (logContext.call_control_id as string) : 'unknown';
+
+  const dir = path.join(debugDir(), callId);
+  try {
+    await fs.promises.mkdir(dir, { recursive: true });
+  } catch (error) {
+    log.warn(
+      { event: 'stt_post_decode_dump_failed', encoding, file_path: dir, err: error, ...(logContext ?? {}) },
+      'stt post-decode dump failed',
+    );
     return;
   }
-  if (state) state.debugLastPostDecodeMs = now;
 
-  const callId = typeof logContext?.call_control_id === 'string' ? logContext.call_control_id : 'unknown';
+  const now = Date.now();
+
+  /* ----------------------- (A) CHUNK DUMP (>=50ms) ----------------------- */
+
+  const chunkMinSamples = Math.max(1, Math.round((sampleRateHz * DEBUG_CHUNK_MIN_MS) / 1000));
+  const chunkMaxSamples = Math.max(chunkMinSamples, Math.round((sampleRateHz * DEBUG_CHUNK_MAX_MS) / 1000));
+
+  const canChunkDump = !state.debugLastChunkDumpMs || now - state.debugLastChunkDumpMs >= DEBUG_CHUNK_INTERVAL_MS;
+
+  if (canChunkDump && samples.length >= chunkMinSamples) {
+    state.debugLastChunkDumpMs = now;
+
+    const take = Math.min(samples.length, chunkMaxSamples);
+    const chunk = samples.subarray(samples.length - take);
+
+    const chunkStats = computePcmStats(chunk);
+    const chunkIndex = (state.debugChunkDumpIndex ?? 0) + 1;
+    state.debugChunkDumpIndex = chunkIndex;
+
+    const chunkPath = path.join(dir, `decoded_pcm_chunk_${String(chunkIndex).padStart(4, '0')}.wav`);
+    try {
+      const wav = encodePcm16ToWav(chunk, sampleRateHz);
+      await fs.promises.writeFile(chunkPath, wav);
+
+      log.info(
+        {
+          event: 'stt_post_decode_chunk',
+          encoding,
+          sample_rate_hz: sampleRateHz,
+          samples: chunk.length,
+          ms: Number(((chunk.length / sampleRateHz) * 1000).toFixed(2)),
+          rms: Number(chunkStats.rms.toFixed(6)),
+          peak: Number(chunkStats.peak.toFixed(6)),
+          zero_ratio: Number((countZeroSamples(chunk) / chunk.length).toFixed(6)),
+          file_path: chunkPath,
+          ...(logContext ?? {}),
+        },
+        'stt post-decode chunk dump',
+      );
+    } catch (error) {
+      log.warn(
+        { event: 'stt_post_decode_chunk_dump_failed', encoding, file_path: chunkPath, err: error, ...(logContext ?? {}) },
+        'stt post-decode chunk dump failed',
+      );
+    }
+  }
+
+  /* --------------------- (B) 400ms WINDOW DUMP (best) --------------------- */
+
+  const prevRate = state.debugPcmAccumSampleRateHz;
+  if (prevRate && prevRate !== sampleRateHz) {
+    state.debugPcmAccum = [];
+    state.debugPcmAccumSamples = 0;
+    state.debugRollingPcm16 = new Int16Array(0);
+  }
+  state.debugPcmAccumSampleRateHz = sampleRateHz;
+
+  const window = takeRollingWindowPcm16(state, samples, sampleRateHz, DEBUG_WINDOW_MS);
+  if (!window) return;
+
+  const winStats = computePcmStats(window);
+
+  const dumpIndex = (state.debugPcmDumpIndex ?? 0) + 1;
+  state.debugPcmDumpIndex = dumpIndex;
+
+  const winPath = path.join(dir, `decoded_pcm_400ms_${String(dumpIndex).padStart(4, '0')}.wav`);
+  try {
+    const wav = encodePcm16ToWav(window, sampleRateHz);
+    await fs.promises.writeFile(winPath, wav);
+
+    log.info(
+      {
+        event: 'stt_post_decode_400ms',
+        encoding,
+        sample_rate_hz: sampleRateHz,
+        samples: window.length,
+        ms: Number(((window.length / sampleRateHz) * 1000).toFixed(2)),
+        rms: Number(winStats.rms.toFixed(6)),
+        peak: Number(winStats.peak.toFixed(6)),
+        zero_ratio: Number((countZeroSamples(window) / window.length).toFixed(6)),
+        file_path: winPath,
+        ...(logContext ?? {}),
+      },
+      'stt post-decode 400ms window dump',
+    );
+  } catch (error) {
+    log.warn(
+      { event: 'stt_post_decode_dump_failed', encoding, file_path: winPath, err: error, ...(logContext ?? {}) },
+      'stt post-decode dump failed',
+    );
+  }
+}
+
+async function maybeDumpPcm16(
+  samples: Int16Array,
+  sampleRateHz: number,
+  encoding: string,
+  state: TelnyxCodecState | undefined,
+  logContext: Record<string, unknown> | undefined,
+): Promise<void> {
+  if (!debugPcmDumpEnabled()) return;
+  const now = Date.now();
+  if (state?.debugLastPcmDumpMs && now - state.debugLastPcmDumpMs < DEBUG_POST_DECODE_INTERVAL_MS) return;
+  if (state) state.debugLastPcmDumpMs = now;
+
+  const callId = typeof logContext?.call_control_id === 'string' ? (logContext.call_control_id as string) : 'unknown';
   const dir = debugDir();
-  const filePath = path.join(dir, `post_decode_${callId}_${now}.wav`);
+  const filePath = path.join(dir, `post_decode_${callId}_${now}.pcm`);
 
   try {
     await fs.promises.mkdir(dir, { recursive: true });
-    const wav = encodePcm16ToWav(samples, sampleRateHz);
-    await fs.promises.writeFile(filePath, wav);
+    const buffer = Buffer.from(samples.buffer, samples.byteOffset, samples.byteLength);
+    await fs.promises.writeFile(filePath, buffer);
   } catch (error) {
     log.warn(
-      { event: 'stt_post_decode_dump_failed', encoding, file_path: filePath, err: error, ...(logContext ?? {}) },
-      'stt post-decode dump failed',
+      { event: 'stt_post_decode_pcm_failed', encoding, file_path: filePath, err: error, ...(logContext ?? {}) },
+      'stt post-decode PCM dump failed',
     );
     return;
   }
@@ -127,7 +490,7 @@ async function maybeDumpPostDecode(
   const stats = computePcmStats(samples);
   log.info(
     {
-      event: 'stt_post_decode',
+      event: 'stt_post_decode_pcm',
       encoding,
       sample_rate_hz: sampleRateHz,
       samples: samples.length,
@@ -136,7 +499,7 @@ async function maybeDumpPostDecode(
       file_path: filePath,
       ...(logContext ?? {}),
     },
-    'stt post-decode dump',
+    'stt post-decode pcm',
   );
 }
 
@@ -179,79 +542,32 @@ function aLawToPcmSample(aLawByte: number): number {
 
 function decodePcmu(payload: Buffer): Int16Array {
   const out = new Int16Array(payload.length);
-  for (let i = 0; i < payload.length; i += 1) {
-    out[i] = muLawToPcmSample(payload[i]);
-  }
+  for (let i = 0; i < payload.length; i += 1) out[i] = muLawToPcmSample(payload[i] as number);
   return out;
 }
 
 function decodePcma(payload: Buffer): Int16Array {
   const out = new Int16Array(payload.length);
-  for (let i = 0; i < payload.length; i += 1) {
-    out[i] = aLawToPcmSample(payload[i]);
-  }
+  for (let i = 0; i < payload.length; i += 1) out[i] = aLawToPcmSample(payload[i] as number);
   return out;
 }
 
 function downmixInterleaved(pcm: Int16Array, channels: number): Int16Array {
-  if (channels <= 1) {
-    return pcm;
-  }
+  if (channels <= 1) return pcm;
   const frames = Math.floor(pcm.length / channels);
   const out = new Int16Array(frames);
   for (let i = 0; i < frames; i += 1) {
     let sum = 0;
     const base = i * channels;
-    for (let c = 0; c < channels; c += 1) {
-      sum += pcm[base + c] ?? 0;
-    }
+    for (let c = 0; c < channels; c += 1) sum += pcm[base + c] ?? 0;
     out[i] = clampInt16(Math.round(sum / channels));
   }
   return out;
 }
 
-function downmixFloat32(channels: Float32Array[]): Float32Array {
-  if (channels.length === 0) {
-    return new Float32Array();
-  }
-  if (channels.length === 1) {
-    return channels[0];
-  }
-  const len = channels[0].length;
-  const out = new Float32Array(len);
-  for (let i = 0; i < len; i += 1) {
-    let sum = 0;
-    for (const channel of channels) {
-      sum += channel[i] ?? 0;
-    }
-    out[i] = sum / channels.length;
-  }
-  return out;
-}
-
-function floatToPcm16(samples: Float32Array): Int16Array {
-  const out = new Int16Array(samples.length);
-  for (let i = 0; i < samples.length; i += 1) {
-    const s = Math.max(-1, Math.min(1, samples[i] ?? 0));
-    out[i] = clampInt16(Math.round(s * 32767));
-  }
-  return out;
-}
-
-function isFloat32ArrayArray(value: unknown): value is Float32Array[] {
-  if (!Array.isArray(value) || value.length === 0) {
-    return false;
-  }
-  return value.every((entry) => entry instanceof Float32Array);
-}
-
 export function resamplePcm16(input: Int16Array, inputRate: number, outputRate: number): Int16Array {
-  if (inputRate <= 0 || outputRate <= 0 || input.length === 0) {
-    return input;
-  }
-  if (inputRate === outputRate) {
-    return input;
-  }
+  if (inputRate <= 0 || outputRate <= 0 || input.length === 0) return input;
+  if (inputRate === outputRate) return input;
 
   const outputLength = Math.max(1, Math.round(input.length * (outputRate / inputRate)));
   const output = new Int16Array(outputLength);
@@ -271,280 +587,1489 @@ export function resamplePcm16(input: Int16Array, inputRate: number, outputRate: 
 }
 
 function looksLikeOgg(payload: Buffer): boolean {
-  if (payload.length < 4) {
-    return false;
-  }
+  if (payload.length < 4) return false;
   return payload.toString('ascii', 0, 4) === 'OggS';
 }
+
+/* ----------------------------- codec normalize ----------------------------- */
+
+function normalizeTelnyxEncoding(raw: string | undefined): { raw: string; normalized: string } {
+  const rawValue = (raw ?? '').trim();
+  if (!rawValue) return { raw: '', normalized: '' };
+
+  let s = rawValue.toUpperCase();
+
+  const semi = s.indexOf(';');
+  if (semi !== -1) s = s.slice(0, semi);
+
+  if (s.includes('/')) {
+    const parts = s.split('/').filter(Boolean);
+    s = parts[parts.length - 1] ?? s;
+  }
+
+  s = s.replace(/[.\-]/g, '_');
+
+  const aliases: Record<string, string> = {
+    MULAW: 'PCMU',
+    ULAW: 'PCMU',
+    G711: 'PCMU',
+    G711_ULAW: 'PCMU',
+    G711U: 'PCMU',
+    PCMU: 'PCMU',
+
+    ALAW: 'PCMA',
+    G711_ALAW: 'PCMA',
+    G711A: 'PCMA',
+    PCMA: 'PCMA',
+
+    AMRWB: 'AMR-WB',
+    AMR_WB: 'AMR-WB',
+    AMR_WB_OA: 'AMR-WB',
+    AMR_WB_OCTET_ALIGNED: 'AMR-WB',
+    AMR_WB_OCTETALIGNED: 'AMR-WB',
+    'AMR-WB': 'AMR-WB',
+
+    G722: 'G722',
+    G_722: 'G722',
+
+    OPUS: 'OPUS',
+  };
+
+  if (!aliases[s] && s.includes('OPUS')) return { raw: rawValue, normalized: 'OPUS' };
+  if (!aliases[s] && s.includes('AMR') && s.includes('WB')) return { raw: rawValue, normalized: 'AMR-WB' };
+  if (!aliases[s] && (s.includes('G722') || s.includes('G_722'))) return { raw: rawValue, normalized: 'G722' };
+  if (!aliases[s] && (s.includes('PCMU') || s.includes('MULAW') || s.includes('ULAW')))
+    return { raw: rawValue, normalized: 'PCMU' };
+  if (!aliases[s] && (s.includes('PCMA') || s.includes('ALAW'))) return { raw: rawValue, normalized: 'PCMA' };
+
+  return { raw: rawValue, normalized: aliases[s] ?? s };
+}
+
+/* ------------------------------- AMR-WB ---------------------------------- */
+/**
+ * Supports:
+ * 1) RTP octet-aligned payloads: [CMR?][TOC...][speech...]
+ * 2) AMR-WB storage frames: [TOC(F=0)+speech...] (optionally preceded by "#!AMR-WB\n")
+ *
+ * Key behaviors:
+ * - transcodeTelnyxAmrWbPayload() is the SINGLE source of truth for Telnyx AMR-WB normalization.
+ * - transcoder output is ALWAYS storage frames bytes (NO header). We NEVER re-parse it as octet.
+ * - Optional raw octet fallback ONLY when BE is not active and env allows it.
+ * - runtime_selected_storage.awb is append-only (no trimming; no rate-limit).
+ * - IMPORTANT: Append VALIDATED SPEECH frames immediately when accepted (not only at decode flush),
+ *   so the capture is complete even if the call ends before a batch flush.
+ * - De-dupe consecutive identical speech frames / appends to prevent "echo/overlap" artifacts.
+ * - NEW: Sliding-window frame de-dupe for artifact writes to prevent time-warp/overlap when upstream repeats frames.
+ */
 
 const AMRWB_FRAME_SIZES = [17, 23, 32, 36, 40, 46, 50, 58, 60];
 const AMRWB_SID_FRAME_BYTES = 5;
 
-function isAmrWbSingleFrame(payloadLength: number): boolean {
-  return AMRWB_FRAME_SIZES.includes(payloadLength);
-}
-
-function splitAmrWbSingleFrameWithHeader(payload: Buffer): Buffer[] | null {
-  if (isAmrWbSingleFrame(payload.length)) {
-    return [payload];
-  }
-  if (payload.length > 1 && isAmrWbSingleFrame(payload.length - 1)) {
-    return [payload.subarray(1)];
-  }
-  if (payload.length > 2 && isAmrWbSingleFrame(payload.length - 2)) {
-    return [payload.subarray(2)];
-  }
-  return null;
-}
+const AMRWB_SPEECH_LOST_FT = 14;
+const AMRWB_NO_DATA_FT = 15;
 
 function amrWbFrameSize(ft: number): number {
-  if (ft >= 0 && ft < AMRWB_FRAME_SIZES.length) {
-    return AMRWB_FRAME_SIZES[ft] ?? 0;
-  }
-  if (ft === 9) {
-    return AMRWB_SID_FRAME_BYTES;
-  }
+  if (ft >= 0 && ft < AMRWB_FRAME_SIZES.length) return AMRWB_FRAME_SIZES[ft] ?? 0;
+  if (ft === 9) return AMRWB_SID_FRAME_BYTES;
   return 0;
 }
 
-function parseAmrWbOctetAligned(payload: Buffer, startOffset: number): Buffer[] | null {
-  if (payload.length === 0) {
-    return null;
+type AmrWbFrameKind = 'speech' | 'sid' | 'no_data' | 'speech_lost';
+
+type AmrWbParseError = {
+  reason: string;
+  invalidFt?: number;
+};
+
+type AmrWbParseResult =
+  | {
+      ok: true;
+      frames: Buffer[];
+      frameTypes: AmrWbFrameKind[];
+      totalFrames: number;
+      decodedFrames: number;
+      sidFrames: number;
+      noDataFrames: number;
+      speechLostFrames: number;
+      cmr?: number | null;
+    }
+  | {
+      ok: false;
+      error: AmrWbParseError;
+      cmr?: number | null;
+    };
+
+type AmrWbParseErrorWithOffset = AmrWbParseError & { offset: number };
+
+type AmrWbDepacketizeResult =
+  | {
+      ok: true;
+      storage: Buffer; // includes "#!AMR-WB\n"
+      frames: Buffer[]; // storage frames bytes (TOC+payload), NO header
+      frameTypes: AmrWbFrameKind[];
+      totalFrames: number;
+      mode: 'octet_cmr' | 'octet_no_cmr' | 'storage';
+      decodedFrames: number;
+      sidFrames: number;
+      noDataFrames: number;
+      speechLostFrames: number;
+      hasSpeechFrames: boolean;
+    }
+  | {
+      ok: false;
+      errors: AmrWbParseErrorWithOffset[];
+    };
+
+function isAmrWbReservedFt(ft: number): boolean {
+  return ft >= 10 && ft <= 13;
+}
+
+function ensureAmrWbStreamHeader(buf: Buffer): Buffer {
+  if (
+    buf.length >= AMRWB_STREAM_HEADER.length &&
+    buf.subarray(0, AMRWB_STREAM_HEADER.length).equals(AMRWB_STREAM_HEADER)
+  ) {
+    return buf;
   }
-  if (startOffset >= payload.length) {
-    return null;
+  return Buffer.concat([AMRWB_STREAM_HEADER, buf]);
+}
+
+function stripAmrWbHeaderIfPresent(buf: Buffer): Buffer {
+  if (buf.length >= AMRWB_STREAM_HEADER.length) {
+    const head = buf.subarray(0, AMRWB_STREAM_HEADER.length);
+    if (head.equals(AMRWB_STREAM_HEADER)) return buf.subarray(AMRWB_STREAM_HEADER.length);
+  }
+  return buf;
+}
+
+function looksLikeAmrWbStorageFrames(buf: Buffer): boolean {
+  const b = stripAmrWbHeaderIfPresent(buf);
+  if (b.length < 1) return false;
+
+  const toc0 = b[0] as number;
+  const f0 = (toc0 & 0x80) !== 0;
+  if (f0) return false;
+
+  const ft0 = (toc0 >> 3) & 0x0f;
+  if (isAmrWbReservedFt(ft0)) return false;
+
+  const size0 = amrWbFrameSize(ft0);
+  if (ft0 === AMRWB_NO_DATA_FT || ft0 === AMRWB_SPEECH_LOST_FT) return true;
+  if (size0 <= 0) return false;
+  if (b.length < 1 + size0) return false;
+
+  const nextOff = 1 + size0;
+  if (b.length > nextOff) {
+    const toc1 = b[nextOff] as number;
+    if ((toc1 & 0x80) !== 0) return false;
+    const ft1 = (toc1 >> 3) & 0x0f;
+    if (isAmrWbReservedFt(ft1)) return false;
+  }
+  return true;
+}
+
+function parseAmrWbStorageToFrames(storageBytes: Buffer): AmrWbParseResult {
+  const payload = stripAmrWbHeaderIfPresent(storageBytes);
+  if (payload.length === 0) return { ok: false, error: { reason: 'empty_storage' }, cmr: null };
+
+  let offset = 0;
+  const frames: Buffer[] = [];
+  const frameTypes: AmrWbFrameKind[] = [];
+  let decodedFrames = 0;
+  let sidFrames = 0;
+  let noDataFrames = 0;
+  let speechLostFrames = 0;
+
+  while (offset < payload.length) {
+    const tocRaw = payload[offset++] as number;
+
+    // Storage format MUST have follow bit unset.
+    const follow = (tocRaw & 0x80) !== 0;
+    if (follow) {
+      return { ok: false, error: { reason: 'storage_toc_follow_bit_set' }, cmr: null };
+    }
+
+    const ft = (tocRaw >> 3) & 0x0f;
+    const q = (tocRaw >> 2) & 0x01;
+
+    if (isAmrWbReservedFt(ft)) {
+      return { ok: false, error: { reason: `invalid_ft_${ft}`, invalidFt: ft }, cmr: null };
+    }
+
+    // Normalize TOC: F=0, keep only FT+Q, force pad bits to 0.
+    const toc = ((ft & 0x0f) << 3) | ((q & 0x01) << 2);
+
+    if (ft === AMRWB_NO_DATA_FT) {
+      frames.push(Buffer.from([toc])); // TOC-only
+      frameTypes.push('no_data');
+      noDataFrames += 1;
+      continue;
+    }
+
+    if (ft === AMRWB_SPEECH_LOST_FT) {
+      frames.push(Buffer.from([toc])); // TOC-only
+      frameTypes.push('speech_lost');
+      speechLostFrames += 1;
+      continue;
+    }
+
+    const size = amrWbFrameSize(ft);
+
+    if (size === AMRWB_SID_FRAME_BYTES) {
+      if (offset + size > payload.length) {
+        return { ok: false, error: { reason: `sid_overflow_ft_${ft}` }, cmr: null };
+      }
+      const sid = payload.subarray(offset, offset + size);
+      offset += size;
+
+      frames.push(Buffer.concat([Buffer.from([toc]), sid]));
+      frameTypes.push('sid');
+      sidFrames += 1;
+      continue;
+    }
+
+    if (size <= 0) {
+      return { ok: false, error: { reason: `invalid_ft_${ft}`, invalidFt: ft }, cmr: null };
+    }
+    if (offset + size > payload.length) {
+      return { ok: false, error: { reason: `frame_overflow_ft_${ft}` }, cmr: null };
+    }
+
+    const speech = payload.subarray(offset, offset + size);
+    offset += size;
+
+    frames.push(Buffer.concat([Buffer.from([toc]), speech]));
+    frameTypes.push('speech');
+    decodedFrames += 1;
   }
 
+  return {
+    ok: true,
+    frames,
+    frameTypes,
+    totalFrames: frameTypes.length,
+    decodedFrames,
+    sidFrames,
+    noDataFrames,
+    speechLostFrames,
+    cmr: null,
+  };
+}
+
+/**
+ * Minimal octet-aligned parser ONLY used for raw fallback.
+ * startOffset=1 means [CMR][TOC...][speech...]
+ * startOffset=0 means [TOC...][speech...]
+ */
+type AmrWbTocEntry = { ft: number; q: number };
+
+function parseAmrWbOctetAlignedToStorageFrames(payload: Buffer, startOffset: number): AmrWbParseResult {
+  const cmr = startOffset === 1 ? (payload[0] >> 4) & 0x0f : null;
+  if (payload.length === 0) return { ok: false, error: { reason: 'empty' }, cmr };
+  if (startOffset >= payload.length) return { ok: false, error: { reason: 'start_offset_out_of_range' }, cmr };
+
   let offset = startOffset;
-  const tocEntries: Array<{ ft: number }> = [];
+
+  // Parse the TOC list
+  const tocEntries: AmrWbTocEntry[] = [];
   let follow = true;
 
   while (follow && offset < payload.length) {
-    const toc = payload[offset++];
+    const toc = payload[offset++] as number;
     follow = (toc & 0x80) !== 0;
+
     const ft = (toc >> 3) & 0x0f;
-    tocEntries.push({ ft });
+    const q = (toc >> 2) & 0x01;
+
+    if (isAmrWbReservedFt(ft)) {
+      return { ok: false, error: { reason: `invalid_ft_${ft}`, invalidFt: ft }, cmr };
+    }
+
+    tocEntries.push({ ft, q });
   }
 
+  if (tocEntries.length === 0) return { ok: false, error: { reason: 'missing_toc' }, cmr };
+
+  // Convert TOC entries + speech bytes into STORAGE frames
   const frames: Buffer[] = [];
+  const frameTypes: AmrWbFrameKind[] = [];
+
+  let decodedFrames = 0;
+  let sidFrames = 0;
+  let noDataFrames = 0;
+  let speechLostFrames = 0;
+
   for (const entry of tocEntries) {
-    const size = amrWbFrameSize(entry.ft);
-    if (size === AMRWB_SID_FRAME_BYTES) {
-      if (offset + size > payload.length) {
-        return null;
-      }
-      offset += size;
+    const ft = entry.ft;
+    const q = entry.q;
+
+    const storageToc = ((ft & 0x0f) << 3) | ((q & 0x01) << 2);
+
+    if (ft === AMRWB_NO_DATA_FT) {
+      frames.push(Buffer.from([storageToc]));
+      frameTypes.push('no_data');
+      noDataFrames += 1;
       continue;
     }
+
+    if (ft === AMRWB_SPEECH_LOST_FT) {
+      frames.push(Buffer.from([storageToc]));
+      frameTypes.push('speech_lost');
+      speechLostFrames += 1;
+      continue;
+    }
+
+    const size = amrWbFrameSize(ft);
+
+    if (size === AMRWB_SID_FRAME_BYTES) {
+      if (offset + size > payload.length) {
+        return { ok: false, error: { reason: `sid_overflow_ft_${ft}` }, cmr };
+      }
+
+      const sid = payload.subarray(offset, offset + size);
+      offset += size;
+
+      frames.push(Buffer.concat([Buffer.from([storageToc]), sid]));
+      frameTypes.push('sid');
+      sidFrames += 1;
+      continue;
+    }
+
     if (size <= 0) {
-      return null;
+      return { ok: false, error: { reason: `invalid_ft_${ft}`, invalidFt: ft }, cmr };
     }
     if (offset + size > payload.length) {
-      return null;
+      return { ok: false, error: { reason: `frame_overflow_ft_${ft}` }, cmr };
     }
-    frames.push(payload.subarray(offset, offset + size));
+
+    const speech = payload.subarray(offset, offset + size);
     offset += size;
+
+    frames.push(Buffer.concat([Buffer.from([storageToc]), speech]));
+    frameTypes.push('speech');
+    decodedFrames += 1;
   }
 
-  return frames.length ? frames : null;
+  return {
+    ok: true,
+    frames,
+    frameTypes,
+    totalFrames: frameTypes.length,
+    decodedFrames,
+    sidFrames,
+    noDataFrames,
+    speechLostFrames,
+    cmr,
+  };
 }
 
-function splitAmrWbPayload(payload: Buffer): Buffer[] | null {
-  if (payload.length === 0) {
-    return null;
-  }
-  if (payload.length === AMRWB_SID_FRAME_BYTES) {
-    return [];
-  }
-  const singleFrame = splitAmrWbSingleFrameWithHeader(payload);
-  if (singleFrame) {
-    return singleFrame;
-  }
-  if (payload.length < 2) {
-    return null;
+type AmrWbDepacketizeOptions = {
+  skipCmr?: boolean;
+};
+
+function depacketizeAmrWbToStorage(payload: Buffer, options?: AmrWbDepacketizeOptions): AmrWbDepacketizeResult {
+  const errors: AmrWbParseErrorWithOffset[] = [];
+  const skipCmr = options?.skipCmr ?? false;
+
+  if (looksLikeAmrWbStorageFrames(payload)) {
+    const parsed = parseAmrWbStorageToFrames(payload);
+    if (!parsed.ok) return { ok: false, errors: [{ offset: -1, ...parsed.error }] };
+
+    return {
+      ok: true,
+      storage: Buffer.concat([AMRWB_STREAM_HEADER, ...parsed.frames]),
+      frames: parsed.frames,
+      frameTypes: parsed.frameTypes,
+      totalFrames: parsed.totalFrames,
+      mode: 'storage',
+      decodedFrames: parsed.decodedFrames,
+      sidFrames: parsed.sidFrames,
+      noDataFrames: parsed.noDataFrames,
+      speechLostFrames: parsed.speechLostFrames,
+      hasSpeechFrames: parsed.decodedFrames > 0,
+    };
   }
 
-  // Try octet-aligned with CMR (skip 1 byte), then without CMR.
-  const withCmr = parseAmrWbOctetAligned(payload, 1);
-  if (withCmr) {
-    return withCmr;
+  if (!skipCmr) {
+    const withCmr = parseAmrWbOctetAlignedToStorageFrames(payload, 1);
+    if (withCmr.ok) {
+      return {
+        ok: true,
+        storage: Buffer.concat([AMRWB_STREAM_HEADER, ...withCmr.frames]),
+        frames: withCmr.frames,
+        frameTypes: withCmr.frameTypes,
+        totalFrames: withCmr.totalFrames,
+        mode: 'octet_cmr',
+        decodedFrames: withCmr.decodedFrames,
+        sidFrames: withCmr.sidFrames,
+        noDataFrames: withCmr.noDataFrames,
+        speechLostFrames: withCmr.speechLostFrames,
+        hasSpeechFrames: withCmr.decodedFrames > 0,
+      };
+    }
+    errors.push({ offset: 1, ...withCmr.error });
   }
-  return parseAmrWbOctetAligned(payload, 0);
+
+  const withoutCmr = parseAmrWbOctetAlignedToStorageFrames(payload, 0);
+  if (withoutCmr.ok) {
+    return {
+      ok: true,
+      storage: Buffer.concat([AMRWB_STREAM_HEADER, ...withoutCmr.frames]),
+      frames: withoutCmr.frames,
+      frameTypes: withoutCmr.frameTypes,
+      totalFrames: withoutCmr.totalFrames,
+      mode: 'octet_no_cmr',
+      decodedFrames: withoutCmr.decodedFrames,
+      sidFrames: withoutCmr.sidFrames,
+      noDataFrames: withoutCmr.noDataFrames,
+      speechLostFrames: withoutCmr.speechLostFrames,
+      hasSpeechFrames: withoutCmr.decodedFrames > 0,
+    };
+  }
+  errors.push({ offset: 0, ...withoutCmr.error });
+
+  return { ok: false, errors };
 }
 
-export async function decodeTelnyxPayloadToPcm16(
-  opts: DecodeTelnyxOptions,
-): Promise<{ pcm16: Int16Array; sampleRateHz: number } | null> {
-  const encoding = opts.encoding.trim().toUpperCase();
-  const channels = opts.channels ?? 1;
+/**
+ * Append VALIDATED STORAGE SPEECH FRAMES to ONE append-only AMR-WB storage stream per call:
+ *   <debugDir>/<callId>/runtime_selected_storage.awb
+ *
+ * - Serialized per session (promise chain) to prevent interleaved writes.
+ * - Writes header once if file is new/empty.
+ * - No rate-limit (rate-limit causes incomplete recordings).
+ * - Dedupe consecutive identical appends to avoid overlap/echo.
+ * - Sliding-window de-dupe across individual frames (prevents overlap/time-warp when upstream repeats frames).
+ */
+function maybeAppendSelectedStorageFrames(
+  state: TelnyxCodecState,
+  framesNoHeader: Buffer[],
+  logContext?: Record<string, unknown>,
+): void {
+  if (!(parseBoolEnv(process.env.AMRWB_ARTIFACT_DEBUG) || parseBoolEnv(process.env.TRUTH_CAPTURE_AMRWB))) return;
+  if (!framesNoHeader || framesNoHeader.length === 0) return;
+
+  const callId = typeof logContext?.call_control_id === 'string' ? String(logContext.call_control_id) : 'unknown';
+  const dir = path.join(debugDir(), callId);
+  const outPath = path.join(dir, 'runtime_selected_storage.awb');
+
+  // Frame-level de-dupe (sliding window)
+  const max =
+    Number.isFinite(AMRWB_SELECTED_DEDUPE_MAX) && AMRWB_SELECTED_DEDUPE_MAX > 0 ? AMRWB_SELECTED_DEDUPE_MAX : 2048;
+
+  const keptFrames: Buffer[] = [];
+  let droppedFrames = 0;
+
+  for (const fr of framesNoHeader) {
+    if (!fr || fr.length === 0) continue;
+
+    // De-dupe by full frame bytes (TOC+payload)
+    const key = dedupeKeyForFrame(fr);
+    if (hasSeenFrameRecently(state, key, max)) {
+      droppedFrames += 1;
+      continue;
+    }
+    keptFrames.push(fr);
+  }
+
+  if (keptFrames.length === 0) {
+    state.amrwbSelectedDropped = (state.amrwbSelectedDropped ?? 0) + droppedFrames;
+
+    if (parseBoolEnv(process.env.AMRWB_DECODE_TRACE)) {
+      log.info(
+        {
+          event: 'AMRWB_RUNTIME_SELECTED_DUP_DROPPED',
+          outPath,
+          dropped_frames: droppedFrames,
+          dropped_total: state.amrwbSelectedDropped,
+          ...(logContext ?? {}),
+        },
+        'AMR-WB runtime selected storage dropping duplicate frames',
+      );
+    }
+    return;
+  }
+
+  state.amrwbSelectedDropped = (state.amrwbSelectedDropped ?? 0) + droppedFrames;
+  state.amrwbSelectedKept = (state.amrwbSelectedKept ?? 0) + keptFrames.length;
+
+  const payload = keptFrames.length === 1 ? keptFrames[0]! : Buffer.concat(keptFrames);
+  if (!payload || payload.length === 0) return;
+
+  // Dedupe consecutive identical *append batches* (after frame-level de-dupe)
+  const batchSha1 = sha1Hex(payload);
+  if (state.amrwbLastSelectedAppendSha1 && state.amrwbLastSelectedAppendSha1 === batchSha1) {
+    if (parseBoolEnv(process.env.AMRWB_DECODE_TRACE)) {
+      log.info(
+        { event: 'amrwb_selected_storage_append_deduped', outPath, ...(logContext ?? {}) },
+        'AMR-WB append batch deduped',
+      );
+    }
+    return;
+  }
+  state.amrwbLastSelectedAppendSha1 = batchSha1;
+
+  const doWrite = async (): Promise<void> => {
+    try {
+      await fs.promises.mkdir(dir, { recursive: true });
+
+      const fh = await fs.promises.open(outPath, 'a+');
+      try {
+        const st = await fh.stat();
+        if (st.size === 0) {
+          await fh.write(AMRWB_STREAM_HEADER, 0, AMRWB_STREAM_HEADER.length, null);
+        }
+        await fh.write(payload, 0, payload.length, null);
+      } finally {
+        await fh.close();
+      }
+
+      if (parseBoolEnv(process.env.AMRWB_DECODE_TRACE)) {
+        const st2 = await fs.promises.stat(outPath);
+        log.info(
+          {
+            event: 'AMRWB_RUNTIME_SELECTED_APPENDED',
+            outPath,
+            bytes: st2.size,
+            appended_payload_bytes: payload.length,
+            appended_frames: keptFrames.length,
+            dropped_frames: droppedFrames,
+            dropped_total: state.amrwbSelectedDropped ?? 0,
+            kept_total: state.amrwbSelectedKept ?? 0,
+            ...(logContext ?? {}),
+          },
+          'AMR-WB runtime selected storage appended',
+        );
+      }
+    } catch (error) {
+      log.warn(
+        { event: 'amrwb_selected_storage_append_failed', outPath, err: error, ...(logContext ?? {}) },
+        'AMR-WB selected storage append failed',
+      );
+    }
+  };
+
+  const prev = state.amrwbSelectedStorageWrite ?? Promise.resolve();
+  state.amrwbSelectedStorageWrite = prev.then(doWrite, doWrite);
+}
+
+type PendingRead = {
+  bytes: number;
+  resolve: (buf: Buffer) => void;
+  reject: (err: Error) => void;
+  timeoutId?: NodeJS.Timeout;
+};
+
+class AmrWbFfmpegStream {
+  private readonly child: ChildProcessWithoutNullStreams;
+  private stdoutChunks: Buffer[] = [];
+  private stdoutLength = 0;
+  private pendingReads: PendingRead[] = [];
+  private stderrBuffer = Buffer.alloc(0);
+  private closed = false;
+  private headerWritten = false;
+  private decodeCalls = 0;
+
+  public constructor(private readonly targetSampleRateHz: number) {
+    const ffmpegPath = process.env.FFMPEG_PATH?.trim() || 'ffmpeg';
+    const args = [
+      '-hide_banner',
+      '-loglevel',
+      'error',
+      '-f',
+      'amrwb',
+      '-c:a',
+      'libopencore_amrwb',
+      '-i',
+      'pipe:0',
+      '-f',
+      's16le',
+      '-ac',
+      '1',
+      '-ar',
+      String(targetSampleRateHz),
+      'pipe:1',
+    ];
+
+    this.child = spawn(ffmpegPath, args, { stdio: ['pipe', 'pipe', 'pipe'] });
+    this.child.stdout.on('data', (chunk) => this.handleStdout(chunk));
+    this.child.stderr.on('data', (chunk) => this.handleStderr(chunk));
+    this.child.on('error', (err) => this.handleError(err));
+    this.child.on('close', (code, signal) => this.handleClose(code, signal));
+  }
+
+  public async decode(frames: Buffer[], decodedFrames: number): Promise<Int16Array> {
+    if (decodedFrames <= 0 || frames.length === 0) {
+      return new Int16Array(0);
+    }
+    if (!this.headerWritten) {
+      await this.write(AMRWB_STREAM_HEADER);
+      this.headerWritten = true;
+    }
+
+    const payload = frames.length === 1 ? frames[0]! : Buffer.concat(frames);
+    await this.write(payload);
+    const timeoutMs = this.decodeCalls === 0 ? 200 : 80;
+    this.decodeCalls += 1;
+
+    const samplesPerFrame = Math.max(1, Math.round(this.targetSampleRateHz / AMRWB_FRAME_RATE));
+    const expectedSamples = decodedFrames * samplesPerFrame;
+    const expectedBytes = expectedSamples * 2;
+    if (expectedBytes <= 0) {
+      return new Int16Array(0);
+    }
+
+    const pcmBuf = await this.readExact(expectedBytes, timeoutMs);
+    const pcm = new Int16Array(pcmBuf.length / 2);
+    for (let i = 0, j = 0; i < pcmBuf.length; i += 2, j += 1) {
+      pcm[j] = pcmBuf.readInt16LE(i);
+    }
+    return pcm;
+  }
+
+  public close(): void {
+    if (this.closed) return;
+    this.closed = true;
+    try {
+      this.child.stdin.end();
+    } catch {
+      // ignore
+    }
+    try {
+      this.child.kill();
+    } catch {
+      // ignore
+    }
+    this.failPending(new Error('ffmpeg stream closed'));
+  }
+
+  public stderrSnippet(): string {
+    return this.stderrBuffer.toString('utf8');
+  }
+
+  private handleStdout(chunk: Buffer): void {
+    if (this.closed) return;
+    const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    this.stdoutChunks.push(buf);
+    this.stdoutLength += buf.length;
+    this.flushReads();
+  }
+
+  private handleStderr(chunk: Buffer): void {
+    const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    this.stderrBuffer = Buffer.concat([this.stderrBuffer, buf]);
+    if (this.stderrBuffer.length > AMRWB_STREAM_STDERR_MAX_BYTES) {
+      this.stderrBuffer = this.stderrBuffer.subarray(this.stderrBuffer.length - AMRWB_STREAM_STDERR_MAX_BYTES);
+    }
+  }
+
+  private handleError(err: Error): void {
+    if (this.closed) return;
+    this.closed = true;
+    this.failPending(err);
+  }
+
+  private handleClose(code: number | null, signal: NodeJS.Signals | null): void {
+    if (this.closed) return;
+    this.closed = true;
+    const message = `ffmpeg stream closed code=${code ?? 'null'} signal=${signal ?? 'null'}`;
+    this.failPending(new Error(message));
+  }
+
+  private async write(buffer: Buffer): Promise<void> {
+    if (this.closed || !this.child.stdin.writable) {
+      throw new Error('ffmpeg stdin closed');
+    }
+    const ok = this.child.stdin.write(buffer);
+    if (ok) return;
+
+    await new Promise<void>((resolve, reject) => {
+      const onDrain = (): void => {
+        cleanup();
+        resolve();
+      };
+      const onError = (err: Error): void => {
+        cleanup();
+        reject(err);
+      };
+      const cleanup = (): void => {
+        this.child.stdin.off('drain', onDrain);
+        this.child.stdin.off('error', onError);
+      };
+      this.child.stdin.once('drain', onDrain);
+      this.child.stdin.once('error', onError);
+    });
+  }
+
+  private readExact(bytes: number, timeoutMs: number): Promise<Buffer> {
+    if (this.closed) {
+      return Promise.reject(new Error('ffmpeg stream closed'));
+    }
+    if (this.stdoutLength >= bytes) {
+      return Promise.resolve(this.readFromChunks(bytes));
+    }
+    return new Promise<Buffer>((resolve, reject) => {
+      const entry: PendingRead = { bytes, resolve, reject };
+      if (timeoutMs > 0) {
+        entry.timeoutId = setTimeout(() => {
+          this.removePending(entry);
+          reject(new Error('ffmpeg stream read timeout'));
+        }, timeoutMs);
+      }
+      this.pendingReads.push(entry);
+    });
+  }
+
+  private removePending(entry: PendingRead): void {
+    const index = this.pendingReads.indexOf(entry);
+    if (index >= 0) this.pendingReads.splice(index, 1);
+    if (entry.timeoutId) clearTimeout(entry.timeoutId);
+  }
+
+  private readFromChunks(bytes: number): Buffer {
+    const out = Buffer.allocUnsafe(bytes);
+    let remaining = bytes;
+    let offset = 0;
+    while (remaining > 0) {
+      const chunk = this.stdoutChunks[0];
+      if (!chunk) break;
+      if (chunk.length <= remaining) {
+        chunk.copy(out, offset);
+        offset += chunk.length;
+        remaining -= chunk.length;
+        this.stdoutChunks.shift();
+      } else {
+        chunk.copy(out, offset, 0, remaining);
+        this.stdoutChunks[0] = chunk.subarray(remaining);
+        offset += remaining;
+        remaining = 0;
+      }
+    }
+    this.stdoutLength -= bytes - remaining;
+    return remaining === 0 ? out : out.subarray(0, offset);
+  }
+
+  private flushReads(): void {
+    while (this.pendingReads.length > 0) {
+      const next = this.pendingReads[0];
+      if (!next || this.stdoutLength < next.bytes) return;
+      this.pendingReads.shift();
+      if (next.timeoutId) clearTimeout(next.timeoutId);
+      const buf = this.readFromChunks(next.bytes);
+      next.resolve(buf);
+    }
+  }
+
+  private failPending(err: Error): void {
+    while (this.pendingReads.length > 0) {
+      const next = this.pendingReads.shift();
+      if (!next) continue;
+      if (next.timeoutId) clearTimeout(next.timeoutId);
+      next.reject(err);
+    }
+  }
+}
+
+function getAmrWbStream(state: TelnyxCodecState | undefined, targetSampleRateHz: number): AmrWbFfmpegStream | null {
+  if (!state || state.amrwbFfmpegStreamDisabled) return null;
+  if (parseBoolEnv(process.env.AMRWB_DISABLE_STREAM)) return null;
+
+  if (state.amrwbFfmpegStream && state.amrwbFfmpegStreamRate === targetSampleRateHz) {
+    return state.amrwbFfmpegStream;
+  }
+  if (state.amrwbFfmpegStream) {
+    state.amrwbFfmpegStream.close();
+  }
+  state.amrwbFfmpegStream = new AmrWbFfmpegStream(targetSampleRateHz);
+  state.amrwbFfmpegStreamRate = targetSampleRateHz;
+  return state.amrwbFfmpegStream;
+}
+
+async function decodeAmrWbWithFfmpeg(
+  amrwbStorageBytes: Buffer,
+  targetSampleRateHz: number,
+  logContext?: Record<string, unknown>,
+): Promise<{ pcm16: Int16Array; stderr?: string } | null> {
+  const ffmpegPath = process.env.FFMPEG_PATH?.trim() || 'ffmpeg';
+
+  return new Promise((resolve) => {
+    const args = [
+      '-hide_banner',
+      '-loglevel',
+      'error',
+      '-f',
+      'amrwb',
+      '-c:a',
+      'libopencore_amrwb',
+      '-i',
+      'pipe:0',
+      '-f',
+      's16le',
+      '-ac',
+      '1',
+      '-ar',
+      String(targetSampleRateHz),
+      'pipe:1',
+    ];
+
+    const child = spawn(ffmpegPath, args, { stdio: ['pipe', 'pipe', 'pipe'] });
+
+    const out: Buffer[] = [];
+    const err: Buffer[] = [];
+
+    child.stdout.on('data', (d) => out.push(Buffer.isBuffer(d) ? d : Buffer.from(d)));
+    child.stderr.on('data', (d) => err.push(Buffer.isBuffer(d) ? d : Buffer.from(d)));
+
+    child.on('error', (e) => {
+      const msg = e instanceof Error ? e.message : String(e);
+      log.warn({ event: 'amrwb_ffmpeg_spawn_failed', err: msg, ...(logContext ?? {}) }, 'ffmpeg spawn failed');
+      resolve(null);
+    });
+
+    child.on('close', (code) => {
+      const stderr = Buffer.concat(err).toString('utf8');
+      if (code !== 0) {
+        resolve(null);
+        return;
+      }
+      const buf = Buffer.concat(out);
+      if (buf.length < 2) {
+        resolve(null);
+        return;
+      }
+      const trimmedLen = buf.length - (buf.length % 2);
+      const pcm = new Int16Array(trimmedLen / 2);
+      for (let i = 0, j = 0; i < trimmedLen; i += 2, j += 1) {
+        pcm[j] = buf.readInt16LE(i);
+      }
+      resolve({ pcm16: pcm, stderr });
+    });
+
+    child.stdin.end(amrwbStorageBytes);
+  });
+}
+
+type AmrCandidate = {
+  label: string;
+  dep: Extract<AmrWbDepacketizeResult, { ok: true }>;
+  sourcePayloadLen: number;
+  sourceHexPrefix: string;
+};
+
+function scoreCandidate(c: AmrCandidate): number {
+  const speech = c.dep.decodedFrames;
+  const total = c.dep.totalFrames;
+  const penalty = c.dep.noDataFrames + c.dep.speechLostFrames + c.dep.sidFrames;
+  const modeBonus = c.dep.mode === 'storage' ? 2 : 0;
+  return speech * 10 + Math.max(0, total - penalty) + modeBonus;
+}
+
+/* ---------------------------------- main ---------------------------------- */
+
+export async function decodeTelnyxPayloadToPcm16(opts: DecodeTelnyxOptions): Promise<DecodeTelnyxResult | null> {
+  const enc = normalizeTelnyxEncoding(opts.encoding);
+  const encoding = enc.normalized;
+
+  const state = getOrCreateSessionState(opts.state, opts.logContext);
+
   const targetRate = opts.targetSampleRateHz;
+  const channels = opts.channels ?? 1;
+
+  if (!state.ingestLogged) {
+    state.ingestLogged = true;
+    log.info(
+      {
+        event: 'stt_codec_probe',
+        raw_encoding: enc.raw,
+        normalized_encoding: encoding,
+        channels,
+        reported_sample_rate_hz: opts.reportedSampleRateHz,
+        payload_len: opts.payload.length,
+        target_sample_rate_hz: targetRate,
+        ...(opts.logContext ?? {}),
+      },
+      'STT codec probe',
+    );
+  }
 
   if (encoding === 'PCMU') {
     const pcm = decodePcmu(opts.payload);
-    const mono = downmixInterleaved(pcm, channels);
-    const resampled = resamplePcm16(mono, 8000, targetRate);
-    return { pcm16: resampled, sampleRateHz: targetRate };
+    const resampled = resamplePcm16(pcm, 8000, targetRate);
+    await maybeDumpPostDecode(resampled, targetRate, encoding, state, opts.logContext);
+    await maybeDumpPcm16(resampled, targetRate, encoding, state, opts.logContext);
+    return { pcm16: resampled, sampleRateHz: targetRate, decodedFrames: 1 };
   }
 
   if (encoding === 'PCMA') {
     const pcm = decodePcma(opts.payload);
-    const mono = downmixInterleaved(pcm, channels);
-    const resampled = resamplePcm16(mono, 8000, targetRate);
-    return { pcm16: resampled, sampleRateHz: targetRate };
+    const resampled = resamplePcm16(pcm, 8000, targetRate);
+    await maybeDumpPostDecode(resampled, targetRate, encoding, state, opts.logContext);
+    await maybeDumpPcm16(resampled, targetRate, encoding, state, opts.logContext);
+    return { pcm16: resampled, sampleRateHz: targetRate, decodedFrames: 1 };
   }
 
+  // AMR-WB
   if (encoding === 'AMR-WB') {
-    if (!opts.allowAmrWb) {
-      return null;
+    if (parseBoolEnv(process.env.AMRWB_DECODE_TRACE)) {
+      log.info({ event: 'amrwb_code_path_reached', encoding, ...(opts.logContext ?? {}) }, 'AMR-WB decode path reached');
     }
-    const state = opts.state ?? {};
-    if (!state.amrwb && !state.amrwbFailed) {
-      state.amrwb = new AmrWbDecoder();
-      state.amrwbReady = state.amrwb.init();
-    }
-    if (!state.amrwb || state.amrwbFailed) {
-      return null;
-    }
-    if (state.amrwbReady) {
-      try {
-        await state.amrwbReady;
-      } catch (error) {
-        state.amrwbFailed = true;
-        state.amrwbLastError = error instanceof Error ? error.message : 'amrwb_init_failed';
-        return null;
-      }
-    }
-    try {
-      const frames = splitAmrWbPayload(opts.payload);
-      const framesToDecode = frames ?? [opts.payload];
-      if (frames && frames.length === 1 && frames[0].length !== opts.payload.length) {
-        if (state.amrwbLastError !== 'amrwb_header_stripped') {
-          state.amrwbLastError = 'amrwb_header_stripped';
-          log.info(
-            {
-              event: 'amrwb_header_stripped',
-              payload_len: opts.payload.length,
-              frame_len: frames[0].length,
-              ...(opts.logContext ?? {}),
-            },
-            'amr-wb header stripped before decode',
-          );
-        }
-      }
-      if (!frames && state.amrwbLastError !== 'amrwb_packet_parse_failed') {
-        state.amrwbLastError = 'amrwb_packet_parse_failed';
-        log.warn(
-          {
-            event: 'amrwb_packet_parse_failed',
-            length: opts.payload.length,
+
+    if (!opts.allowAmrWb) return null;
+
+    const candidates: AmrCandidate[] = [];
+
+    // 1) Run transcoder FIRST (single source of truth)
+    const transcode = transcodeTelnyxAmrWbPayload(opts.payload);
+
+    // artifact capture (optional)
+    if (parseBoolEnv(process.env.TRUTH_CAPTURE_AMRWB) || parseBoolEnv(process.env.AMRWB_ARTIFACT_DEBUG)) {
+      writeAmrwbArtifacts('amrwb_raw_payload', opts.payload, {
+        hasCmr: true,
+        meta: {
+          encoding,
+          payload_len: opts.payload.length,
+          ...(opts.logContext ?? {}),
+        },
+      });
+
+      if (transcode.ok) {
+        // transcoder output is STORAGE frames bytes; treat as storage for artifact writer
+        writeAmrwbArtifacts('amrwb_transcoded_output', transcode.output, {
+          hasCmr: false,
+          meta: {
+            packing: transcode.packing,
+            rtp_stripped: transcode.rtpStripped,
+            toc_count: transcode.tocCount,
+            cmr: transcode.cmr ?? null,
+            cmr_stripped: true,
+            total_bytes_in: transcode.totalBytesIn,
+            total_bytes_out: transcode.totalBytesOut,
             ...(opts.logContext ?? {}),
           },
-          'amr-wb payload could not be split into frames; decoding raw payload',
+        });
+      }
+    }
+
+    const envDefaultBe = parseBoolEnv(process.env.TELNYX_AMRWB_DEFAULT_BE);
+    const forcedBe = opts.forceAmrWbBe === true;
+    const beActive = forcedBe || envDefaultBe || (transcode.ok && transcode.packing === 'be');
+
+    // If BE is active, do NOT allow raw octet fallback.
+    const octetFallbackAllowed = !beActive && parseBoolEnv(process.env.AMRWB_ALLOW_OCTET_FALLBACK);
+
+    // Optional stricter enforcement: only allow BE when explicitly forced or env requires
+    const requireBe = forcedBe || parseBoolEnv(process.env.AMRWB_REQUIRE_BE);
+
+    const logPathSelectOnce = (chosenPath: 'be' | 'octet'): void => {
+      if (state.amrwbPathSelectedLogged) return;
+      state.amrwbPathSelectedLogged = true;
+      log.info(
+        {
+          event: 'amrwb_path_select',
+          be_active: beActive,
+          forced_be: forcedBe,
+          env_default_be: envDefaultBe,
+          require_be: requireBe,
+          transcode_packing: transcode.ok ? transcode.packing : 'transcode_failed',
+          cmr_stripped: transcode.ok ? true : null,
+          fallback_allowed: octetFallbackAllowed,
+          chosen_path: chosenPath,
+          ...(opts.logContext ?? {}),
+        },
+        'AMR-WB path selected',
+      );
+    };
+
+    if (!transcode.ok) {
+      const invalidCount = (state.amrwbDepackInvalidCount ?? 0) + 1;
+      state.amrwbDepackInvalidCount = invalidCount;
+
+      if (invalidCount <= 10) {
+        const hexPrefix = opts.payload.subarray(0, Math.min(32, opts.payload.length)).toString('hex');
+        log.warn(
+          {
+            event: 'amrwb_depack_invalid',
+            reason: transcode.error,
+            payload_len: opts.payload.length,
+            first_bytes_hex: hexPrefix,
+            rtp_stripped: transcode.rtpStripped,
+            forced_be: forcedBe,
+            env_default_be: envDefaultBe,
+            require_be: requireBe,
+            be_active: beActive,
+            ...(opts.logContext ?? {}),
+          },
+          `AMRWB_DEPACK invalid reason=${transcode.error} firstBytesHex=${hexPrefix} len=${opts.payload.length}`,
         );
       }
 
-      const chunks: Int16Array[] = [];
-      let totalSamples = 0;
-      for (const frame of framesToDecode) {
-        if (frame.length === AMRWB_SID_FRAME_BYTES) {
-          continue;
+      state.amrwbLastError = 'amrwb_depack_invalid';
+
+      if (beActive || requireBe) {
+        state.amrwbLastError = 'amrwb_be_transcode_failed';
+        logPathSelectOnce('be');
+        return null;
+      }
+    } else {
+      if (!state.amrwbDepacketizeLogged) {
+        state.amrwbDepacketizeLogged = true;
+        log.info(
+          {
+            event: 'amrwb_depack',
+            packing: transcode.packing,
+            rtp_stripped: transcode.rtpStripped,
+            toc_count: transcode.tocCount,
+            cmr_stripped: true,
+            total_bytes_in: transcode.totalBytesIn,
+            total_bytes_out: transcode.totalBytesOut,
+            forced_be: forcedBe,
+            env_default_be: envDefaultBe,
+            require_be: requireBe,
+            be_active: beActive,
+            ...(opts.logContext ?? {}),
+          },
+          `AMRWB_DEPACK packing=${transcode.packing} rtpStripped=${transcode.rtpStripped} tocCount=${transcode.tocCount} totalBytesIn=${transcode.totalBytesIn} totalBytesOut=${transcode.totalBytesOut}`,
+        );
+      }
+
+      // If we require BE and transcoder says octet, reject (no fallback)
+      if (requireBe && transcode.packing !== 'be') {
+        state.amrwbLastError = 'amrwb_require_be_mismatch';
+        logPathSelectOnce('be');
+        log.warn(
+          {
+            event: 'amrwb_require_be_mismatch',
+            packing: transcode.packing,
+            payload_len: opts.payload.length,
+            ...(opts.logContext ?? {}),
+          },
+          'AMR-WB require-BE is enabled but input did not parse as BE',
+        );
+        return null;
+      }
+
+      // IMPORTANT: transcoder output is ALWAYS storage frames bytes (NO header).
+      // We ONLY parse it as storage. We NEVER treat it as octet.
+      const storageBytes = ensureAmrWbStreamHeader(transcode.output);
+      const parsedStorage = parseAmrWbStorageToFrames(storageBytes);
+
+      if (parsedStorage.ok) {
+        if (parsedStorage.decodedFrames > 0) {
+          const depStorage: Extract<AmrWbDepacketizeResult, { ok: true }> = {
+            ok: true,
+            storage: storageBytes,
+            frames: parsedStorage.frames,
+            frameTypes: parsedStorage.frameTypes,
+            totalFrames: parsedStorage.totalFrames,
+            mode: 'storage',
+            decodedFrames: parsedStorage.decodedFrames,
+            sidFrames: parsedStorage.sidFrames,
+            noDataFrames: parsedStorage.noDataFrames,
+            speechLostFrames: parsedStorage.speechLostFrames,
+            hasSpeechFrames: true,
+          };
+
+          candidates.push({
+            label: 'transcoded',
+            dep: depStorage,
+            sourcePayloadLen: transcode.output.length,
+            sourceHexPrefix: transcode.output.subarray(0, Math.min(32, transcode.output.length)).toString('hex'),
+          });
+        } else if (parseBoolEnv(process.env.AMRWB_DECODE_TRACE)) {
+          log.info(
+            {
+              event: 'amrwb_transcoded_no_speech',
+              total_frames: parsedStorage.totalFrames,
+              decoded_frames: parsedStorage.decodedFrames,
+              sid_frames: parsedStorage.sidFrames,
+              no_data_frames: parsedStorage.noDataFrames,
+              speech_lost_frames: parsedStorage.speechLostFrames,
+              ...(opts.logContext ?? {}),
+            },
+            'AMR-WB transcoded chunk had no speech; ignored',
+          );
         }
-        const decoded = state.amrwb.decodeFrame(new Uint8Array(frame));
-        chunks.push(decoded);
-        totalSamples += decoded.length;
-      }
-      if (totalSamples === 0) {
-        return { pcm16: new Int16Array(0), sampleRateHz: targetRate };
+      } else if (!state.amrwbDepacketizeFailedLogged) {
+        state.amrwbDepacketizeFailedLogged = true;
+        log.warn(
+          {
+            event: 'amrwb_transcoded_storage_parse_failed',
+            reason: parsedStorage.error.reason,
+            invalid_ft: parsedStorage.error.invalidFt ?? null,
+            payload_len: transcode.output.length,
+            packing: transcode.packing,
+            hex_prefix: transcode.output.subarray(0, Math.min(32, transcode.output.length)).toString('hex'),
+            ...(opts.logContext ?? {}),
+          },
+          'AMR-WB transcoded output did not parse as storage frames',
+        );
       }
 
-      const merged = new Int16Array(totalSamples);
-      let offset = 0;
-      for (const chunk of chunks) {
-        merged.set(chunk, offset);
-        offset += chunk.length;
+      if (candidates.length === 0 && (beActive || requireBe)) {
+        state.amrwbLastError = 'amrwb_be_storage_parse_failed';
+        logPathSelectOnce('be');
+        return null;
       }
+    }
 
-      const resampled = resamplePcm16(merged, 16000, targetRate);
-      return { pcm16: resampled, sampleRateHz: targetRate };
-    } catch (error) {
-      state.amrwbLastError = error instanceof Error ? error.message : 'amrwb_decode_failed';
+    // Optional raw octet fallback (ONLY if BE inactive AND env enables it)
+    if (octetFallbackAllowed) {
+      const rawDep = depacketizeAmrWbToStorage(opts.payload, { skipCmr: false });
+      if (rawDep.ok) {
+        candidates.push({
+          label: 'raw',
+          dep: rawDep,
+          sourcePayloadLen: opts.payload.length,
+          sourceHexPrefix: opts.payload.subarray(0, Math.min(32, opts.payload.length)).toString('hex'),
+        });
+      }
+    }
+
+    if (candidates.length === 0) {
+      logPathSelectOnce(beActive || requireBe ? 'be' : 'octet');
+      state.amrwbLastError = state.amrwbLastError ?? 'amrwb_no_candidates';
       return null;
     }
-  }
 
-  if (encoding === 'G722') {
-    if (!opts.allowG722) {
+    // Filter broken candidates
+    const headerLen = AMRWB_STREAM_HEADER.length;
+    const valid = candidates.filter((c) => {
+      if (!c.dep.storage || c.dep.storage.length <= headerLen) return false;
+      if (!c.dep.frames || c.dep.frames.length === 0) return false;
+      if (c.dep.decodedFrames > 0 && c.dep.hasSpeechFrames !== true) return false;
+      return true;
+    });
+
+    if (valid.length === 0) {
+      state.amrwbLastError = 'amrwb_no_valid_candidates';
       return null;
     }
-    const state = opts.state ?? {};
-    if (!state.g722) {
-      state.g722 = new G722Decoder(64000, 0);
-    }
-    const decoded = state.g722.decode(opts.payload);
-    const mono = downmixInterleaved(decoded, channels);
-    const resampled = resamplePcm16(mono, 16000, targetRate);
-    return { pcm16: resampled, sampleRateHz: targetRate };
-  }
 
-  if (encoding === 'OPUS') {
-    if (!opts.allowOpus) {
-      return null;
-    }
-    if (looksLikeOgg(opts.payload)) {
+    candidates.length = 0;
+    candidates.push(...valid);
+
+    candidates.sort((a, b) => scoreCandidate(b) - scoreCandidate(a));
+    const transcodedCandidate = candidates.find((candidate) => candidate.label === 'transcoded');
+    const chosen = transcodedCandidate ?? candidates[0]!;
+    const dep = chosen.dep;
+
+    const chosenPath =
+      chosen.label === 'raw' ? 'octet' : transcode.ok && transcode.packing === 'be' ? 'be' : 'octet';
+    logPathSelectOnce(chosenPath);
+
+    if (chosen.label === 'raw' && !state.amrwbFallbackLogged) {
+      state.amrwbFallbackLogged = true;
       log.warn(
         {
-          event: 'opus_container_detected',
-          encoding,
-          length: opts.payload.length,
+          event: 'amrwb_fallback_used',
+          chosen_mode: dep.mode,
+          payload_len: opts.payload.length,
+          transcode_packing: transcode.ok ? transcode.packing : 'transcode_failed',
           ...(opts.logContext ?? {}),
         },
+        'AMR-WB octet fallback used',
+      );
+    }
+
+    if (!dep.storage || dep.storage.length <= AMRWB_STREAM_HEADER.length) {
+      log.error(
+        { event: 'AMRWB_CHOSEN_INVALID_STORAGE', storage_len: dep.storage?.length ?? -1, ...(opts.logContext ?? {}) },
+        'Chosen AMR-WB candidate had invalid storage',
+      );
+      return null;
+    }
+
+    // -------------------- BUFFER AMR-WB FRAMES --------------------
+
+    if (!state.amrwbFrameBuf) state.amrwbFrameBuf = [];
+    if (!state.amrwbFrameBufDecodedFrames) state.amrwbFrameBufDecodedFrames = 0;
+
+    // Collect validated speech frames accepted this packet; append immediately to artifact
+    const acceptedSpeechFrames: Buffer[] = [];
+
+    for (let i = 0; i < dep.frames.length; i += 1) {
+      if (dep.frameTypes[i] !== 'speech') continue;
+
+      const frame = dep.frames[i]!;
+      if (!frame || frame.length < 2) continue;
+
+      const toc = frame[0]!;
+      const ft = (toc >> 3) & 0x0f;
+      const expected = 1 + amrWbFrameSize(ft);
+
+      // Speech frames must match exact size (TOC + speech payload)
+      if (expected <= 1 || frame.length !== expected) continue;
+
+      // Dedupe consecutive identical speech frames to prevent overlap/echo
+      const frSha1 = sha1Hex(frame);
+      if (state.amrwbLastAcceptedSpeechSha1 && state.amrwbLastAcceptedSpeechSha1 === frSha1) {
+        continue;
+      }
+      state.amrwbLastAcceptedSpeechSha1 = frSha1;
+
+      state.amrwbFrameBuf.push(frame);
+      state.amrwbFrameBufDecodedFrames = (state.amrwbFrameBufDecodedFrames ?? 0) + 1;
+      acceptedSpeechFrames.push(frame);
+    }
+
+    const now = Date.now();
+    if ((state.amrwbFrameBufDecodedFrames ?? 0) > 0 && !state.amrwbFrameBufLastFlushMs) {
+      state.amrwbFrameBufLastFlushMs = now; // buffer start time
+    }
+
+    const bufStart = state.amrwbFrameBufLastFlushMs ?? 0;
+    const ageMs = bufStart ? now - bufStart : 0;
+
+    const minFrames =
+      Number.isFinite(AMRWB_MIN_DECODE_FRAMES) && AMRWB_MIN_DECODE_FRAMES > 0 ? AMRWB_MIN_DECODE_FRAMES : 10;
+    const maxBufferMs =
+      Number.isFinite(AMRWB_MAX_BUFFER_MS) && AMRWB_MAX_BUFFER_MS > 0 ? AMRWB_MAX_BUFFER_MS : 500;
+
+    const haveEnough = (state.amrwbFrameBufDecodedFrames ?? 0) >= minFrames;
+    const tooOld = bufStart !== 0 && ageMs >= maxBufferMs;
+
+    if (!haveEnough && !tooOld) {
+      return null;
+    }
+
+    // Flush buffer -> decode batch
+    const framesToDecodeRaw = state.amrwbFrameBuf;
+    const decodedFramesToDecodeRaw = state.amrwbFrameBufDecodedFrames ?? 0;
+
+    state.amrwbFrameBuf = [];
+    state.amrwbFrameBufDecodedFrames = 0;
+    state.amrwbFrameBufLastFlushMs = 0;
+
+    if (!framesToDecodeRaw || framesToDecodeRaw.length === 0 || decodedFramesToDecodeRaw <= 0) {
+      return null;
+    }
+
+    // HARD-STOP drift: consecutive duplicate storage-frame dedupe BEFORE decode
+    const dd = dedupeConsecutiveFramesForDecode(state, framesToDecodeRaw);
+    const framesToDecode = dd.frames;
+
+    if (dd.dropped > 0 && parseBoolEnv(process.env.AMRWB_DECODE_TRACE)) {
+      log.info(
+        {
+          event: 'AMRWB_DECODE_DEDUP',
+          dropped: dd.dropped,
+          kept: dd.kept,
+          dropped_total: state.amrwbDecodeDedupeDropped ?? 0,
+          kept_total: state.amrwbDecodeDedupeKept ?? 0,
+          ...(opts.logContext ?? {}),
+        },
+        'AMR-WB decode-path dropped consecutive duplicate storage frames',
+      );
+    }
+
+    // Recompute decodedFrames based on deduped frames (speech-only buffer, so this is safe)
+    const decodedFramesToDecode = framesToDecode.length;
+
+    maybeAppendSelectedStorageFrames(state, framesToDecode, opts.logContext);
+
+    const storageForDecode = Buffer.concat([AMRWB_STREAM_HEADER, ...framesToDecode]);
+
+
+    // ----------------------------- DECODE (FFMPEG) -----------------------------
+    const samplesPerFrame = Math.max(1, Math.round(targetRate / AMRWB_FRAME_RATE));
+
+    let decoded: { pcm16: Int16Array } | null = null;
+    let usedStream = false;
+    const stream = getAmrWbStream(state, targetRate);
+
+    if (stream) {
+      try {
+        const pcm16 = await stream.decode(framesToDecode, decodedFramesToDecode);
+        if (pcm16.length > 0) {
+          decoded = { pcm16 };
+          usedStream = true;
+          state.amrwbFfmpegUsable = true;
+          state.amrwbLastError = undefined;
+        }
+      } catch (error) {
+        state.amrwbFfmpegStreamDisabled = true;
+        state.amrwbFfmpegUsable = false;
+        state.amrwbLastError = 'amrwb_ffmpeg_stream_failed';
+        stream.close();
+        state.amrwbFfmpegStream = undefined;
+        state.amrwbFfmpegStreamRate = undefined;
+
+        log.warn(
+          {
+            event: 'amrwb_ffmpeg_stream_failed',
+            stderr: stream.stderrSnippet(),
+            err: error,
+            ...(opts.logContext ?? {}),
+          },
+          'AMR-WB ffmpeg stream decode failed',
+        );
+      }
+    }
+
+    if (!decoded || decoded.pcm16.length === 0) {
+      const oneShot = await decodeAmrWbWithFfmpeg(storageForDecode, targetRate, opts.logContext);
+      if (!oneShot || oneShot.pcm16.length === 0) {
+        state.amrwbFfmpegUsable = false;
+        state.amrwbLastError = 'amrwb_ffmpeg_decode_failed';
+        return null;
+      }
+      decoded = { pcm16: oneShot.pcm16 };
+    }
+
+    // strict check based on chosen batch
+    const expectedSpeechSamples = decodedFramesToDecode * samplesPerFrame;
+    if (amrwbStrictDecodeEnabled() && decoded.pcm16.length < expectedSpeechSamples) {
+      state.amrwbLastError = 'amrwb_short_pcm';
+      return null;
+    }
+
+    const decodedRawSamples = decoded.pcm16.length;
+    const actualSamples = decoded.pcm16.length;
+    const zeroCount = countZeroSamples(decoded.pcm16);
+    const zeroRatio = actualSamples > 0 ? zeroCount / actualSamples : 1;
+    const decodedStats = computePcmStats(decoded.pcm16);
+    const dropout = zeroRatio > 0.9 || decodedStats.rms < 0.001 || decodedRawSamples < expectedSpeechSamples;
+
+    if (shouldLogAmrwbDebug(state, Date.now(), dropout)) {
+      const prefixSamples = Array.from(decoded.pcm16.subarray(0, 16));
+      const prefixBuf = Buffer.from(
+        decoded.pcm16.buffer,
+        decoded.pcm16.byteOffset,
+        Math.min(32, decoded.pcm16.byteLength),
+      );
+
+      log.info(
+        {
+          event: 'amrwb_decode_debug',
+          decode_source: chosen.label,
+          mode: dep.mode,
+          decoded_frames: decodedFramesToDecode,
+          total_frames: decodedFramesToDecode,
+          sample_rate_hz: targetRate,
+          expected_speech_samples: expectedSpeechSamples,
+          decoded_raw_samples: decodedRawSamples,
+          samples: actualSamples,
+          zero_samples: zeroCount,
+          zero_ratio: Number(zeroRatio.toFixed(6)),
+          rms: Number(decodedStats.rms.toFixed(6)),
+          peak: Number(decodedStats.peak.toFixed(6)),
+          dropout,
+          decode_path: usedStream ? 'ffmpeg_stream' : 'ffmpeg',
+          pcm_prefix_samples: prefixSamples,
+          pcm_prefix_hex: prefixBuf.toString('hex'),
+          ...(opts.logContext ?? {}),
+        },
+        'AMR-WB decode debug',
+      );
+    }
+
+    state.amrwbFfmpegUsable = true;
+    state.amrwbLastError = undefined;
+
+    await maybeDumpPostDecode(decoded.pcm16, targetRate, encoding, state, opts.logContext);
+    await maybeDumpPcm16(decoded.pcm16, targetRate, encoding, state, opts.logContext);
+
+    return {
+      pcm16: decoded.pcm16,
+      sampleRateHz: targetRate,
+      decodedFrames: decodedFramesToDecode,
+      decodeFailures: 0,
+    };
+  }
+
+  // G.722
+  if (encoding === 'G722') {
+    if (!opts.allowG722) return null;
+    if (!state.g722) state.g722 = new G722Decoder(64000, 0);
+    const decoded = state.g722.decode(opts.payload);
+
+    const resampled = resamplePcm16(decoded, 16000, targetRate);
+    await maybeDumpPostDecode(resampled, targetRate, encoding, state, opts.logContext);
+    await maybeDumpPcm16(resampled, targetRate, encoding, state, opts.logContext);
+    return { pcm16: resampled, sampleRateHz: targetRate, decodedFrames: 1 };
+  }
+
+  // OPUS
+  if (encoding === 'OPUS') {
+    if (!opts.allowOpus) return null;
+
+    if (looksLikeOgg(opts.payload)) {
+      log.warn(
+        { event: 'opus_container_detected', encoding, length: opts.payload.length, ...(opts.logContext ?? {}) },
         'Opus payload appears to be Ogg; expected raw Opus packets',
       );
       return null;
     }
 
-    const state = opts.state ?? {};
-    if (!state.opus && !state.opusFailed) {
+    if ((!state.opus || state.opusChannels !== channels) && !state.opusFailed) {
       try {
-        state.opus = new OpusDecoder();
-        state.opusReady = state.opus.ready;
+        state.opus = new OpusPacketDecoder(channels);
+        state.opusChannels = channels;
       } catch (error) {
         state.opusFailed = true;
-        log.warn(
-          { err: error, event: 'opus_decoder_init_failed', ...(opts.logContext ?? {}) },
-          'Opus decoder init failed',
-        );
+        log.warn({ err: error, event: 'opus_decoder_init_failed', ...(opts.logContext ?? {}) }, 'Opus decoder init failed');
         return null;
       }
     }
 
-    if (!state.opus || state.opusFailed) {
+    if (!state.opus || state.opusFailed) return null;
+
+    let pcm = new Int16Array(0);
+    try {
+      const decoded = state.opus.decode(opts.payload);
+      const mono = downmixInterleaved(decoded, channels);
+      pcm = new Int16Array(mono);
+    } catch (error) {
+      log.warn({ err: error, event: 'opus_decode_failed', ...(opts.logContext ?? {}) }, 'Opus decode failed');
       return null;
     }
 
-    if (state.opusReady) {
-      try {
-        await state.opusReady;
-      } catch (error) {
-        state.opusFailed = true;
-        log.warn(
-          { err: error, event: 'opus_decoder_ready_failed', ...(opts.logContext ?? {}) },
-          'Opus decoder ready failed',
-        );
-        return null;
-      }
+    const inputRate = DEFAULT_OPUS_SAMPLE_RATE;
+    const resampled =
+      inputRate === 48000 && targetRate === 16000 ? resample48kTo16k(pcm) : resamplePcm16(pcm, inputRate, targetRate);
+
+    if (!state.opusLogged) {
+      state.opusLogged = true;
+      log.info(
+        {
+          event: 'opus_decode_success',
+          input_bytes: opts.payload.length,
+          input_rate_hz: inputRate,
+          output_rate_hz: targetRate,
+          decoded_samples: pcm.length,
+          output_samples: resampled.length,
+          ...(opts.logContext ?? {}),
+        },
+        'Opus packet decoded',
+      );
     }
 
-    const result = state.opus.decodeFrame(new Uint8Array(opts.payload));
-    if (!result || !isFloat32ArrayArray(result.channelData)) {
-      return null;
-    }
-    const monoFloat = downmixFloat32(result.channelData);
-    const pcm = floatToPcm16(monoFloat);
-    const inputRate = typeof result.sampleRate === 'number' ? result.sampleRate : DEFAULT_OPUS_SAMPLE_RATE;
-    const resampled = resamplePcm16(pcm, inputRate, targetRate);
-    return { pcm16: resampled, sampleRateHz: targetRate };
+    await maybeDumpPostDecode(resampled, targetRate, encoding, state, opts.logContext);
+    await maybeDumpPcm16(resampled, targetRate, encoding, state, opts.logContext);
+    return { pcm16: resampled, sampleRateHz: targetRate, decodedFrames: 1 };
   }
 
   return null;
+}
+
+export function closeTelnyxCodecState(state?: TelnyxCodecState): void {
+  if (!state?.amrwbFfmpegStream) return;
+  state.amrwbFfmpegStream.close();
+  state.amrwbFfmpegStream = undefined;
+  state.amrwbFfmpegStreamRate = undefined;
+}
+
+/**
+ * Clears the cached session state (when caller did not provide a state object).
+ * Call this when a Telnyx call ends, using the same logContext that contains call_control_id.
+ */
+export function clearTelnyxCodecSession(logContext?: Record<string, unknown>): void {
+  const key = getSessionKey(logContext);
+  if (!key) return;
+
+  const st = SESSION_STATE_CACHE.get(key);
+  if (st?.amrwbFfmpegStream) {
+    st.amrwbFfmpegStream.close();
+  }
+  SESSION_STATE_CACHE.delete(key);
 }

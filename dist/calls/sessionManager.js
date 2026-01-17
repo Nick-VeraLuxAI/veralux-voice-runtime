@@ -1,9 +1,12 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.SessionManager = void 0;
+// src/calls/sessionManager.ts
 const capacity_1 = require("../limits/capacity");
 const log_1 = require("../log");
+const metrics_1 = require("../metrics");
 const callSession_1 = require("./callSession");
+const codecDecode_1 = require("../audio/codecDecode");
 const DEFAULT_IDLE_TTL_MINUTES = 10;
 const DEFAULT_SWEEP_INTERVAL_MS = 60000;
 class SessionManager {
@@ -116,6 +119,34 @@ class SessionManager {
         const session = this.sessions.get(callControlId);
         return session ? session.isActive() : true;
     }
+    isPlaybackActive(callControlId) {
+        const session = this.sessions.get(callControlId);
+        return session ? session.isPlaybackActive() : false;
+    }
+    isListening(callControlId) {
+        const session = this.sessions.get(callControlId);
+        return session ? session.isListening() : false;
+    }
+    getLastSpeechStartAtMs(callControlId) {
+        const session = this.sessions.get(callControlId);
+        return session ? session.getLastSpeechStartAtMs() : 0;
+    }
+    getTransportMode(callControlId) {
+        const transport = this.transports.get(callControlId);
+        return transport?.mode;
+    }
+    notifyIngestFailure(callControlId, reason) {
+        const session = this.sessions.get(callControlId);
+        if (!session) {
+            log_1.log.warn({
+                event: 'call_session_ingest_missing',
+                call_control_id: callControlId,
+                reason,
+            }, 'call session missing for ingest failure');
+            return;
+        }
+        session.notifyIngestFailure(reason);
+    }
     onHangup(callControlId, reason, context = {}) {
         const session = this.sessions.get(callControlId);
         if (!session) {
@@ -143,6 +174,8 @@ class SessionManager {
         this.teardown(callControlId, reason ?? 'hangup', context);
     }
     teardown(callControlId, reason, context = {}) {
+        // ✅ Always clear codec session cache on teardown (session exists OR missing)
+        (0, codecDecode_1.clearTelnyxCodecSession)({ call_control_id: callControlId });
         const session = this.sessions.get(callControlId);
         if (!session) {
             this.inactiveCalls.set(callControlId, Date.now());
@@ -206,8 +239,10 @@ class SessionManager {
         }, 'call session teardown');
     }
     pushAudio(callControlId, frame) {
+        (0, metrics_1.incInboundAudioFrames)();
         const session = this.sessions.get(callControlId);
         if (!session) {
+            (0, metrics_1.incInboundAudioFramesDropped)('missing_session');
             log_1.log.warn({
                 event: 'call_session_missing_audio',
                 call_control_id: callControlId,
@@ -215,6 +250,7 @@ class SessionManager {
             return false;
         }
         if (!session.isActive() || session.getState() === 'ENDED') {
+            (0, metrics_1.incInboundAudioFramesDropped)('inactive_session');
             log_1.log.warn({
                 event: 'call_session_audio_ended',
                 call_control_id: callControlId,
@@ -231,15 +267,30 @@ class SessionManager {
         return true;
     }
     pushPcm16(callControlId, pcm16, sampleRateHz) {
-        if (sampleRateHz <= 0) {
+        return this.pushPcm16Frame(callControlId, { pcm16, sampleRateHz, channels: 1 });
+    }
+    pushPcm16Frame(callControlId, frame) {
+        (0, metrics_1.incInboundAudioFrames)();
+        const session = this.sessions.get(callControlId);
+        if (!session) {
+            (0, metrics_1.incInboundAudioFramesDropped)('missing_session');
+            log_1.log.warn({ event: 'call_session_missing_pcm16', call_control_id: callControlId }, 'missing session for pcm16');
+            return false;
+        }
+        if (!session.isActive() || session.getState() === 'ENDED') {
+            (0, metrics_1.incInboundAudioFramesDropped)('inactive_session');
+            log_1.log.warn({ event: 'call_session_pcm16_ended', call_control_id: callControlId }, 'session ended for pcm16');
+            return false;
+        }
+        if (frame.sampleRateHz <= 0) {
             log_1.log.warn({
                 event: 'call_session_pcm16_invalid_rate',
                 call_control_id: callControlId,
-                sample_rate_hz: sampleRateHz,
-            }, 'invalid pcm16 sample rate');
+                sample_rate_hz: frame.sampleRateHz,
+            }, 'invalid pcm16 rate');
         }
-        const buffer = Buffer.from(pcm16.buffer, pcm16.byteOffset, pcm16.byteLength);
-        return this.pushAudio(callControlId, buffer);
+        session.onPcm16Frame(frame);
+        return true;
     }
     registerMediaConnection(callControlId, connection) {
         const connections = this.mediaConnections.get(callControlId) ?? new Set();

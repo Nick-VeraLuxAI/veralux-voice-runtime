@@ -25,6 +25,8 @@ const defaults: Record<string, string> = {
 };
 
 export function setTestEnv(): void {
+  process.env.TELNYX_SKIP_SIGNATURE = 'false';
+  process.env.TELNYX_VERIFY_SIGNATURES = 'true';
   for (const [key, value] of Object.entries(defaults)) {
     if (!process.env[key]) {
       process.env[key] = value;

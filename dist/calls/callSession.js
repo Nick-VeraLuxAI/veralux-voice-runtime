@@ -1,11 +1,15 @@
 "use strict";
+var __importDefault = (this && this.__importDefault) || function (mod) {
+    return (mod && mod.__esModule) ? mod : { "default": mod };
+};
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.CallSession = void 0;
+const fs_1 = __importDefault(require("fs"));
+const path_1 = __importDefault(require("path"));
 const env_1 = require("../env");
 const log_1 = require("../log");
 const wavInfo_1 = require("../audio/wavInfo");
 const playbackPipeline_1 = require("../audio/playbackPipeline");
-const codecDecode_1 = require("../audio/codecDecode");
 const audioStore_1 = require("../storage/audioStore");
 const chunkedSTT_1 = require("../stt/chunkedSTT");
 const registry_1 = require("../stt/registry");
@@ -20,17 +24,47 @@ function getErrorMessage(error) {
         return error.message;
     return 'unknown_error';
 }
+function resolveDebugDir() {
+    const dir = process.env.STT_DEBUG_DIR;
+    return dir && dir.trim() !== '' ? dir.trim() : '/tmp/veralux-stt-debug';
+}
+function wavHeader(pcmDataBytes, sampleRate, channels) {
+    const bytesPerSample = 2;
+    const blockAlign = channels * bytesPerSample;
+    const byteRate = sampleRate * blockAlign;
+    const header = Buffer.alloc(44);
+    header.write('RIFF', 0, 'ascii');
+    header.writeUInt32LE(36 + pcmDataBytes, 4);
+    header.write('WAVE', 8, 'ascii');
+    header.write('fmt ', 12, 'ascii');
+    header.writeUInt32LE(16, 16);
+    header.writeUInt16LE(1, 20);
+    header.writeUInt16LE(channels, 22);
+    header.writeUInt32LE(sampleRate, 24);
+    header.writeUInt32LE(byteRate, 28);
+    header.writeUInt16LE(blockAlign, 32);
+    header.writeUInt16LE(16, 34);
+    header.write('data', 36, 'ascii');
+    header.writeUInt32LE(pcmDataBytes, 40);
+    return header;
+}
+function encodePcm16Wav(pcm16le, sampleRateHz) {
+    const header = wavHeader(pcm16le.length, sampleRateHz, 1);
+    return Buffer.concat([header, pcm16le]);
+}
 class CallSession {
     constructor(config) {
         this.state = 'INIT';
         this.transcriptBuffer = [];
         this.conversationHistory = [];
         this.deadAirMs = env_1.env.DEAD_AIR_MS;
+        this.deadAirNoFramesMs = env_1.env.DEAD_AIR_NO_FRAMES_MS;
         this.active = true;
         this.isHandlingTranscript = false;
         this.hasStarted = false;
         this.turnSequence = 0;
         this.repromptInFlight = false;
+        this.ingestFailurePrompted = false;
         this.logPreviewChars = 160;
         this.ttsSegmentChain = Promise.resolve();
         this.ttsSegmentQueueDepth = 0;
@@ -40,6 +74,16 @@ class CallSession {
         };
         this.transcriptHandlingToken = 0;
         this.transcriptAcceptedForUtterance = false;
+        this.lastSpeechStartAtMs = 0;
+        this.lastDecodedFrameAtMs = 0;
+        this.rxDumpActive = false;
+        this.rxDumpSamplesTarget = 0;
+        this.rxDumpSamplesCollected = 0;
+        this.rxDumpBuffers = [];
+        this.listeningSinceAtMs = 0;
+        // pick reasonable defaults; you can env-ize later
+        this.deadAirListeningGraceMs = 1200; // prevents immediate reprompt right after enter LISTENING
+        this.deadAirAfterSpeechStartGraceMs = 1500; // prevents reprompt while user has started speaking but transcript not ready
         this.callControlId = config.callControlId;
         this.tenantId = config.tenantId;
         this.from = config.from;
@@ -56,6 +100,7 @@ class CallSession {
             call_control_id: this.callControlId,
             tenant_id: this.tenantId,
             requestId: this.requestId,
+            telnyx_track: env_1.env.TELNYX_STREAM_TRACK,
         };
         this.transport =
             config.transportSession ??
@@ -71,13 +116,19 @@ class CallSession {
             env_1.env.WHISPER_URL;
         const sttMode = this.sttConfig?.mode ?? 'whisper_http';
         const provider = (0, registry_1.getProvider)(sttMode);
-        const acceptCodecs = (0, codecDecode_1.parseTelnyxAcceptCodecs)(env_1.env.TELNYX_ACCEPT_CODECS);
-        acceptCodecs.add('PCMU');
-        acceptCodecs.add('PCMA');
-        const usePcm16Ingest = (0, codecDecode_1.shouldUsePcm16Ingest)(acceptCodecs, env_1.env.TELNYX_AMRWB_DECODE, env_1.env.TELNYX_G722_DECODE, env_1.env.TELNYX_OPUS_DECODE);
-        const sttAudioInput = this.transport.mode === 'pstn' && usePcm16Ingest
+        const selectedMode = sttMode === 'http_wav_json' && !env_1.env.ALLOW_HTTP_WAV_JSON ? 'whisper_http' : sttMode;
+        log_1.log.info({
+            event: 'stt_provider_selected',
+            call_control_id: this.callControlId,
+            stt_mode: selectedMode,
+            requested_mode: sttMode,
+            provider_id: provider.id,
+            ...(this.logContext ?? {}),
+        }, 'stt provider selected');
+        const sttAudioInput = this.transport.mode === 'pstn'
             ? { codec: 'pcm16le', sampleRateHz: env_1.env.TELNYX_TARGET_SAMPLE_RATE }
             : this.transport.audioInput;
+        this.rxSampleRateHz = sttAudioInput.sampleRateHz;
         this.stt = new chunkedSTT_1.ChunkedSTT({
             provider,
             whisperUrl: sttEndpointUrl,
@@ -89,9 +140,13 @@ class CallSession {
             onTranscript: async (text, source) => {
                 await this.handleTranscript(text, source);
             },
-            onSpeechStart: () => {
-                void this.handleSpeechStart();
+            onSpeechStart: (info) => {
+                void this.handleSpeechStart(info);
             },
+            isPlaybackActive: () => this.isPlaybackActive(),
+            isListening: () => this.isListening(),
+            getTrack: () => env_1.env.TELNYX_STREAM_TRACK,
+            getCodec: () => this.transport.audioInput.codec,
             logContext: this.logContext,
         });
     }
@@ -121,6 +176,7 @@ class CallSession {
         if (!this.active || this.state === 'ENDED') {
             return;
         }
+        this.lastDecodedFrameAtMs = Date.now();
         if (this.state === 'INIT' || this.state === 'ANSWERED') {
             this.enterListeningState();
         }
@@ -128,7 +184,67 @@ class CallSession {
             this.scheduleDeadAirTimer();
         }
         this.metrics.lastHeardAt = new Date();
+        // Never gate STT audio feed on playback state; transcript handling is gated separately.
+        (0, metrics_1.incSttFramesFed)();
+        this.maybeCaptureRxDump(frame);
         this.stt.ingest(frame);
+    }
+    onPcm16Frame(frame) {
+        if (!this.active || this.state === 'ENDED') {
+            return;
+        }
+        this.lastDecodedFrameAtMs = Date.now();
+        if (this.state === 'INIT' || this.state === 'ANSWERED') {
+            this.enterListeningState();
+        }
+        this.metrics.lastHeardAt = new Date();
+        if (frame.sampleRateHz !== this.rxSampleRateHz) {
+            log_1.log.warn({
+                event: 'stt_sample_rate_mismatch',
+                expected_hz: this.rxSampleRateHz,
+                got_hz: frame.sampleRateHz,
+                ...this.logContext,
+            }, 'stt sample rate mismatch');
+        }
+        const pcmBuffer = Buffer.from(frame.pcm16.buffer, frame.pcm16.byteOffset, frame.pcm16.byteLength);
+        (0, metrics_1.incSttFramesFed)();
+        this.maybeCaptureRxDump(pcmBuffer);
+        this.stt.ingestPcm16(frame.pcm16, frame.sampleRateHz);
+    }
+    isPlaybackActive() {
+        if (!this.active || this.state === 'ENDED') {
+            return false;
+        }
+        return this.playbackState.active || this.state === 'SPEAKING' || this.ttsSegmentQueueDepth > 0;
+    }
+    isListening() {
+        return this.state === 'LISTENING';
+    }
+    getLastSpeechStartAtMs() {
+        return this.lastSpeechStartAtMs;
+    }
+    notifyIngestFailure(reason) {
+        if (!this.active || this.state === 'ENDED') {
+            return;
+        }
+        if (this.ingestFailurePrompted || this.repromptInFlight) {
+            return;
+        }
+        this.ingestFailurePrompted = true;
+        this.repromptInFlight = true;
+        this.stt.stop();
+        const turnId = `ingest-${this.nextTurnId()}`;
+        log_1.log.warn({ event: 'call_session_ingest_failure_prompt', reason, ...this.logContext }, 'ingest failure prompt');
+        void this.playText("I'm having trouble hearing you. Please try again.", turnId)
+            .catch((error) => {
+            log_1.log.warn({ err: error, ...this.logContext }, 'ingest failure reprompt failed');
+        })
+            .finally(() => {
+            this.repromptInFlight = false;
+            if (this.state === 'LISTENING') {
+                this.scheduleDeadAirTimer();
+            }
+        });
     }
     end() {
         if (this.state === 'ENDED') {
@@ -203,6 +319,10 @@ class CallSession {
         if (this.active && this.state === 'SPEAKING') {
             this.enterListeningState();
         }
+        if (this.active && this.state === 'LISTENING') {
+            this.flushDeferredTranscript();
+        }
+        this.startRxDumpAfterPlayback();
     }
     createPlaybackStopSignal() {
         let resolve;
@@ -220,6 +340,7 @@ class CallSession {
         this.playbackState.segmentId = segmentId;
         this.state = 'SPEAKING';
         this.clearDeadAirTimer();
+        this.resetRxDump();
     }
     resolvePlaybackStopSignal() {
         if (this.playbackStopSignal) {
@@ -234,6 +355,17 @@ class CallSession {
     invalidateTranscriptHandling() {
         this.transcriptHandlingToken += 1;
         this.isHandlingTranscript = false;
+    }
+    flushDeferredTranscript() {
+        if (!this.deferredTranscript) {
+            return;
+        }
+        if (!this.active || this.state !== 'LISTENING' || this.isHandlingTranscript) {
+            return;
+        }
+        const deferred = this.deferredTranscript;
+        this.deferredTranscript = undefined;
+        void this.handleTranscript(deferred.text, deferred.source);
     }
     logTtsBytesReady(id, audio, contentType) {
         const header = (0, wavInfo_1.describeWavHeader)(audio);
@@ -295,6 +427,7 @@ class CallSession {
     }
     resetTranscriptTracking() {
         this.transcriptAcceptedForUtterance = false;
+        this.deferredTranscript = undefined;
         this.firstPartialAt = undefined;
     }
     shouldTriggerPartialFastPath(text) {
@@ -305,10 +438,11 @@ class CallSession {
             return true;
         return trimmed.length >= PARTIAL_FAST_PATH_MIN_CHARS;
     }
-    handleSpeechStart() {
+    handleSpeechStart(info) {
         if (!this.active || this.state === 'ENDED') {
             return;
         }
+        this.lastSpeechStartAtMs = Date.now();
         this.resetTranscriptTracking();
         const playbackActive = this.playbackState.active || this.state === 'SPEAKING' || this.ttsSegmentQueueDepth > 0;
         if (!playbackActive || this.playbackState.interrupted) {
@@ -318,6 +452,10 @@ class CallSession {
             event: 'barge_in',
             reason: 'speech_start',
             state: this.state,
+            speech_rms: info.rms,
+            speech_peak: info.peak,
+            speech_frame_ms: Math.round(info.frameMs),
+            speech_frame_streak: info.streak,
             ...this.logContext,
         }, 'barge in');
         this.playbackState.active = false;
@@ -342,6 +480,7 @@ class CallSession {
             return;
         }
         this.state = 'LISTENING';
+        this.listeningSinceAtMs = Date.now();
         this.scheduleDeadAirTimer();
     }
     scheduleDeadAirTimer() {
@@ -360,13 +499,92 @@ class CallSession {
             this.deadAirTimer = undefined;
         }
     }
+    startRxDumpAfterPlayback() {
+        if (!env_1.env.STT_DEBUG_DUMP_RX_WAV) {
+            return;
+        }
+        this.rxDumpActive = true;
+        this.rxDumpSamplesTarget = Math.max(1, Math.round(this.rxSampleRateHz * 2));
+        this.rxDumpSamplesCollected = 0;
+        this.rxDumpBuffers = [];
+    }
+    resetRxDump() {
+        this.rxDumpActive = false;
+        this.rxDumpSamplesCollected = 0;
+        this.rxDumpSamplesTarget = 0;
+        this.rxDumpBuffers = [];
+    }
+    maybeCaptureRxDump(frame) {
+        if (!this.rxDumpActive) {
+            return;
+        }
+        const sampleCount = Math.floor(frame.length / 2);
+        if (sampleCount <= 0) {
+            return;
+        }
+        this.rxDumpBuffers.push(Buffer.from(frame));
+        this.rxDumpSamplesCollected += sampleCount;
+        if (this.rxDumpSamplesCollected >= this.rxDumpSamplesTarget) {
+            void this.flushRxDump();
+        }
+    }
+    async flushRxDump() {
+        if (!this.rxDumpActive) {
+            return;
+        }
+        this.rxDumpActive = false;
+        const pcmBuffer = Buffer.concat(this.rxDumpBuffers);
+        this.rxDumpBuffers = [];
+        if (pcmBuffer.length === 0) {
+            return;
+        }
+        const dir = resolveDebugDir();
+        const filePath = path_1.default.join(dir, `rx_after_playback_${this.callControlId}_${Date.now()}.wav`);
+        try {
+            await fs_1.default.promises.mkdir(dir, { recursive: true });
+            const wav = encodePcm16Wav(pcmBuffer, this.rxSampleRateHz);
+            await fs_1.default.promises.writeFile(filePath, wav);
+            log_1.log.info({
+                event: 'stt_debug_rx_wav_written',
+                file_path: filePath,
+                sample_rate_hz: this.rxSampleRateHz,
+                bytes: wav.length,
+                ...this.logContext,
+            }, 'stt debug rx wav written');
+        }
+        catch (error) {
+            log_1.log.warn({ err: error, file_path: filePath, ...this.logContext }, 'stt debug rx wav write failed');
+        }
+    }
     async handleDeadAirTimeout() {
-        // FIX (TS2367): remove redundant `this.state === 'ENDED'` check.
-        // If state isn't LISTENING, we already return.
         if (!this.active || this.state !== 'LISTENING' || this.repromptInFlight) {
             return;
         }
+        // If we're currently processing a transcript, don't reprompt.
         if (this.isHandlingTranscript) {
+            this.scheduleDeadAirTimer();
+            return;
+        }
+        const now = Date.now();
+        // 1) Grace right after we enter LISTENING (prevents greet/playback -> listening race)
+        if (this.listeningSinceAtMs > 0 && now - this.listeningSinceAtMs < this.deadAirListeningGraceMs) {
+            this.scheduleDeadAirTimer();
+            return;
+        }
+        // 2) If we recently detected speech start, assume user is talking and STT is behind.
+        if (this.lastSpeechStartAtMs > 0 && now - this.lastSpeechStartAtMs < this.deadAirAfterSpeechStartGraceMs) {
+            this.scheduleDeadAirTimer();
+            return;
+        }
+        // 3) If we are still receiving frames recently, don't reprompt.
+        // If frames are still arriving, do NOT treat this as "no-frames" dead air.
+        if (this.lastDecodedFrameAtMs > 0 && now - this.lastDecodedFrameAtMs < this.deadAirNoFramesMs) {
+            // frames are alive; just wait for next deadAirMs tick
+            this.scheduleDeadAirTimer();
+            return;
+        }
+        // 4) Extra safety: never reprompt if playback/tts is active (should already be true, but safe)
+        if (this.isPlaybackActive()) {
             this.scheduleDeadAirTimer();
             return;
         }
@@ -378,12 +596,13 @@ class CallSession {
         finally {
             this.repromptInFlight = false;
             if (this.state === 'LISTENING') {
+                this.listeningSinceAtMs = Date.now(); // reset grace so it doesn't immediately fire again
                 this.scheduleDeadAirTimer();
             }
         }
     }
     async handleTranscript(text, transcriptSource) {
-        if (!this.active || this.state !== 'LISTENING' || this.isHandlingTranscript) {
+        if (!this.active || this.state === 'ENDED' || this.isHandlingTranscript) {
             return;
         }
         const trimmed = text.trim();
@@ -391,6 +610,7 @@ class CallSession {
             return;
         }
         const isPartial = transcriptSource === 'partial_fallback';
+        const trigger = isPartial ? 'partial' : 'final';
         if (this.transcriptAcceptedForUtterance) {
             return;
         }
@@ -400,8 +620,24 @@ class CallSession {
         if (isPartial && !this.shouldTriggerPartialFastPath(trimmed)) {
             return;
         }
+        const playbackActive = this.playbackState.active || this.ttsSegmentQueueDepth > 0;
+        if (playbackActive && !this.playbackState.interrupted) {
+            const existing = this.deferredTranscript;
+            if (!existing || trigger === 'final' || existing.source !== 'final') {
+                this.deferredTranscript = { text: trimmed, source: transcriptSource };
+            }
+            log_1.log.info({
+                event: 'transcript_deferred_playback',
+                trigger,
+                transcript_length: trimmed.length,
+                state: this.state,
+                playback_active: this.playbackState.active,
+                tts_queue_depth: this.ttsSegmentQueueDepth,
+                ...this.logContext,
+            }, 'transcript deferred during playback');
+            return;
+        }
         const tenantLabel = this.tenantId ?? 'unknown';
-        const trigger = isPartial ? 'partial' : 'final';
         const responseStartAt = Date.now();
         if (isPartial && this.firstPartialAt) {
             (0, metrics_1.observeStageDuration)('stt_first_partial_to_response_ms', tenantLabel, responseStartAt - this.firstPartialAt);

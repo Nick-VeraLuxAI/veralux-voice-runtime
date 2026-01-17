@@ -31,6 +31,26 @@ const sttRmsFloorFallback = (value) => {
         return normalized;
     return emptyToUndefined(process.env.STT_RMS_THRESHOLD);
 };
+const numberFromEnv = (value) => {
+    if (typeof value === 'boolean')
+        return NaN;
+    if (typeof value === 'string') {
+        const trimmed = value.trim();
+        if (trimmed === '')
+            return undefined;
+        const normalized = trimmed.toLowerCase();
+        if (normalized === 'true' || normalized === 'false')
+            return NaN;
+        return trimmed;
+    }
+    return value;
+};
+const sttFramesRequiredFallback = (value) => {
+    const normalized = numberFromEnv(value);
+    if (normalized !== undefined)
+        return normalized;
+    return numberFromEnv(process.env.STT_FRAMES_REQUIRED);
+};
 const ttsSampleRateFallback = (value) => {
     const normalized = emptyToUndefined(value);
     if (normalized !== undefined)
@@ -51,8 +71,17 @@ const EnvSchema = zod_1.z.object({
     TELNYX_STREAM_TRACK: zod_1.z
         .enum(['inbound_track', 'outbound_track', 'both_tracks'])
         .default('inbound_track'),
+    TELNYX_STREAM_CODEC: zod_1.z.preprocess(emptyToUndefined, zod_1.z.string().optional()),
     TELNYX_SKIP_SIGNATURE: zod_1.z.preprocess(stringToBoolean, zod_1.z.boolean().default(false)),
     TELNYX_ACCEPT_CODECS: zod_1.z.preprocess(emptyToUndefined, zod_1.z.string().default('PCMU')),
+    TELNYX_STREAM_RESTART_MAX: zod_1.z.preprocess(emptyToUndefined, zod_1.z.coerce.number().int().nonnegative().default(1)),
+    TELNYX_INGEST_HEALTH_GRACE_MS: zod_1.z.preprocess(emptyToUndefined, zod_1.z.coerce.number().int().nonnegative().default(1200)),
+    TELNYX_INGEST_HEALTH_ENABLED: zod_1.z.preprocess(stringToBoolean, zod_1.z.boolean().default(true)),
+    TELNYX_INGEST_HEALTH_RESTART_ENABLED: zod_1.z.preprocess(stringToBoolean, zod_1.z.boolean().default(true)),
+    TELNYX_INGEST_POST_PLAYBACK_GRACE_MS: zod_1.z.preprocess(emptyToUndefined, zod_1.z.coerce.number().int().nonnegative().default(1200)),
+    TELNYX_INGEST_MIN_AUDIO_MS_SINCE_PLAYBACK_END: zod_1.z.preprocess(emptyToUndefined, zod_1.z.coerce.number().int().nonnegative().default(2000)),
+    TELNYX_AMRWB_MIN_DECODED_BYTES: zod_1.z.preprocess(emptyToUndefined, zod_1.z.coerce.number().int().positive().default(320)),
+    TELNYX_INGEST_DECODE_FAILURES_BEFORE_FALLBACK: zod_1.z.preprocess(emptyToUndefined, zod_1.z.coerce.number().int().positive().default(3)),
     TELNYX_TARGET_SAMPLE_RATE: zod_1.z.preprocess(emptyToUndefined, zod_1.z.coerce.number().int().positive().default(16000)),
     TELNYX_OPUS_DECODE: zod_1.z.preprocess(stringToBoolean, zod_1.z.boolean().default(false)),
     TELNYX_G722_DECODE: zod_1.z.preprocess(stringToBoolean, zod_1.z.boolean().default(false)),
@@ -64,6 +93,7 @@ const EnvSchema = zod_1.z.object({
     AUDIO_STORAGE_DIR: zod_1.z.string().min(1),
     /* ───────────────────────── STT (Whisper) ───────────────────────── */
     WHISPER_URL: zod_1.z.string().min(1),
+    ALLOW_HTTP_WAV_JSON: zod_1.z.preprocess(stringToBoolean, zod_1.z.boolean().default(false)),
     STT_CHUNK_MS: zod_1.z.coerce.number().int().positive(),
     STT_SILENCE_MS: zod_1.z.coerce.number().int().positive(),
     STT_MIN_SECONDS: zod_1.z.preprocess(emptyToUndefined, zod_1.z.coerce.number().positive().default(0.6)),
@@ -78,13 +108,25 @@ const EnvSchema = zod_1.z.object({
     FINAL_MIN_SECONDS: zod_1.z.preprocess(emptyToUndefined, zod_1.z.coerce.number().positive().default(1.0)),
     FINAL_MIN_BYTES: zod_1.z.preprocess(emptyToUndefined, zod_1.z.coerce.number().int().positive().optional()),
     /* Speech detection thresholds */
+    STT_RMS_FLOOR: zod_1.z.preprocess(emptyToUndefined, zod_1.z.coerce.number().positive().default(0.015)),
+    STT_PEAK_FLOOR: zod_1.z.preprocess(emptyToUndefined, zod_1.z.coerce.number().positive().default(0.05)),
+    STT_DISABLE_GATES: zod_1.z.preprocess(stringToBoolean, zod_1.z.boolean().default(false)),
     STT_SPEECH_RMS_FLOOR: zod_1.z.preprocess(sttRmsFloorFallback, zod_1.z.coerce.number().positive().default(0.03)),
     STT_SPEECH_PEAK_FLOOR: zod_1.z.preprocess(emptyToUndefined, zod_1.z.coerce.number().positive().default(0.05)),
-    STT_SPEECH_FRAMES_REQUIRED: zod_1.z.preprocess(emptyToUndefined, zod_1.z.coerce.number().int().positive().optional()),
+    STT_SPEECH_FRAMES_REQUIRED: zod_1.z.preprocess(sttFramesRequiredFallback, zod_1.z.coerce.number().int().positive().optional()),
     /* Partial transcription */
     STT_PARTIAL_INTERVAL_MS: zod_1.z.preprocess(emptyToUndefined, zod_1.z.coerce.number().int().positive().default(250)),
+    STT_PARTIAL_MIN_MS: zod_1.z.preprocess(emptyToUndefined, zod_1.z.coerce.number().int().positive().default(600)),
+    /* STT input DSP */
+    STT_HIGHPASS_ENABLED: zod_1.z.preprocess(stringToBoolean, zod_1.z.boolean().default(true)),
+    STT_HIGHPASS_CUTOFF_HZ: zod_1.z.preprocess(emptyToUndefined, zod_1.z.coerce.number().int().positive().default(100)),
+    /* STT debug dumps */
+    STT_DEBUG_DUMP_WHISPER_WAVS: zod_1.z.preprocess(stringToBoolean, zod_1.z.boolean().default(false)),
+    STT_DEBUG_DUMP_PCM16: zod_1.z.preprocess(stringToBoolean, zod_1.z.boolean().default(false)),
+    STT_DEBUG_DUMP_RX_WAV: zod_1.z.preprocess(stringToBoolean, zod_1.z.boolean().default(false)),
     /* Dead air protection */
     DEAD_AIR_MS: zod_1.z.coerce.number().int().positive(),
+    DEAD_AIR_NO_FRAMES_MS: zod_1.z.preprocess(emptyToUndefined, zod_1.z.coerce.number().int().positive().default(1500)),
     /* ───────────────────────── TTS ───────────────────────── */
     KOKORO_URL: zod_1.z.string().min(1),
     KOKORO_VOICE_ID: zod_1.z.preprocess(emptyToUndefined, zod_1.z.string().min(1).optional()),

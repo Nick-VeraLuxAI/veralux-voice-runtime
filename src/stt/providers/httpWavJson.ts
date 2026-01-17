@@ -1,7 +1,9 @@
 import { log } from '../../log';
+import { encodePcm16ToWav } from '../../audio/postprocess';
 import type { STTProvider } from '../provider';
 import type { STTAudioInput, STTOptions, STTTranscript } from '../types';
 import { probeWav } from '../../diagnostics/audioProbe';
+import { assertLooksLikeWav, looksLikeWav } from '../wavGuard';
 
 const mediaDebugEnabled = (): boolean => {
   const value = process.env.MEDIA_DEBUG;
@@ -24,7 +26,20 @@ export class HttpWavJsonProvider implements STTProvider {
       throw new Error('http_wav_json expects WAV input');
     }
 
-    probeWav('stt.submit.wav', audio.audio, {
+    const wavPayload = looksLikeWav(audio.audio)
+      ? audio.audio
+      : encodePcm16ToWav(
+          new Int16Array(audio.audio.buffer, audio.audio.byteOffset, Math.floor(audio.audio.byteLength / 2)),
+          audio.sampleRateHz || 16000,
+        );
+
+    assertLooksLikeWav(wavPayload, {
+      provider: 'http_wav_json',
+      wav_bytes: wavPayload.length,
+      ...(opts.logContext ?? {}),
+    });
+
+    probeWav('stt.submit.wav', wavPayload, {
       ...(opts.audioMeta ?? {}),
       logContext: opts.logContext ?? opts.audioMeta?.logContext,
       format: 'wav',
@@ -33,7 +48,7 @@ export class HttpWavJsonProvider implements STTProvider {
 
     if (mediaDebugEnabled()) {
       log.info(
-        { event: 'stt_http_wav_json_request', wav_bytes: audio.audio.length },
+        { event: 'stt_http_wav_json_request', wav_bytes: wavPayload.length },
         'stt http wav json request',
       );
     }
@@ -43,7 +58,7 @@ export class HttpWavJsonProvider implements STTProvider {
       headers: {
         'Content-Type': 'audio/wav',
       },
-      body: new Uint8Array(audio.audio),
+      body: new Uint8Array(wavPayload),
       signal: opts.signal,
     });
 

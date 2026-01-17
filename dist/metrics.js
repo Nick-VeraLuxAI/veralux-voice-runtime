@@ -8,6 +8,9 @@ exports.metricsHandler = metricsHandler;
 exports.startStageTimer = startStageTimer;
 exports.observeStageDuration = observeStageDuration;
 exports.incStageError = incStageError;
+exports.incInboundAudioFrames = incInboundAudioFrames;
+exports.incSttFramesFed = incSttFramesFed;
+exports.incInboundAudioFramesDropped = incInboundAudioFramesDropped;
 const prom_client_1 = __importDefault(require("prom-client"));
 /**
  * Runtime Prometheus metrics
@@ -44,6 +47,22 @@ const stageErrorsTotal = new prom_client_1.default.Counter({
     name: `${METRICS_PREFIX}stage_errors_total`,
     help: 'Count of errors by stage (STT/LLM/TTS/etc.)',
     labelNames: ['stage', 'tenant'],
+    registers: [register],
+});
+const inboundAudioFramesTotal = new prom_client_1.default.Counter({
+    name: `${METRICS_PREFIX}inbound_audio_frames_total`,
+    help: 'Inbound audio frames received (pre-STT)',
+    registers: [register],
+});
+const sttFramesFedTotal = new prom_client_1.default.Counter({
+    name: `${METRICS_PREFIX}stt_frames_fed_total`,
+    help: 'Audio frames fed into STT ingest',
+    registers: [register],
+});
+const inboundAudioFramesDroppedTotal = new prom_client_1.default.Counter({
+    name: `${METRICS_PREFIX}inbound_audio_frames_dropped_total`,
+    help: 'Inbound audio frames dropped before STT',
+    labelNames: ['reason'],
     registers: [register],
 });
 // ---------- helpers ----------
@@ -119,5 +138,15 @@ function observeStageDuration(stage, tenant, durationMs) {
 }
 function incStageError(stage, tenant) {
     stageErrorsTotal.inc({ stage, tenant: tenant ?? 'unknown' });
+}
+function incInboundAudioFrames(count = 1) {
+    inboundAudioFramesTotal.inc(count);
+}
+function incSttFramesFed(count = 1) {
+    sttFramesFedTotal.inc(count);
+}
+function incInboundAudioFramesDropped(reason, count = 1) {
+    const label = reason && reason.trim() !== '' ? reason : 'unknown';
+    inboundAudioFramesDroppedTotal.inc({ reason: label }, count);
 }
 //# sourceMappingURL=metrics.js.map
