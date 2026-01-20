@@ -4,7 +4,6 @@ import path from 'path';
 import crypto from 'crypto';
 
 import { closeTelnyxCodecState, decodeTelnyxPayloadToPcm16, type TelnyxCodecState } from '../audio/codecDecode';
-import { depacketizeAmrWbBandwidthEfficientNoCmr } from '../audio/amrwbRtp';
 import { prepareAmrWbPayload } from '../audio/prepareAmrWbPayload';
 import { DebugAudioTap } from '../audio/debugAudioTap';
 
@@ -242,12 +241,18 @@ function isLikelyAmrwbSpeechPayload(payload: Buffer): boolean {
 
 function looksLikeTelnyxNoCmrToc33(buf: Buffer): boolean {
   if (buf.length !== 33) return false;
-  const first = buf[0] ?? 0;
-  const hi = (first >> 4) & 0x0f;
-  const lo = first & 0x0f;
-  const qSet = (first & 0x04) !== 0;
-  return hi === 0x0f && lo <= 9 && qSet;
+  const toc = buf[0] ?? 0;
+  const ft = (toc >> 3) & 0x0f;
+  const qSet = (toc & 0x04) !== 0;
+
+  // valid speech FT are 0..9 (10-13 invalid, 14 lost, 15 no-data)
+  if (!qSet) return false;
+  if (ft >= 10) return false;
+
+  // In your observed case we expect FT=2 most of the time => toc == 0x14
+  return true;
 }
+
 
 function looksLikeWavRiff(buf: Buffer): boolean {
   if (buf.length < 12) return false;
@@ -779,31 +784,6 @@ export class MediaIngestHealthMonitor {
 
 /* --------------------------------- ingest --------------------------------- */
 
-class SlidingHashDedupe {
-  private readonly max: number;
-  private readonly q: string[] = [];
-  private readonly set = new Set<string>();
-
-  constructor(max = 1024) {
-    this.max = Math.max(64, max);
-  }
-
-  /** returns true if this key is already present */
-  seen(key: string): boolean {
-    if (this.set.has(key)) return true;
-    this.set.add(key);
-    this.q.push(key);
-    while (this.q.length > this.max) {
-      const old = this.q.shift();
-      if (old) this.set.delete(old);
-    }
-    return false;
-  }
-}
-
-function sha1Hex(buf: Buffer): string {
-  return crypto.createHash('sha1').update(buf).digest('hex');
-}
 
 export class MediaIngest {
   private readonly callControlId: string;
@@ -871,10 +851,15 @@ export class MediaIngest {
   private amrwbCaptureDisabled = false;
   private amrwbCaptureErrorLogged = false;
 
-  // ---- Telnyx duplicate payload defense ----
-  private readonly telnyxDedupe = new SlidingHashDedupe(2048);
-  private telnyxDupDropped = 0;
-  private telnyxDupKept = 0;
+  
+
+  // ---- AMR-WB adjacent duplicate defense (lag-1) ----
+  // Keyed by stream_id + normalizedTrack (inbound/outbound) so streams don't poison each other.
+  private lastAmrwbFrameHashByKey = new Map<string, Buffer>();
+
+  private telnyxAdjDupDropped = 0;
+  private telnyxAdjDupKept = 0;
+
 
   // Optional: hard pin codec to prevent flip-flop (policy)
   private pinnedCodec?: string;
@@ -1190,49 +1175,134 @@ export class MediaIngest {
       );
     }
 
-    this.frameSeq += 1;
+    // --------------------------------------------------------------------------------
+    // Prefer Telnyx seq if present; fall back to a local monotonic counter.
+    // IMPORTANT: do NOT bump local counter until we know we’re keeping the frame.
+    // --------------------------------------------------------------------------------
+    const telnyxSeq = seqNum; // already computed above via getTelnyxSequence(message)
+    const seqForPipeline = typeof telnyxSeq === 'number' && Number.isFinite(telnyxSeq) ? telnyxSeq : undefined;
 
+    // We still keep a local counter for when Telnyx seq is missing.
+    // NOTE: we will assign it later (after gating) only if needed.
+    let localSeqAssigned: number | undefined;
+
+    // --------------------------------------------------------------
+    // decode base64 -> bytes (NO hashing yet)
+    // --------------------------------------------------------------
     let buffer: Buffer;
     let encodingUsed: Base64Encoding = 'base64';
     let trimmedPayload = payload.trim();
     const payloadLooksBase64 = looksLikeBase64(trimmedPayload);
     const base64Len = trimmedPayload.length;
 
-    // Strong dedupe: base64 string OR decoded bytes
     try {
       const decoded = decodeTelnyxPayloadWithInfo(trimmedPayload);
       buffer = decoded.buffer;
       encodingUsed = decoded.encoding;
       trimmedPayload = decoded.trimmed;
-
-      const dedupeKey = sha1Hex(buffer);
-      if (this.telnyxDedupe.seen(dedupeKey)) {
-        this.telnyxDupDropped += 1;
-        log.warn(
-          {
-            event: 'telnyx_payload_dedup_dropped',
-            call_control_id: this.callControlId,
-            seq: this.frameSeq,
-            decoded_len: buffer.length,
-            dropped_total: this.telnyxDupDropped,
-            kept_total: this.telnyxDupKept,
-            ...(this.logContext ?? {}),
-          },
-          'dropping duplicate Telnyx media payload by hash',
-        );
-        return;
-      }
-      this.telnyxDupKept += 1;
     } catch (error) {
       this.logMediaPayloadDebug(base64Len, null, payloadSource, 'decode_failed');
-      log.warn({ event: 'media_ws_decode_failed', call_control_id: this.callControlId, err: error }, 'media ws decode failed');
+      log.warn(
+        { event: 'media_ws_decode_failed', call_control_id: this.callControlId, err: error },
+        'media ws decode failed',
+      );
       return;
     }
 
+    // NOTE: currentCodec was already computed earlier (do NOT redeclare it here).
+    // Use the existing variable that was used for candidate selection.
+    // const currentCodec = normalizeCodec(this.mediaEncoding);
+
+    // basic "decoded bytes too short" gate (same as your existing logic)
+    const minDecodedLen = currentCodec === 'AMR-WB' ? 2 : 10;
+    if (buffer.length < minDecodedLen) {
+      log.info(
+        {
+          event: 'media_payload_suspicious',
+          call_control_id: this.callControlId,
+          codec: currentCodec,
+          payload_len: trimmedPayload.length,
+          decoded_len: buffer.length,
+          payload_source: payloadSource,
+          telnyx_seq: seqForPipeline ?? null,
+          ...(this.logContext ?? {}),
+        },
+        'media payload too short',
+      );
+      this.healthMonitor.recordPayload(trimmedPayload.length, buffer.length, 0, 0, false);
+      this.checkHealth(currentCodec);
+      return;
+    }
+
+    // track gating FIRST (so outbound frames never enter dedupe or decode path)
+    if (this.expectedTrack && this.expectedTrack !== 'both_tracks' && normalizedTrack && this.expectedTrack !== normalizedTrack) {
+      if (normalizedTrack === 'outbound') this.rxFramesOutboundSkipped += 1;
+      else this.rxFramesUnknownTrackSkipped += 1;
+
+      log.info(
+        {
+          event: 'media_track_skipped',
+          call_control_id: this.callControlId,
+          expected_track: this.expectedTrack,
+          got_track: normalizedTrack,
+          telnyx_seq: seqForPipeline ?? null,
+          bytes: buffer.length,
+          ...(this.logContext ?? {}),
+        },
+        'media track skipped',
+      );
+      return;
+    }
+
+    if (normalizedTrack === 'inbound') this.rxFramesInbound += 1;
+
+    // Assign local seq only after we know we’re keeping the frame.
+    if (seqForPipeline === undefined) {
+      this.frameSeq += 1;
+      localSeqAssigned = this.frameSeq;
+    }
+
+    // Canonical seq used everywhere downstream.
+    const finalSeq = seqForPipeline ?? (localSeqAssigned as number);
+    // --------------------------------------------------------------
+    // AMR-WB adjacent-frame dedupe (lag-1 only, per stream+track)
+    // --------------------------------------------------------------
+    if (currentCodec === 'AMR-WB') {
+      const dedupeKey = `${this.callControlId}:${this.activeStreamId ?? 'nostream'}:${normalizedTrack ?? 'notrack'}`;
+
+      const h = crypto.createHash('sha1').update(buffer).digest(); // Buffer(20)
+      const prev = this.lastAmrwbFrameHashByKey.get(dedupeKey);
+
+      if (prev && prev.equals(h)) {
+        this.telnyxAdjDupDropped += 1;
+        log.warn(
+          {
+            event: 'amrwb_adjacent_duplicate_dropped',
+            call_control_id: this.callControlId,
+            stream_id: this.activeStreamId ?? null,
+            track: normalizedTrack ?? null,
+            seq: finalSeq,
+            dropped_total: this.telnyxAdjDupDropped,
+            kept_total: this.telnyxAdjDupKept,
+            ...(this.logContext ?? {}),
+          },
+          'dropping adjacent duplicate AMR-WB frame',
+        );
+        return;
+      }
+
+      this.lastAmrwbFrameHashByKey.set(dedupeKey, h);
+      this.telnyxAdjDupKept += 1;
+    }
+
+    
+    // --------------------------------------------------------------------------
+    // From this point on, ALWAYS use finalSeq (not this.frameSeq)
     // --------------------------------------------------------------------------
 
     void this.maybeDumpMediaFrame(trimmedPayload, buffer);
-    this.queueAmrwbTruthCapture(buffer, this.frameSeq);
+    
+    this.queueAmrwbTruthCapture(buffer, finalSeq);
 
     this.logMediaPayloadDebug(base64Len, buffer, payloadSource);
 
@@ -1261,7 +1331,6 @@ export class MediaIngest {
 
       const payloadPrefix = redactInline(trimmedPayload.slice(0, 64));
       const decodedPrefixHex = buffer.subarray(0, 32).toString('hex');
-      const seqForCap = this.frameSeq;
       const timestamp = typeof media?.timestamp === 'number' ? (media.timestamp as number) : undefined;
 
       const notAudio = currentCodec === 'AMR-WB' ? buffer.length < 20 : buffer.length < 10;
@@ -1307,14 +1376,14 @@ export class MediaIngest {
           data_track: trackFields.dataTrack ?? null,
           resolved_track: resolvedTrack ?? null,
         },
-        seq: seqForCap,
+        seq: finalSeq,
         timestamp,
         payload_base64: payloadLooksBase64,
         not_audio: notAudio,
         amrwb_parse: amrwbParse,
       });
 
-      void dumpCaptureFrame(capture, this.callControlId, seqForCap, trimmedPayload);
+      void dumpCaptureFrame(capture, this.callControlId, finalSeq, trimmedPayload);
 
       if (capture.startedAtMs && (Date.now() > (capture.endAtMs ?? 0) || capture.frameCount >= TELNYX_CAPTURE_MAX_FRAMES)) {
         finalizeCapture(capture, 'capture_window_elapsed');
@@ -1323,50 +1392,6 @@ export class MediaIngest {
       }
     }
 
-    // basic "decoded bytes too short" gate
-    const minDecodedLen = currentCodec === 'AMR-WB' ? 2 : 10;
-    if (buffer.length < minDecodedLen) {
-      log.info(
-        {
-          event: 'media_payload_suspicious',
-          call_control_id: this.callControlId,
-          codec: currentCodec,
-          payload_len: trimmedPayload.length,
-          decoded_len: buffer.length,
-          payload_source: payloadSource,
-          frame_seq: this.frameSeq,
-          track: resolvedTrack ?? null,
-          ...(this.logContext ?? {}),
-        },
-        'media payload too short',
-      );
-      this.healthMonitor.recordPayload(trimmedPayload.length, buffer.length, 0, 0, false);
-      this.checkHealth(currentCodec);
-      return;
-    }
-
-    // track gating (don’t emit/accept payload if it will be dropped)
-    if (this.expectedTrack && this.expectedTrack !== 'both_tracks' && normalizedTrack && this.expectedTrack !== normalizedTrack) {
-      if (normalizedTrack === 'outbound') this.rxFramesOutboundSkipped += 1;
-      else this.rxFramesUnknownTrackSkipped += 1;
-
-      log.info(
-        {
-          event: 'media_track_skipped',
-          call_control_id: this.callControlId,
-          expected_track: this.expectedTrack,
-          got_track: normalizedTrack,
-          frame_seq: this.frameSeq,
-          bytes: buffer.length,
-          ...(this.logContext ?? {}),
-        },
-        'media track skipped',
-      );
-      return;
-    }
-
-    if (normalizedTrack === 'inbound') this.rxFramesInbound += 1;
-
     // ✅ accepted payload tap (post-gating)
     try {
       this.onAcceptedPayload?.({
@@ -1374,7 +1399,7 @@ export class MediaIngest {
         codec: currentCodec,
         track: resolvedTrack ?? null,
         normalizedTrack: normalizedTrack || null,
-        seq: this.frameSeq,
+        seq: finalSeq,
         timestamp: typeof media?.timestamp === 'number' ? (media.timestamp as number) : null,
         payloadSource: payloadSource ?? null,
         payloadLen: trimmedPayload.length,
@@ -1396,12 +1421,14 @@ export class MediaIngest {
       );
     }
 
+    // decode pipeline: use finalSeq
     this.handleEncodedPayload(
       buffer,
       typeof media?.timestamp === 'number' ? (media.timestamp as number) : undefined,
-      this.frameSeq,
+      finalSeq,
       payloadSource,
     );
+
   }
 
   public close(reason: string): void {
@@ -1467,74 +1494,101 @@ export class MediaIngest {
   }
 
   private async captureAmrwbTruthPayload(payload: Buffer, frameIndex: number): Promise<void> {
-    if (!this.amrwbCaptureEnabled || this.amrwbCaptureDisabled) return;
+  if (!this.amrwbCaptureEnabled || this.amrwbCaptureDisabled) return;
 
-    if (!this.amrwbCaptureDirReady) {
-      try {
-        await fs.promises.mkdir(this.amrwbCaptureDir, { recursive: true });
-      } catch (error) {
-        this.amrwbCaptureDisabled = true;
-        this.logAmrwbCaptureErrorOnce(error, 'mkdir');
-        return;
-      }
-      this.amrwbCaptureDirReady = true;
-    }
-
-    const rawPath = path.join(this.amrwbCaptureDir, 'raw_frames.bin');
-    const bePath = path.join(this.amrwbCaptureDir, 'be_converted.awb');
-
+  if (!this.amrwbCaptureDirReady) {
     try {
-      if (!this.amrwbCaptureBeHeaderWritten) {
-        await fs.promises.writeFile(bePath, AMRWB_FILE_HEADER);
-        this.amrwbCaptureBeHeaderWritten = true;
-      }
-      await fs.promises.appendFile(rawPath, payload);
+      await fs.promises.mkdir(this.amrwbCaptureDir, { recursive: true });
     } catch (error) {
       this.amrwbCaptureDisabled = true;
-      this.logAmrwbCaptureErrorOnce(error, 'write_raw');
+      this.logAmrwbCaptureErrorOnce(error, 'mkdir');
       return;
     }
+    this.amrwbCaptureDirReady = true;
+  }
 
-    // ✅ Gate BE capture: only speech frames (33 bytes) should be appended
-    const isSpeech = isLikelyAmrwbSpeechPayload(payload);
+  const rawPath = path.join(this.amrwbCaptureDir, 'raw_frames.bin');
+  const bePath = path.join(this.amrwbCaptureDir, 'be_converted.awb');
 
-    let beAppended = false;
-    let droppedNonSpeech = false;
+  try {
+    if (!this.amrwbCaptureBeHeaderWritten) {
+      await fs.promises.writeFile(bePath, AMRWB_FILE_HEADER);
+      this.amrwbCaptureBeHeaderWritten = true;
+    }
+    await fs.promises.appendFile(rawPath, payload);
+  } catch (error) {
+    this.amrwbCaptureDisabled = true;
+    this.logAmrwbCaptureErrorOnce(error, 'write_raw');
+    return;
+  }
 
-    if (!isSpeech) {
-      droppedNonSpeech = true;
+  // ✅ Gate BE capture: only speech frames (33 bytes) should be appended
+  const isSpeech = isLikelyAmrwbSpeechPayload(payload);
+
+  let beAppended = false;
+  let droppedNonSpeech = false;
+
+  // NEW: explain WHY we did/didn’t append
+  let beCandidateOk = false;
+  let beCandidateReason: string | null = null;
+
+  // NEW: tiny sanity sniff so we know what “shape” this payload is
+  const firstByte = payload.length > 0 ? payload[0] : null;
+  const firstByteHiNibble = firstByte === null ? null : (firstByte >> 4) & 0x0f;
+  const tocFt = firstByte === null ? null : (firstByte >> 3) & 0x0f;
+  const tocQ = firstByte === null ? null : (firstByte & 0x04) !== 0;
+
+  if (!isSpeech) {
+    droppedNonSpeech = true;
+    beCandidateReason = 'not_len_33';
+  } else {
+    const beCandidate = this.buildBeConvertedCandidate(payload);
+    if (!beCandidate) {
+      beCandidateReason = 'build_candidate_returned_null';
     } else {
-      const beCandidate = this.buildBeConvertedCandidate(payload);
-      if (beCandidate) {
-        try {
-          await fs.promises.appendFile(bePath, beCandidate);
-          beAppended = true;
-        } catch (error) {
-          this.amrwbCaptureDisabled = true;
-          this.logAmrwbCaptureErrorOnce(error, 'write_be');
-        }
+      beCandidateOk = true;
+      try {
+        await fs.promises.appendFile(bePath, beCandidate);
+        beAppended = true;
+      } catch (error) {
+        this.amrwbCaptureDisabled = true;
+        this.logAmrwbCaptureErrorOnce(error, 'write_be');
+        beCandidateReason = 'append_be_failed';
       }
     }
-
-    const first8Hex = getHexPrefix(payload, 8);
-    log.info(
-      {
-        event: 'amrwb_truth_capture_frame',
-        call_control_id: this.callControlId,
-        frame_index: frameIndex,
-        payload_len: payload.length,
-        first8_hex: first8Hex,
-        is_speech: isSpeech,
-        dropped_non_speech: droppedNonSpeech,
-        appended_streams: {
-          raw: true,
-          be: beAppended,
-        },
-        ...(this.logContext ?? {}),
-      },
-      `amrwb truth capture callId=${this.callControlId} frame_index=${frameIndex} payload_len=${payload.length} first8_hex=${first8Hex} speech=${isSpeech} dropped_non_speech=${droppedNonSpeech} appended_raw=true appended_be=${beAppended}`,
-    );
   }
+
+  const first8Hex = getHexPrefix(payload, 8);
+
+  log.info(
+    {
+      event: 'amrwb_truth_capture_frame',
+      call_control_id: this.callControlId,
+      frame_index: frameIndex,
+      payload_len: payload.length,
+      first8_hex: first8Hex,
+
+      // what we decided
+      is_speech: isSpeech,
+      dropped_non_speech: droppedNonSpeech,
+      be_candidate_ok: beCandidateOk,
+      be_candidate_reason: beCandidateReason,
+
+      // what the bytes look like (tells us if this is really [TOC + 32])
+      first_byte: firstByte,
+      first_byte_hi_nibble: firstByteHiNibble,
+      toc_ft: tocFt,
+      toc_q: tocQ,
+
+      appended_streams: {
+        raw: true,
+        be: beAppended,
+      },
+      ...(this.logContext ?? {}),
+    },
+    `amrwb truth capture callId=${this.callControlId} frame_index=${frameIndex} payload_len=${payload.length} first8_hex=${first8Hex} speech=${isSpeech} be_ok=${beCandidateOk} be_reason=${beCandidateReason} appended_be=${beAppended}`,
+  );
+}
 
   /* ------------------------------ low-level helpers ----------------------------- */
 
@@ -1720,6 +1774,11 @@ export class MediaIngest {
         'active stream set',
       );
     }
+        // Reset per-call adjacent AMR-WB dedupe state
+        this.lastAmrwbFrameHashByKey.clear();
+        this.telnyxAdjDupDropped = 0;
+        this.telnyxAdjDupKept = 0;
+
 
     const mediaFormat =
       (start.media_format as Record<string, unknown> | undefined) ??
@@ -2219,8 +2278,6 @@ export class MediaIngest {
           rx_frames_outbound_skipped: this.rxFramesOutboundSkipped,
           rx_frames_unknown_track_skipped: this.rxFramesUnknownTrackSkipped,
           force_amrwb_be: this.forceAmrWbBe,
-          telnyx_dedupe_kept: this.telnyxDupKept,
-          telnyx_dedupe_dropped: this.telnyxDupDropped,
           ...(this.logContext ?? {}),
         },
         'media ingest decode stats',
