@@ -8,7 +8,6 @@ exports.normalizeTelnyxTrack = normalizeTelnyxTrack;
 // src/media/mediaIngest.ts
 const fs_1 = __importDefault(require("fs"));
 const path_1 = __importDefault(require("path"));
-const crypto_1 = __importDefault(require("crypto"));
 const codecDecode_1 = require("../audio/codecDecode");
 const prepareAmrWbPayload_1 = require("../audio/prepareAmrWbPayload");
 const debugAudioTap_1 = require("../audio/debugAudioTap");
@@ -636,11 +635,6 @@ class MediaIngest {
         this.amrwbCaptureBeHeaderWritten = false;
         this.amrwbCaptureDisabled = false;
         this.amrwbCaptureErrorLogged = false;
-        // ---- AMR-WB adjacent duplicate defense (lag-1) ----
-        // Keyed by stream_id + normalizedTrack (inbound/outbound) so streams don't poison each other.
-        this.lastAmrwbFrameHashByKey = new Map();
-        this.telnyxAdjDupDropped = 0;
-        this.telnyxAdjDupKept = 0;
         this.frameSeq = 0;
         this.codecState = {};
         this.lastStatsLogAt = 0;
@@ -762,12 +756,7 @@ class MediaIngest {
         if (!this.activeStreamId && msgStreamId) {
             this.activeStreamId = msgStreamId;
             this.lastSeqByStream.set(msgStreamId, -1);
-            log_1.log.info({
-                event: 'telnyx_stream_adopted',
-                call_control_id: this.callControlId,
-                stream_id: msgStreamId,
-                ...(this.logContext ?? {}),
-            }, 'adopted Telnyx stream_id from media frame');
+            log_1.log.info({ event: 'telnyx_stream_adopted', call_control_id: this.callControlId, stream_id: msgStreamId, ...(this.logContext ?? {}) }, 'adopted Telnyx stream_id from media frame');
         }
         // Drop old stream frames
         if (this.activeStreamId && msgStreamId && msgStreamId !== this.activeStreamId) {
@@ -780,8 +769,9 @@ class MediaIngest {
             }, 'dropping media frame from old Telnyx stream_id (restart overlap defense)');
             return;
         }
-        // Drop duplicates/out-of-order by seq
-        if (this.activeStreamId && seqNum !== undefined) {
+        // Seq guard: CHECK now, but DO NOT COMMIT lastSeq until after we decide to keep the frame.
+        let shouldCommitSeq = false;
+        if (this.activeStreamId && typeof seqNum === 'number' && Number.isFinite(seqNum)) {
             const last = this.lastSeqByStream.get(this.activeStreamId) ?? -1;
             if (seqNum <= last) {
                 log_1.log.warn({
@@ -794,7 +784,7 @@ class MediaIngest {
                 }, 'dropping duplicate/out-of-order Telnyx media frame by sequence_number');
                 return;
             }
-            this.lastSeqByStream.set(this.activeStreamId, seqNum);
+            shouldCommitSeq = true;
         }
         // -------------------------------------------------------------------------------
         const media = message.media && typeof message.media === 'object' ? message.media : undefined;
@@ -916,7 +906,8 @@ class MediaIngest {
             trimmedPayload = decoded.trimmed;
         }
         catch (error) {
-            this.logMediaPayloadDebug(base64Len, null, payloadSource, 'decode_failed');
+            // 4th arg = seq (if we have Telnyx seq already), 5th arg = note
+            this.logMediaPayloadDebug(base64Len, null, payloadSource, seqForPipeline, 'decode_failed');
             log_1.log.warn({ event: 'media_ws_decode_failed', call_control_id: this.callControlId, err: error }, 'media ws decode failed');
             return;
         }
@@ -957,6 +948,10 @@ class MediaIngest {
             }, 'media track skipped');
             return;
         }
+        // Commit Telnyx seq ONLY after we decided to keep the frame (post-track-gating)
+        if (shouldCommitSeq && this.activeStreamId && typeof seqNum === 'number' && Number.isFinite(seqNum)) {
+            this.lastSeqByStream.set(this.activeStreamId, seqNum);
+        }
         if (normalizedTrack === 'inbound')
             this.rxFramesInbound += 1;
         // Assign local seq only after we know we’re keeping the frame.
@@ -966,36 +961,12 @@ class MediaIngest {
         }
         // Canonical seq used everywhere downstream.
         const finalSeq = seqForPipeline ?? localSeqAssigned;
-        // --------------------------------------------------------------
-        // AMR-WB adjacent-frame dedupe (lag-1 only, per stream+track)
-        // --------------------------------------------------------------
-        if (currentCodec === 'AMR-WB') {
-            const dedupeKey = `${this.callControlId}:${this.activeStreamId ?? 'nostream'}:${normalizedTrack ?? 'notrack'}`;
-            const h = crypto_1.default.createHash('sha1').update(buffer).digest(); // Buffer(20)
-            const prev = this.lastAmrwbFrameHashByKey.get(dedupeKey);
-            if (prev && prev.equals(h)) {
-                this.telnyxAdjDupDropped += 1;
-                log_1.log.warn({
-                    event: 'amrwb_adjacent_duplicate_dropped',
-                    call_control_id: this.callControlId,
-                    stream_id: this.activeStreamId ?? null,
-                    track: normalizedTrack ?? null,
-                    seq: finalSeq,
-                    dropped_total: this.telnyxAdjDupDropped,
-                    kept_total: this.telnyxAdjDupKept,
-                    ...(this.logContext ?? {}),
-                }, 'dropping adjacent duplicate AMR-WB frame');
-                return;
-            }
-            this.lastAmrwbFrameHashByKey.set(dedupeKey, h);
-            this.telnyxAdjDupKept += 1;
-        }
         // --------------------------------------------------------------------------
         // From this point on, ALWAYS use finalSeq (not this.frameSeq)
         // --------------------------------------------------------------------------
         void this.maybeDumpMediaFrame(trimmedPayload, buffer);
         this.queueAmrwbTruthCapture(buffer, finalSeq);
-        this.logMediaPayloadDebug(base64Len, buffer, payloadSource);
+        this.logMediaPayloadDebug(base64Len, buffer, payloadSource, finalSeq);
         void dumpTelnyxRawPayload(this.callControlId, trimmedPayload);
         if (capture && !capture.stopped) {
             const payloadLen = trimmedPayload.length;
@@ -1118,6 +1089,9 @@ class MediaIngest {
         if (payload.length !== 33)
             return null;
         const toc = payload[0] ?? 0;
+        const f = (toc & 0x80) !== 0;
+        if (f)
+            return null; // multi-frame TOC not supported here
         const ft = (toc >> 3) & 0x0f; // frame type
         const q = (toc & 0x04) !== 0; // quality bit
         // Reject non-speech / invalid
@@ -1380,10 +1354,6 @@ class MediaIngest {
             this.lastSeqByStream.set(streamId, -1);
             log_1.log.info({ event: 'telnyx_stream_active', call_control_id: this.callControlId, stream_id: streamId, ...(this.logContext ?? {}) }, 'active stream set');
         }
-        // Reset per-call adjacent AMR-WB dedupe state
-        this.lastAmrwbFrameHashByKey.clear();
-        this.telnyxAdjDupDropped = 0;
-        this.telnyxAdjDupKept = 0;
         const mediaFormat = start.media_format ??
             message.media_format ??
             undefined;
@@ -1598,7 +1568,7 @@ class MediaIngest {
         }
         return { zero, nearZero };
     }
-    logMediaPayloadDebug(base64Len, buffer, payloadSource, note) {
+    logMediaPayloadDebug(base64Len, buffer, payloadSource, seq, note) {
         if (this.mediaPayloadDebugCount >= 20)
             return;
         this.mediaPayloadDebugCount += 1;
@@ -1613,7 +1583,7 @@ class MediaIngest {
                 decoded_len: decodedLen,
                 decoded_prefix_hex: decodedPrefixHex,
                 note: note ?? (buffer ? undefined : 'decoded_payload_unavailable'),
-                frame_seq: this.frameSeq,
+                frame_seq: seq ?? this.frameSeq,
                 ...(this.logContext ?? {}),
             }, buffer ? 'MEDIA_PAYLOAD_DEBUG raw payload' : 'MEDIA_PAYLOAD_DEBUG decoded payload unavailable');
         }
@@ -1660,12 +1630,18 @@ class MediaIngest {
         const shouldDumpDecoded = telnyxTapRawEnabled() || (this.captureState && !this.captureState.stopped);
         if (shouldDumpDecoded && pcm16.length > 0) {
             const decodedBuf = Buffer.from(pcm16.buffer, pcm16.byteOffset, pcm16.byteLength);
-            const seqForDump = typeof seq === 'number' && Number.isFinite(seq) ? seq : this.frameSeq;
-            const capture = this.captureState;
-            if (capture && !capture.stopped) {
-                void dumpCaptureDecodedPcm(capture, this.callControlId, seqForDump, decodedBuf);
+            // seq is the canonical sequence (Telnyx seq if present, else local seq assigned upstream)
+            if (typeof seq === 'number' && Number.isFinite(seq)) {
+                const capture = this.captureState;
+                if (capture && !capture.stopped) {
+                    void dumpCaptureDecodedPcm(capture, this.callControlId, seq, decodedBuf);
+                }
+                void dumpTelnyxDecodedPcm(this.callControlId, seq, decodedBuf);
             }
-            void dumpTelnyxDecodedPcm(this.callControlId, seqForDump, decodedBuf);
+            else {
+                // Optional: one-time log if you want visibility that dumps are being skipped
+                // log.debug({ event: 'decoded_dump_skipped_no_seq', call_control_id: this.callControlId }, 'decoded dump skipped');
+            }
         }
         if (pcm16.length > 0) {
             const stats = computePcmStats(pcm16);

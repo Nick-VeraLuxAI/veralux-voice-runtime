@@ -1112,10 +1112,6 @@ function depacketizeAmrWbToStorage(payload: Buffer, options?: AmrWbDepacketizeOp
  * - Sliding-window de-dupe across individual frames (prevents overlap/time-warp when upstream repeats frames).
  */
 
-// Drop-in replacement for maybeAppendSelectedStorageFrames() in src/audio/codecDecode.ts
-// ✅ Removes FT=2 hardcoding (33B) and seeds recent-window dedupe by parsing frames from disk tail.
-// ✅ Keeps: per-path write serialization + lag-1 boundary dedupe + recent-window dedupe.
-
 function maybeAppendSelectedStorageFrames(
   state: TelnyxCodecState,
   framesNoHeader: Buffer[],
@@ -1127,108 +1123,6 @@ function maybeAppendSelectedStorageFrames(
   const callId = typeof logContext?.call_control_id === 'string' ? String(logContext.call_control_id) : 'unknown';
   const dir = path.join(debugDir(), callId);
   const outPath = path.join(dir, 'runtime_selected_storage.awb');
-
-  // --- helpers (local) ---
-
-  const MAX_SPEECH_FRAME_BYTES = 1 + 60; // TOC + max payload (FT=8 => 60 bytes payload)
-
-  function isValidStorageSpeechFrame(fr: Buffer): boolean {
-    if (!fr || fr.length < 2) return false;
-    const toc = fr[0] as number;
-    const F = (toc >> 7) & 1;
-    if (F !== 0) return false;
-    const ft = (toc >> 3) & 0x0f;
-    if (ft < 0 || ft > 8) return false; // speech only
-    const expected = 1 + amrWbFrameSize(ft);
-    return expected > 1 && fr.length === expected;
-  }
-
-  function parseStorageSpeechFramesFromPayload(payload: Buffer): Buffer[] {
-    // payload is storage frames bytes (NO "#!AMR-WB\n" header)
-    const out: Buffer[] = [];
-    let off = 0;
-
-    while (off < payload.length) {
-      const toc = payload[off] as number;
-      if (toc == null) break;
-
-      const F = (toc >> 7) & 1;
-      const ft = (toc >> 3) & 0x0f;
-
-      // storage format requires F=0
-      if (F !== 0) break;
-
-      // handle non-speech quickly (we only want speech frames 0..8)
-      if (ft === AMRWB_NO_DATA_FT || ft === AMRWB_SPEECH_LOST_FT) {
-        // TOC-only frame
-        off += 1;
-        continue;
-      }
-      if (ft === 9) {
-        // SID: TOC + 5 bytes
-        const need = 1 + AMRWB_SID_FRAME_BYTES;
-        if (off + need > payload.length) break;
-        off += need;
-        continue;
-      }
-      if (isAmrWbReservedFt(ft)) break;
-
-      const size = amrWbFrameSize(ft);
-      if (size <= 0) break;
-
-      const need = 1 + size;
-      if (off + need > payload.length) break;
-
-      const fr = payload.subarray(off, off + need);
-      if (ft >= 0 && ft <= 8) out.push(Buffer.from(fr)); // copy
-      off += need;
-    }
-
-    return out;
-  }
-
-  async function readTailAndSeedDedupe(
-    fh: fs.promises.FileHandle,
-    fileSize: number,
-    maxRecent: number,
-  ): Promise<{ lastFrameSha1: string | null; seeded: number }> {
-    // Reads a tail chunk, parses storage frames, seeds per-path recent-window dedupe,
-    // and returns sha1 of last speech frame parsed (for boundary lag-1 dedupe).
-    if (fileSize <= AMRWB_STREAM_HEADER.length) return { lastFrameSha1: null, seeded: 0 };
-
-    // Read enough tail bytes to *likely* include last N frames even with smaller frames.
-    // Add some slack for safety.
-    const want = Math.min(
-      Math.max(0, fileSize - AMRWB_STREAM_HEADER.length),
-      maxRecent * MAX_SPEECH_FRAME_BYTES + 512,
-    );
-
-    const startPos = Math.max(AMRWB_STREAM_HEADER.length, fileSize - want);
-    const bytesToRead = Math.max(0, fileSize - startPos);
-    if (bytesToRead <= 0) return { lastFrameSha1: null, seeded: 0 };
-
-    const buf = Buffer.alloc(bytesToRead);
-    const r = await fh.read(buf, 0, buf.length, startPos);
-    const got = r.bytesRead ?? 0;
-    if (got <= 0) return { lastFrameSha1: null, seeded: 0 };
-
-    const tailPayload = buf.subarray(0, got); // this is already after header (startPos >= headerLen)
-    const parsed = parseStorageSpeechFramesFromPayload(tailPayload);
-
-    // Keep only the last maxRecent parsed frames (in case the tail contains more)
-    const lastFrames = parsed.length > maxRecent ? parsed.slice(parsed.length - maxRecent) : parsed;
-
-    let seeded = 0;
-    for (const fr of lastFrames) {
-      const key = dedupeKeyForFrame(fr);
-      // NOTE: this mutates the per-path window.
-      hasSeenFrameRecentlyForPath(outPath, key, maxRecent);
-      seeded += 1;
-    }
-
-    const lastFrameSha1 = lastFrames.length > 0 ? sha1Hex(lastFrames[lastFrames.length - 1]!) : null;
-    return { lastFrameSha1, seeded };
-  }
 
   const doWrite = async (): Promise<void> => {
     try {
@@ -1243,101 +1137,130 @@ function maybeAppendSelectedStorageFrames(
           await fh.write(AMRWB_STREAM_HEADER, 0, AMRWB_STREAM_HEADER.length, null);
         }
 
-        // Compute window size ONCE
-        const maxRecent =
-          Number.isFinite(AMRWB_SELECTED_RECENT_DEDUPE_N) && AMRWB_SELECTED_RECENT_DEDUPE_N > 0
-            ? AMRWB_SELECTED_RECENT_DEDUPE_N
-            : 32;
+      // -------------------------------
+      // Tail-of-file adjacent dedupe seed
+      // -------------------------------
+      const FRAME_BYTES = AMRWB_STORAGE_FRAME_BYTES_FT2; // 33 for FT=2
+      let lastOnDiskSha1: string | null = null;
 
-        // --- Seed boundary + recent-window from disk ---
-        let prevSha1: string | null = null;
+      // Compute window size ONCE (used for disk seed + dedupe)
+      const maxRecent =
+        Number.isFinite(AMRWB_SELECTED_RECENT_DEDUPE_N) && AMRWB_SELECTED_RECENT_DEDUPE_N > 0
+          ? AMRWB_SELECTED_RECENT_DEDUPE_N
+          : 32;
 
-        try {
-          const seed = await readTailAndSeedDedupe(fh, st.size, maxRecent);
-          prevSha1 = seed.lastFrameSha1 ?? state.amrwbLastSelectedFrameSha1 ?? null;
-        } catch {
-          // If disk-tail parse fails for any reason, fall back to state only.
-          prevSha1 = state.amrwbLastSelectedFrameSha1 ?? null;
-        }
+      // If file already has at least one frame, read last frame (for lag-1 boundary dedupe)
+      if (st.size >= AMRWB_STREAM_HEADER.length + FRAME_BYTES) {
+        const lastPos = st.size - FRAME_BYTES;
+        const tail = Buffer.alloc(FRAME_BYTES);
+        const { bytesRead } = await fh.read(tail, 0, tail.length, lastPos);
+        if (bytesRead === FRAME_BYTES) lastOnDiskSha1 = sha1Hex(tail);
 
-        // --- Lag-1 adjacent dedupe (boundary + within batch) ---
-        const afterAdj: Buffer[] = [];
-        let droppedAdjacent = 0;
+        // -------------------------------
+        // Seed recent-window dedupe from disk (prevents lag-k replay across restarts/batches)
+        // -------------------------------
+        const payloadBytes = st.size - AMRWB_STREAM_HEADER.length;
+        const totalFramesOnDisk = Math.floor(payloadBytes / FRAME_BYTES);
+        const take = Math.min(totalFramesOnDisk, maxRecent);
 
-        for (const fr of framesNoHeader) {
-          if (!fr || fr.length === 0) continue;
+        if (take > 0) {
+          const startFrameIndex = totalFramesOnDisk - take;
+          const startPos = AMRWB_STREAM_HEADER.length + startFrameIndex * FRAME_BYTES;
+          const buf = Buffer.alloc(take * FRAME_BYTES);
+          const r = await fh.read(buf, 0, buf.length, startPos);
 
-          // Safety: only write valid speech frames
-          if (!isValidStorageSpeechFrame(fr)) continue;
-
-          const frSha1 = sha1Hex(fr);
-          if (prevSha1 && frSha1 === prevSha1) {
-            droppedAdjacent += 1;
-            continue;
-          }
-
-          afterAdj.push(fr);
-          prevSha1 = frSha1;
-        }
-
-        if (afterAdj.length === 0) {
-          if (droppedAdjacent > 0) {
-            state.amrwbSelectedDropped = (state.amrwbSelectedDropped ?? 0) + droppedAdjacent;
-
-            if (parseBoolEnv(process.env.AMRWB_DECODE_TRACE)) {
-              log.info(
-                {
-                  event: 'AMRWB_RUNTIME_SELECTED_ADJ_DUP_DROPPED',
-                  outPath,
-                  dropped_adjacent: droppedAdjacent,
-                  dropped_total: state.amrwbSelectedDropped ?? 0,
-                  ...(logContext ?? {}),
-                },
-                'AMR-WB runtime selected storage dropped adjacent duplicates',
-              );
+          if (r.bytesRead === buf.length) {
+            for (let i = 0; i < take; i += 1) {
+              const fr = buf.subarray(i * FRAME_BYTES, (i + 1) * FRAME_BYTES);
+              const key = dedupeKeyForFrame(fr);
+              hasSeenFrameRecently(state, key, maxRecent);
             }
           }
-          return;
+        }
+      }
+
+      // -------------------------------
+      // Lag-1 adjacent dedupe (boundary + within batch)
+      // -------------------------------
+      const afterAdj: Buffer[] = [];
+      let prevSha1: string | null = lastOnDiskSha1 ?? state.amrwbLastSelectedFrameSha1 ?? null;
+      let droppedAdjacent = 0;
+
+      for (const fr of framesNoHeader) {
+        if (!fr || fr.length === 0) continue;
+
+        const frSha1 = sha1Hex(fr);
+        if (prevSha1 && frSha1 === prevSha1) {
+          droppedAdjacent += 1;
+          continue;
         }
 
-        // --- Recent-window dedupe (kills lag-k replay) ---
-        const finalFrames: Buffer[] = [];
-        let droppedRecent = 0;
+        afterAdj.push(fr);
+        prevSha1 = frSha1;
+      }
 
-        for (const fr of afterAdj) {
-          const key = dedupeKeyForFrame(fr);
-          if (hasSeenFrameRecentlyForPath(outPath, key, maxRecent)) {
-            droppedRecent += 1;
-            continue;
-          }
-          finalFrames.push(fr);
-        }
-
-        if (finalFrames.length === 0) {
-          state.amrwbSelectedDropped = (state.amrwbSelectedDropped ?? 0) + droppedAdjacent + droppedRecent;
+      // If everything was adjacent-dup, bail
+      if (afterAdj.length === 0) {
+        if (droppedAdjacent > 0) {
+          state.amrwbSelectedDropped = (state.amrwbSelectedDropped ?? 0) + droppedAdjacent;
 
           if (parseBoolEnv(process.env.AMRWB_DECODE_TRACE)) {
             log.info(
               {
-                event: 'AMRWB_RUNTIME_SELECTED_RECENT_DUP_DROPPED_ALL',
+                event: 'AMRWB_RUNTIME_SELECTED_ADJ_DUP_DROPPED',
                 outPath,
                 dropped_adjacent: droppedAdjacent,
-                dropped_recent: droppedRecent,
-                max_recent: maxRecent,
                 dropped_total: state.amrwbSelectedDropped ?? 0,
                 ...(logContext ?? {}),
               },
-              'AMR-WB runtime selected storage dropped all frames due to recent-window dedupe',
+              'AMR-WB runtime selected storage dropped adjacent duplicates',
             );
           }
-          return;
         }
+        return;
+      }
+
+      // -------------------------------
+      // Recent-window dedupe (kills lag-k replay)
+      // -------------------------------
+      const finalFrames: Buffer[] = [];
+      let droppedRecent = 0;
+
+      for (const fr of afterAdj) {
+        const key = dedupeKeyForFrame(fr);
+        if (hasSeenFrameRecently(state, key, maxRecent)) {
+          droppedRecent += 1;
+          continue;
+        }
+        finalFrames.push(fr);
+      }
+
+      if (finalFrames.length === 0) {
+        state.amrwbSelectedDropped = (state.amrwbSelectedDropped ?? 0) + droppedAdjacent + droppedRecent;
+
+        if (parseBoolEnv(process.env.AMRWB_DECODE_TRACE)) {
+          log.info(
+            {
+              event: 'AMRWB_RUNTIME_SELECTED_RECENT_DUP_DROPPED_ALL',
+              outPath,
+              dropped_adjacent: droppedAdjacent,
+              dropped_recent: droppedRecent,
+              max_recent: maxRecent,
+              dropped_total: state.amrwbSelectedDropped ?? 0,
+              ...(logContext ?? {}),
+            },
+            'AMR-WB runtime selected storage dropped all frames due to recent-window dedupe',
+          );
+        }
+        return;
+      }
+
 
         // Write frames (TOC+payload), no header
         const payloadToWrite = finalFrames.length === 1 ? finalFrames[0]! : Buffer.concat(finalFrames);
         await fh.write(payloadToWrite, 0, payloadToWrite.length, null);
 
-        // Update cross-boundary marker to last written frame
+        // Update cross-boundary marker to last written frame (adjacent-dedupe seed)
         state.amrwbLastSelectedFrameSha1 = sha1Hex(finalFrames[finalFrames.length - 1]!);
 
         // Counters
@@ -1346,6 +1269,7 @@ function maybeAppendSelectedStorageFrames(
           state.amrwbSelectedDropped = (state.amrwbSelectedDropped ?? 0) + droppedAdjacent + droppedRecent;
         }
 
+        // Optional trace log
         if (parseBoolEnv(process.env.AMRWB_DECODE_TRACE)) {
           const st2 = await fs.promises.stat(outPath);
           log.info(
@@ -1365,6 +1289,7 @@ function maybeAppendSelectedStorageFrames(
             'AMR-WB runtime selected storage appended',
           );
         }
+
       } finally {
         await fh.close();
       }
@@ -1376,22 +1301,18 @@ function maybeAppendSelectedStorageFrames(
     }
   };
 
-  // Serialize writes per output path to avoid interleaving across concurrent appenders
+  // Serialize writes per session state to avoid interleaving
   const prev = AMRWB_SELECTED_WRITE_BY_PATH.get(outPath) ?? Promise.resolve();
+
   const next = prev.then(doWrite, doWrite);
 
+  // Keep the chain alive even if a write fails
   AMRWB_SELECTED_WRITE_BY_PATH.set(
     outPath,
     next.catch(() => undefined),
   );
 
-  // Optional: bound the write map so it can’t grow forever
-  if (AMRWB_SELECTED_WRITE_BY_PATH.size > 256) {
-    const firstKey = AMRWB_SELECTED_WRITE_BY_PATH.keys().next().value as string | undefined;
-    if (firstKey) AMRWB_SELECTED_WRITE_BY_PATH.delete(firstKey);
-  }
 }
-
 
 
 type PendingRead = {
