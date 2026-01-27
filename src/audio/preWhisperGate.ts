@@ -1,6 +1,7 @@
 // src/audio/preWhisperGate.ts
 import fs from 'fs';
 import path from 'path';
+import crypto from 'crypto';
 import { decodeWavToPcm16, encodePcm16ToWav } from './postprocess';
 import { resample48kTo16k } from './resample48kTo16k';
 import { log } from '../log';
@@ -104,6 +105,98 @@ function analyzePcm16(samples: Int16Array): { rms: number; peak: number; clipped
   return { rms: Math.sqrt(sumSquares / samples.length), peak: peak / 32768, clipped };
 }
 
+function parseIntEnv(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (!raw) return fallback;
+  const parsed = Number.parseInt(raw, 10);
+  if (!Number.isFinite(parsed)) return fallback;
+  return parsed;
+}
+
+function sha1Hex(buf: Buffer): string {
+  return crypto.createHash('sha1').update(buf).digest('hex');
+}
+
+/**
+ * Dedupe exact repeated PCM frames in a recent window.
+ * This fixes "echo + slow" caused by upstream frame replay (lag-k).
+ *
+ * Frames are assumed to be ~20ms each:
+ *   frameSamples = sampleRateHz / 50
+ *
+ * Returns: { samples, keptFrames, droppedFrames, frameSamples }
+ */
+function dedupeRecentPcmFrames(
+  mono: Int16Array,
+  sampleRateHz: number,
+  windowSize: number,
+): { samples: Int16Array; keptFrames: number; droppedFrames: number; frameSamples: number } {
+  if (!Number.isFinite(windowSize) || windowSize <= 0) {
+    return { samples: mono, keptFrames: 0, droppedFrames: 0, frameSamples: Math.max(1, Math.round(sampleRateHz / 50)) };
+  }
+
+  const frameSamples = Math.max(1, Math.round(sampleRateHz / 50));
+  const totalFrames = Math.floor(mono.length / frameSamples);
+  if (totalFrames <= 1) {
+    return { samples: mono, keptFrames: totalFrames, droppedFrames: 0, frameSamples };
+  }
+
+  // Keep hashes for last N frames
+  const recentQueue: string[] = [];
+  const recentSet = new Set<string>();
+
+  const kept: Int16Array[] = [];
+  let keptFrames = 0;
+  let droppedFrames = 0;
+
+  for (let i = 0; i < totalFrames; i += 1) {
+    const start = i * frameSamples;
+    const end = start + frameSamples;
+
+    // hash the raw bytes of this frame
+    const frameView = mono.subarray(start, end);
+    const frameBuf = Buffer.from(frameView.buffer, frameView.byteOffset, frameView.byteLength);
+
+    const h = sha1Hex(frameBuf);
+
+    // Drop if seen in recent window
+    if (recentSet.has(h)) {
+      droppedFrames += 1;
+      continue;
+    }
+
+    kept.push(frameView);
+    keptFrames += 1;
+
+    // push into window
+    recentQueue.push(h);
+    recentSet.add(h);
+
+    while (recentQueue.length > windowSize) {
+      const old = recentQueue.shift();
+      if (old) recentSet.delete(old);
+    }
+  }
+
+  // append leftover tail samples (if any) — keep them as-is
+  const tailStart = totalFrames * frameSamples;
+  const tail = tailStart < mono.length ? mono.subarray(tailStart) : null;
+
+  // concat kept frames (+ tail)
+  const tailLen = tail ? tail.length : 0;
+  const outLen = keptFrames * frameSamples + tailLen;
+  const out = new Int16Array(outLen);
+
+  let off = 0;
+  for (const fr of kept) {
+    out.set(fr, off);
+    off += fr.length;
+  }
+  if (tail) out.set(tail, off);
+
+  return { samples: out, keptFrames, droppedFrames, frameSamples };
+}
+
 /**
  * preWhisperGate expects input that is ALREADY DECODED to PCM/WAV by codecDecode.
  * It should NOT decode AMR-WB (that belongs earlier).
@@ -111,7 +204,6 @@ function analyzePcm16(samples: Int16Array): { rms: number; peak: number; clipped
 export async function preWhisperGate(input: {
   buf: Buffer;
   hints?: { codec?: string; sampleRate?: number; channels?: number; callId?: string };
-
 }): Promise<{ wav16kMono: Buffer; meta: Record<string, unknown> }> {
   const callId = input.hints?.callId ?? 'unknown';
   const format = detectFormat(input.buf);
@@ -158,6 +250,19 @@ export async function preWhisperGate(input: {
 
   let mono = downmixToMono(pcm16, inputChannels);
 
+  // -------------------- PCM RECENT-WINDOW DEDUPE (fix echo/slow) --------------------
+  // Set STT_PREWHISPER_DEDUPE_WINDOW=0 to disable
+  // Suggested starting points:
+  //   16 or 32 (catches lag-k replay up to ~320–640ms)
+  const dedupeWindow = Math.max(0, parseIntEnv('STT_PREWHISPER_DEDUPE_WINDOW', 0));
+  const inRateForDedupe = inputSampleRate ?? OUTPUT_SAMPLE_RATE_HZ;
+
+  const dd = dedupeRecentPcmFrames(mono, inRateForDedupe, dedupeWindow);
+  if (dedupeWindow > 0 && dd.droppedFrames > 0) {
+    mono = dd.samples;
+  }
+
+  // -------------------- RESAMPLE TO 16k --------------------
   if (inputSampleRate !== OUTPUT_SAMPLE_RATE_HZ) {
     if (inputSampleRate === 48000) {
       mono = resample48kTo16k(mono);
@@ -204,6 +309,13 @@ export async function preWhisperGate(input: {
           output_channels: OUTPUT_CHANNELS,
           before_path: beforePath,
           after_path: afterPath,
+
+          // dedupe debug
+          prewhisper_dedupe_window: dedupeWindow,
+          prewhisper_dedupe_in_rate_hz: inRateForDedupe,
+          prewhisper_dedupe_frame_samples: dd.frameSamples,
+          prewhisper_dedupe_dropped_frames: dd.droppedFrames,
+          prewhisper_dedupe_kept_frames: dd.keptFrames,
         },
         'prewhisper dump',
       );
@@ -220,6 +332,12 @@ export async function preWhisperGate(input: {
       input_channels: inputChannels ?? null,
       output_sample_rate_hz: OUTPUT_SAMPLE_RATE_HZ,
       output_channels: OUTPUT_CHANNELS,
+
+      prewhisper_dedupe_window: dedupeWindow,
+      prewhisper_dedupe_in_rate_hz: inRateForDedupe,
+      prewhisper_dedupe_frame_samples: dd.frameSamples,
+      prewhisper_dedupe_dropped_frames: dd.droppedFrames,
+      prewhisper_dedupe_kept_frames: dd.keptFrames,
     },
   };
 }

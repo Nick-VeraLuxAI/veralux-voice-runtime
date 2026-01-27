@@ -1,3 +1,4 @@
+// test/amrwbRtp.test.ts
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import {
@@ -28,17 +29,26 @@ function packBits(bits: number[]): Buffer {
   return buf;
 }
 
+/**
+ * Build a minimal BE payload:
+ *   [CMR:4 bits][TOC: F=0 FT=ft Q=1 (6 bits)][frame bits...]
+ *
+ * NOTE: This is BE header CMR nibble (NOT a 1-byte octet-aligned CMR).
+ */
 function buildBeSingleFramePayload(ft: number, bitLen: number): Buffer {
   const bits: number[] = [];
   const cmr = 0x0f;
   const q = 1;
 
+  // CMR (4 bits)
   pushBits(bits, cmr, 4);
-  // TOC: F=0, FT=ft, Q=q
+
+  // TOC (6 bits): F=0, FT=ft, Q=q
   pushBits(bits, 0, 1);
   pushBits(bits, ft, 4);
   pushBits(bits, q, 1);
 
+  // frame payload bits
   for (let i = 0; i < bitLen; i += 1) {
     bits.push(i === 0 ? 1 : 0);
   }
@@ -73,7 +83,7 @@ test('detectAndStripRtpHeader removes RTP padding bytes', () => {
   assert.deepEqual(result.payload, payload);
 });
 
-test('tryParseAmrWbOctetAligned validates a single-frame payload', () => {
+test('tryParseAmrWbOctetAligned validates a single-frame payload (with CMR byte)', () => {
   const cmr = 0x0f;
   const toc = 0x04; // F=0, FT=0, Q=1
   const speech = Buffer.alloc(17);
@@ -89,26 +99,37 @@ test('tryParseAmrWbOctetAligned validates a single-frame payload', () => {
   }
 });
 
-test('depacketizeAmrWbBandwidthEfficient repacks to valid octet-aligned payload', () => {
+test('depacketizeAmrWbBandwidthEfficient repacks to valid octet-aligned payload (no CMR)', () => {
+  // FT=0 => 132 bits => 17 bytes in octet-aligned
   const bePayload = buildBeSingleFramePayload(0, 132);
   const be = depacketizeAmrWbBandwidthEfficient(bePayload);
   assert.equal(be.ok, true);
   if (!be.ok) return;
 
-  const octet = repackToOctetAlignedFromBe(be);
-  const parsed = tryParseAmrWbOctetAligned(octet);
+  // Repack to octet-aligned WITHOUT CMR (TOC + speech)
+  const octet = repackToOctetAlignedFromBe(be, { includeCmr: false });
+
+  // Validate octet-aligned no-CMR parse
+  const parsed = tryParseAmrWbOctetAlignedNoCmr(octet);
   assert.equal(parsed.ok, true);
+  if (parsed.ok) {
+    assert.equal(parsed.frames.length, 1);
+    assert.equal(parsed.frames[0]?.sizeBytes, 17);
+    assert.equal(parsed.tocBytes, 1);
+    assert.equal(parsed.dataBytes, 17);
+  }
 });
 
-test('transcode does not accept 0xf1 0x6e as valid octet-aligned', () => {
+test('transcode (BE-only) rejects obvious non-BE bytes like 0xf1 0x6e ...', () => {
   const payload = Buffer.from([0xf1, 0x6e, 0x00, 0x00]);
   const result = transcodeTelnyxAmrWbPayload(payload);
   assert.equal(result.ok, false);
   assert.equal(result.packing, 'invalid');
-  assert.match(result.error ?? '', /invalid_ft_13/);
+  assert.match(result.error ?? '', /be_only_reject|be:|reject/i);
 });
 
-test('transcode accepts 33-byte octet-aligned payload without CMR', () => {
+test('transcode (BE-only) rejects 33-byte octet-aligned storage-like payload', () => {
+  // This is "storage frames" style (TOC+32), which MUST be rejected by BE-only transcode.
   const toc = (2 << 3) | (1 << 2); // F=0, FT=2, Q=1
   const speech = Buffer.alloc(32, 0x55);
   const payload = Buffer.concat([Buffer.from([toc]), speech]);
@@ -117,28 +138,35 @@ test('transcode accepts 33-byte octet-aligned payload without CMR', () => {
   assert.equal(parsed.ok, true);
 
   const result = transcodeTelnyxAmrWbPayload(payload);
-  assert.equal(result.ok, true);
-  if (result.ok) {
-    assert.equal(result.packing, 'octet');
-    assert.equal(result.totalBytesOut, payload.length);
-    assert.equal(result.tocCount, 1);
-    assert.deepEqual(result.output, payload);
-  }
+  assert.equal(result.ok, false);
+  assert.equal(result.packing, 'invalid');
 });
 
-test('transcode strips CMR byte when octet-aligned CMR is detected', () => {
-  const cmr = 0x0f;
-  const toc = (2 << 3) | (1 << 2); // F=0, FT=2, Q=1
-  const speech = Buffer.alloc(32, 0x33);
-  const payload = Buffer.concat([Buffer.from([cmr << 4]), Buffer.from([toc]), speech]);
+test('transcode (BE-only) produces storage frames (TOC F=0) for a valid BE frame', () => {
+  // Build a BE frame FT=2:
+  // FT=2 => 253 bits => 32 bytes in octet-aligned / storage
+  const bePayload = buildBeSingleFramePayload(2, 253);
+  const result = transcodeTelnyxAmrWbPayload(bePayload);
 
-  const result = transcodeTelnyxAmrWbPayload(payload);
   assert.equal(result.ok, true);
   if (!result.ok) return;
 
-  assert.equal(result.packing, 'octet');
+  assert.equal(result.packing, 'be');
   assert.equal(result.cmrStripped, true);
-  assert.equal(result.cmr, cmr);
-  assert.equal(result.totalBytesOut, payload.length - 1);
-  assert.deepEqual(result.output, payload.subarray(1));
+  assert.equal(result.tocCount, 1);
+
+  // output should be: [storageTOC][speechBytes]
+  // storage TOC: F=0, FT=2, Q=1 => (FT<<3)|(Q<<2)
+  const expectedToc = ((2 & 0x0f) << 3) | ((1 & 0x01) << 2);
+  assert.equal(result.output.length, 1 + 32);
+  assert.equal(result.output[0], expectedToc);
+
+  // sanity: parse as octet-aligned-no-CMR (storage format is identical)
+  const parsed = tryParseAmrWbOctetAlignedNoCmr(result.output);
+  assert.equal(parsed.ok, true);
+  if (parsed.ok) {
+    assert.equal(parsed.frames.length, 1);
+    assert.equal(parsed.frames[0]?.sizeBytes, 32);
+    assert.equal(parsed.frames[0]?.ft, 2);
+  }
 });

@@ -1,5 +1,7 @@
+// src/stt/providers/whisperHttp.ts
 import fs from 'fs';
 import path from 'path';
+import crypto from 'crypto';
 import { env } from '../../env';
 import { log } from '../../log';
 import { observeStageDuration, startStageTimer, incStageError } from '../../metrics';
@@ -17,21 +19,36 @@ const wavDebugLogged = new Set<string>();
 let wavDebugLoggedAnonymous = false;
 const whisperDumpCounters = new Map<string, number>();
 
+// Dedupe state: same call + partial + same payload => skip sending
+const lastPartialSha1ByCall = new Map<string, string>();
+
 function parseBoolEnv(value: string | undefined): boolean {
   if (!value) return false;
   const normalized = value.trim().toLowerCase();
-  return normalized === '1' || normalized === 'true' || normalized === 'yes';
+  return normalized === '1' || normalized === 'true' || normalized === 'yes' || normalized === 'y';
 }
 
-const mediaDebugEnabled = (): boolean => {
-  const value = process.env.MEDIA_DEBUG;
-  if (!value) return false;
-  const normalized = value.trim().toLowerCase();
-  return normalized === '1' || normalized === 'true' || normalized === 'yes';
-};
-
+const mediaDebugEnabled = (): boolean => parseBoolEnv(process.env.MEDIA_DEBUG);
 const whisperDumpEnabled = (): boolean => parseBoolEnv(process.env.STT_DEBUG_DUMP_WHISPER_WAVS);
 const preWhisperGateEnabled = (): boolean => parseBoolEnv(process.env.STT_PREWHISPER_GATE);
+const disablePartials = (): boolean => parseBoolEnv(process.env.STT_DISABLE_PARTIALS);
+const forceNormalizeWav = (): boolean => parseBoolEnv(process.env.STT_FORCE_NORMALIZE_WAV);
+
+// Simple trace mode (independent of MEDIA_DEBUG)
+const sttTraceEnabled = (): boolean => parseBoolEnv(process.env.STT_TRACE);
+const sttTraceLimit = (): number => {
+  const n = Number.parseInt(process.env.STT_TRACE_LIMIT ?? '', 10);
+  return Number.isFinite(n) && n >= 0 ? n : 30;
+};
+const traceCountsByCall = new Map<string, number>();
+function shouldTrace(callId: string): boolean {
+  if (!sttTraceEnabled()) return false;
+  const limit = sttTraceLimit();
+  if (limit === 0) return true;
+  const n = (traceCountsByCall.get(callId) ?? 0) + 1;
+  traceCountsByCall.set(callId, n);
+  return n <= limit;
+}
 
 function debugDir(): string {
   return process.env.STT_DEBUG_DIR && process.env.STT_DEBUG_DIR.trim() !== ''
@@ -43,24 +60,34 @@ function sanitizeFilePart(value: string): string {
   return value.replace(/[^A-Za-z0-9._-]/g, '_');
 }
 
+function sha1Hex(buf: Buffer): string {
+  return crypto.createHash('sha1').update(buf).digest('hex');
+}
+
+function sha1_10(buf: Buffer): string {
+  return sha1Hex(buf).slice(0, 10);
+}
+
 async function maybeDumpWhisperWav(
   wavPayload: Buffer,
   kind: 'partial' | 'final',
   logContext?: Record<string, unknown>,
 ): Promise<void> {
   if (!whisperDumpEnabled()) return;
+
   const callControlId = extractCallControlId(logContext) ?? 'unknown';
   const safeId = sanitizeFilePart(callControlId);
   const seq = (whisperDumpCounters.get(safeId) ?? 0) + 1;
   whisperDumpCounters.set(safeId, seq);
 
   const dir = debugDir();
-  const filePath = path.join(dir, `whisper_${safeId}_${kind}_${seq}_${Date.now()}.wav`);
+  const h10 = sha1_10(wavPayload);
+  const filePath = path.join(dir, `whisper_${safeId}_${kind}_${seq}_${h10}_${Date.now()}.wav`);
   try {
     await fs.promises.mkdir(dir, { recursive: true });
     await fs.promises.writeFile(filePath, wavPayload);
     log.info(
-      { event: 'stt_whisper_wav_dumped', file_path: filePath, kind, ...(logContext ?? {}) },
+      { event: 'stt_whisper_wav_dumped', file_path: filePath, kind, sha1_10: h10, ...(logContext ?? {}) },
       'stt whisper wav dumped',
     );
   } catch (error) {
@@ -100,9 +127,7 @@ function muLawBufferToPcm16LE(muLaw: Buffer): Buffer {
 
 function upsamplePcm16le8kTo16kLinear(pcm16le: Buffer): Buffer {
   const sampleCount = Math.floor(pcm16le.length / 2);
-  if (sampleCount === 0) {
-    return Buffer.alloc(0);
-  }
+  if (sampleCount === 0) return Buffer.alloc(0);
 
   const output = Buffer.alloc(sampleCount * 2 * 2);
   for (let i = 0; i < sampleCount - 1; i += 1) {
@@ -132,7 +157,7 @@ function wavHeader(pcmDataBytes: number, sampleRate: number, numChannels: number
   header.write('WAVE', 8, 'ascii');
   header.write('fmt ', 12, 'ascii');
   header.writeUInt32LE(16, 16);
-  header.writeUInt16LE(1, 20);
+  header.writeUInt16LE(1, 20); // PCM
   header.writeUInt16LE(numChannels, 22);
   header.writeUInt32LE(sampleRate, 24);
   header.writeUInt32LE(byteRate, 28);
@@ -168,21 +193,45 @@ function extractCallControlId(logContext?: Record<string, unknown>): string | un
   return trimmed === '' ? undefined : trimmed;
 }
 
+/**
+ * Whisper servers vary a lot:
+ * - { text: "..." }
+ * - { transcription: "..." }
+ * - { result: { text: "..." } }
+ * - { segments: [{ text: "..." }, ...] }
+ */
 function extractText(result: unknown): string {
   if (!result || typeof result !== 'object') return '';
-
   const record = result as Record<string, unknown>;
+
   if (typeof record.text === 'string') return record.text;
   if (typeof record.transcription === 'string') return record.transcription;
+
+  const maybeResult = record.result;
+  if (maybeResult && typeof maybeResult === 'object') {
+    const r = maybeResult as Record<string, unknown>;
+    if (typeof r.text === 'string') return r.text;
+    if (typeof r.transcription === 'string') return r.transcription;
+  }
+
+  const segments = record.segments;
+  if (Array.isArray(segments)) {
+    const parts: string[] = [];
+    for (const seg of segments) {
+      if (seg && typeof seg === 'object') {
+        const s = seg as Record<string, unknown>;
+        if (typeof s.text === 'string' && s.text.trim() !== '') parts.push(s.text.trim());
+      }
+    }
+    if (parts.length > 0) return parts.join(' ').trim();
+  }
 
   return '';
 }
 
 function parseWavDurationMs(wav: Buffer): number | null {
   if (wav.length < 44) return null;
-  if (wav.toString('ascii', 0, 4) !== 'RIFF' || wav.toString('ascii', 8, 12) !== 'WAVE') {
-    return null;
-  }
+  if (wav.toString('ascii', 0, 4) !== 'RIFF' || wav.toString('ascii', 8, 12) !== 'WAVE') return null;
 
   const channels = wav.readUInt16LE(22);
   const sampleRate = wav.readUInt32LE(24);
@@ -202,7 +251,6 @@ function computeAudioMs(input: STTAudioInput, wavPayload: Buffer): number {
     const dataBytes = Math.max(0, wavPayload.length - 44);
     return (dataBytes / (input.sampleRateHz * 2)) * 1000;
   }
-
   const bytesPerSample = input.encoding === 'pcmu' ? 1 : 2;
   return (input.audio.length / (input.sampleRateHz * bytesPerSample)) * 1000;
 }
@@ -217,13 +265,12 @@ function buildWhisperUrl(whisperUrl: string, language?: string): string {
   return `${whisperUrl}${separator}language=${encodeURIComponent(language)}`;
 }
 
-function prepareWavPayload(
-  input: STTAudioInput,
-  meta: AudioMeta | undefined,
-): { wav: Buffer; meta: AudioMeta } {
+function prepareWavPayload(input: STTAudioInput, meta: AudioMeta | undefined): { wav: Buffer; meta: AudioMeta } {
   let nextMeta: AudioMeta = meta ?? {};
+
   if (input.encoding === 'wav') {
     nextMeta = appendLineage(nextMeta, 'passthrough:wav');
+    nextMeta = { ...nextMeta, format: 'wav' };
     return { wav: input.audio, meta: nextMeta };
   }
 
@@ -256,26 +303,20 @@ function prepareWavPayload(
 function logWavDebug(wavPayload: Buffer, logContext?: Record<string, unknown>): void {
   const callControlId = extractCallControlId(logContext);
   const shouldLog = callControlId ? !wavDebugLogged.has(callControlId) : !wavDebugLoggedAnonymous;
-  if (!shouldLog) {
-    return;
-  }
+  if (!shouldLog) return;
 
-  if (callControlId) {
-    wavDebugLogged.add(callControlId);
-  } else {
-    wavDebugLoggedAnonymous = true;
-  }
+  if (callControlId) wavDebugLogged.add(callControlId);
+  else wavDebugLoggedAnonymous = true;
 
   const sampleRate = wavPayload.length >= 28 ? wavPayload.readUInt32LE(24) : undefined;
   const bitsPerSample = wavPayload.length >= 36 ? wavPayload.readUInt16LE(34) : undefined;
   const channels = wavPayload.length >= 24 ? wavPayload.readUInt16LE(22) : undefined;
+
   const firstSamples: number[] = [];
   const dataOffset = 44;
   for (let i = 0; i < 10; i += 1) {
     const offset = dataOffset + i * 2;
-    if (offset + 2 > wavPayload.length) {
-      break;
-    }
+    if (offset + 2 > wavPayload.length) break;
     firstSamples.push(wavPayload.readInt16LE(offset));
   }
 
@@ -285,6 +326,8 @@ function logWavDebug(wavPayload: Buffer, logContext?: Record<string, unknown>): 
       sample_rate: sampleRate,
       bits_per_sample: bitsPerSample,
       channels,
+      wav_bytes: wavPayload.length,
+      sha1_10: sha1_10(wavPayload),
       first_samples: firstSamples,
       ...(logContext ?? {}),
     },
@@ -292,31 +335,46 @@ function logWavDebug(wavPayload: Buffer, logContext?: Record<string, unknown>): 
   );
 }
 
+function previewText(text: string, max = 140): string {
+  const t = text.replace(/\s+/g, ' ').trim();
+  if (t.length <= max) return t;
+  return `${t.slice(0, max)}…`;
+}
+
 export class WhisperHttpProvider implements STTProvider {
   public readonly id = 'whisper_http';
   public readonly supportsPartials = true;
 
   public async transcribe(audio: STTAudioInput, opts: STTOptions = {}): Promise<STTTranscript> {
-    const baseUrl = opts.endpointUrl ?? process.env.WHISPER_URL ?? env.WHISPER_URL;
-    if (!baseUrl) {
-      throw new Error('WHISPER_URL is not set');
+    const isFinal = !opts.isPartial;
+
+    // Optional: hard-disable partials (so you can isolate finals)
+    if (!isFinal && disablePartials()) {
+      return { text: '', isFinal: false, raw: { skipped: 'partials_disabled' } };
     }
 
+    const baseUrl = opts.endpointUrl ?? process.env.WHISPER_URL ?? env.WHISPER_URL;
+    if (!baseUrl) throw new Error('WHISPER_URL is not set');
+
     const whisperUrl = buildWhisperUrl(baseUrl, opts.language);
+
+    const callControlId = extractCallControlId(opts.logContext) ?? (opts.audioMeta?.callId ?? 'unknown');
+    const safeCallKey = sanitizeFilePart(callControlId);
+
     const baseMeta: AudioMeta = {
       ...(opts.audioMeta ?? {}),
       logContext: opts.logContext ?? opts.audioMeta?.logContext,
       kind: opts.isPartial ? 'partial' : 'final',
     };
+
+    // Build WAV bytes
     const gateEnabled = preWhisperGateEnabled();
-    const callControlId = extractCallControlId(opts.logContext) ?? 'unknown';
     let wavPayload: Buffer;
     let wavMeta: AudioMeta;
     let audioForMetrics = audio;
-    let logEncoding = audio.encoding;
-    let logSampleRateHz = audio.sampleRateHz;
 
-    if (gateEnabled) {
+    if (gateEnabled || forceNormalizeWav()) {
+      // preWhisperGate produces canonical 16k mono wav
       const gate = await preWhisperGate({
         buf: audio.audio,
         hints: {
@@ -326,176 +384,236 @@ export class WhisperHttpProvider implements STTProvider {
           callId: callControlId,
         },
       });
+
       wavPayload = gate.wav16kMono;
       wavMeta = appendLineage(baseMeta, 'prewhisper_gate');
       wavMeta = { ...wavMeta, sampleRateHz: WAV_SAMPLE_RATE_HZ, channels: 1, bitDepth: 16, format: 'wav' };
-      audioForMetrics = {
-        audio: wavPayload,
-        sampleRateHz: WAV_SAMPLE_RATE_HZ,
-        encoding: 'wav',
-        channels: 1,
-      };
-      logEncoding = 'wav';
-      logSampleRateHz = WAV_SAMPLE_RATE_HZ;
+      audioForMetrics = { audio: wavPayload, sampleRateHz: WAV_SAMPLE_RATE_HZ, encoding: 'wav', channels: 1 };
     } else {
+      // minimal wrap/resample for legacy callers
       const prepared = prepareWavPayload(audio, baseMeta);
       wavPayload = prepared.wav;
       wavMeta = prepared.meta;
+      audioForMetrics = { audio: wavPayload, sampleRateHz: wavMeta.sampleRateHz ?? audio.sampleRateHz, encoding: 'wav', channels: 1 };
     }
+
+    // Validate + guard
     assertLooksLikeWav(wavPayload, {
       provider: 'whisper_http',
       wav_bytes: wavPayload.length,
+      call_control_id: callControlId,
       ...(opts.logContext ?? {}),
     });
-    const audioMs = computeAudioMs(audioForMetrics, wavPayload);
+
+    const wavSha1 = sha1Hex(wavPayload);
+    const h10 = wavSha1.slice(0, 10);
+
+    // Deduplicate identical partial payloads per call (use full sha1)
+    if (!isFinal) {
+      const prev = lastPartialSha1ByCall.get(safeCallKey);
+      if (prev === wavSha1) {
+        if (mediaDebugEnabled() || (shouldTrace(callControlId))) {
+          log.info(
+            {
+              event: 'stt_whisper_partial_dedup_skipped',
+              call_control_id: callControlId,
+              sha1_10: h10,
+              ...(opts.logContext ?? {}),
+            },
+            'skipping duplicate partial whisper request',
+          );
+        }
+        return { text: '', isFinal: false, raw: { skipped: 'dup_partial', sha1_10: h10 } };
+      }
+      lastPartialSha1ByCall.set(safeCallKey, wavSha1);
+    }
+
+    const whisperStage: 'partial' | 'final' = opts.isPartial ? 'partial' : 'final';
     const tenantLabel = typeof opts.logContext?.tenant_id === 'string' ? opts.logContext.tenant_id : 'unknown';
-    const whisperStage = opts.isPartial ? 'partial' : 'final';
     const stageLabel = opts.isPartial ? 'stt_whisper_http_partial' : 'stt_whisper_http_final';
 
-    observeStageDuration(
-      opts.isPartial ? 'stt_payload_ms_partial' : 'stt_payload_ms_final',
-      tenantLabel,
-      audioMs,
-    );
+    const audioMs = computeAudioMs(audioForMetrics, wavPayload);
+    observeStageDuration(opts.isPartial ? 'stt_payload_ms_partial' : 'stt_payload_ms_final', tenantLabel, audioMs);
 
-    probeWav('stt.submit.wav', wavPayload, {
-      ...wavMeta,
-      kind: whisperStage,
-    });
+    // Optional probing/dumps
+    probeWav('stt.submit.wav', wavPayload, { ...wavMeta, kind: whisperStage });
     await maybeDumpWhisperWav(wavPayload, whisperStage, opts.logContext);
 
-    if (mediaDebugEnabled()) {
-      logWavDebug(wavPayload, opts.logContext);
+    // Trace + media debug summary
+    if (mediaDebugEnabled()) logWavDebug(wavPayload, opts.logContext);
+
+    if (shouldTrace(callControlId)) {
+      const riff = wavPayload.length >= 12 ? wavPayload.toString('ascii', 0, 4) : '';
+      const wave = wavPayload.length >= 12 ? wavPayload.toString('ascii', 8, 12) : '';
+      log.info(
+        {
+          event: 'whisper_send',
+          kind: whisperStage,
+          endpoint: whisperUrl,
+          wav_bytes: wavPayload.length,
+          riff_ok: riff === 'RIFF',
+          wave_ok: wave === 'WAVE',
+          sha1_10: h10,
+          audio_ms: Math.round(audioMs),
+          ...(opts.logContext ?? {}),
+        },
+        'sending whisper wav',
+      );
+    } else if (mediaDebugEnabled()) {
       log.info(
         {
           event: 'whisper_request',
-          encoding: logEncoding,
+          kind: whisperStage,
           wav_bytes: wavPayload.length,
+          sha1_10: h10,
+          ...(opts.logContext ?? {}),
         },
         'whisper request',
       );
     }
 
     const end = startStageTimer(stageLabel, tenantLabel);
-    const httpStartedAt = Date.now();
-    let response: Response;
-    let httpMs = 0;
-    try {
-      log.info(
-        {
-          event: 'stt_whisper_http_request_start',
-          tenant_id: tenantLabel,
-          kind: whisperStage,
-          whisper_url: whisperUrl,
-          encoding: logEncoding,
-          sampleRateHz: logSampleRateHz,
-          wav_bytes: wavPayload.length,
-          audio_ms: audioMs,
-          language: opts.language ?? null,
-          ...(opts.logContext ?? {}),
-        },
-        'stt whisper http request start',
-      );
+    let ended = false;
+    const safeEnd = (): void => {
+      if (!ended) {
+        ended = true;
+        end();
+      }
+    };
 
-      response = await fetch(whisperUrl, {
+    const httpStartedAt = Date.now();
+
+    try {
+     
+      
+      // Send raw WAV bytes (curl --data-binary). Avoid Blob/multipart.
+      // wavPayload is a Buffer
+      const body = wavPayload.buffer.slice(
+        wavPayload.byteOffset,
+        wavPayload.byteOffset + wavPayload.byteLength,
+      ) as ArrayBuffer;
+
+      if (shouldTrace(callControlId) || mediaDebugEnabled()) {
+        log.info(
+          {
+            event: 'whisper_body_debug',
+            wav_bytes: wavPayload.length,
+            body_bytes: body.byteLength,
+            head12: wavPayload.toString('ascii', 0, 12),
+            sha1_10: h10,
+            ...(opts.logContext ?? {}),
+          },
+          'whisper body debug',
+        );
+      }
+
+
+      const response = await fetch(whisperUrl, {
         method: 'POST',
         headers: {
           'Content-Type': 'audio/wav',
+          Accept: 'application/json, text/plain;q=0.9, */*;q=0.1',
         },
-        body: new Uint8Array(wavPayload),
+        body,
         signal: opts.signal,
       });
-      httpMs = Date.now() - httpStartedAt;
-    } catch (error) {
-      httpMs = Date.now() - httpStartedAt;
-      log.info(
-        {
-          event: 'stt_whisper_request',
-          tenant_id: tenantLabel,
-          kind: whisperStage,
-          whisper_stage: whisperStage,
-          encoding: logEncoding,
-          sampleRateHz: logSampleRateHz,
-          audio_bytes: wavPayload.length,
-          audio_ms: audioMs,
-          http_ms: httpMs,
-          duration_ms: httpMs,
-          ...(opts.logContext ?? {}),
-        },
-        'stt whisper request',
-      );
-      if (!isAbortError(error)) {
-        incStageError(stageLabel, tenantLabel);
-      }
-      throw error;
-    } finally {
-      end();
-    }
 
-    log.info(
-      {
-        event: 'stt_whisper_request',
-        tenant_id: tenantLabel,
-        kind: whisperStage,
-        whisper_stage: whisperStage,
-        encoding: logEncoding,
-        sampleRateHz: logSampleRateHz,
-        audio_bytes: wavPayload.length,
-        audio_ms: audioMs,
-        http_ms: httpMs,
-        duration_ms: httpMs,
-        ...(opts.logContext ?? {}),
-      },
-      'stt whisper request',
-    );
+      const httpMs = Date.now() - httpStartedAt;
+      safeEnd();
 
-    if (!response.ok) {
-      const body = await response.text();
-      const preview = body.length > 500 ? `${body.slice(0, 500)}...` : body;
 
-      log.error(
-        { event: 'whisper_error', status: response.status, body_preview: preview },
-        'whisper request failed',
-      );
+      const contentType = response.headers.get('content-type') ?? '';
+      const respText = await response.text();
 
-      incStageError(stageLabel, tenantLabel);
-      throw new Error(`whisper error ${response.status}: ${preview}`);
-    }
-
-    const contentType = response.headers.get('content-type') ?? '';
-    const isFinal = !opts.isPartial;
-
-    if (contentType.includes('application/json')) {
-      const data = (await response.json()) as unknown;
-      const transcript: STTTranscript = {
-        text: extractText(data),
-        isFinal,
-        confidence:
-          typeof (data as { confidence?: unknown }).confidence === 'number'
-            ? (data as { confidence?: number }).confidence
-            : undefined,
-        raw: data,
-      };
-
-      if (mediaDebugEnabled()) {
+      if (shouldTrace(callControlId)) {
         log.info(
-          { event: 'whisper_response', status: response.status, transcript_length: transcript.text.length },
+          {
+            event: 'whisper_http_response',
+            kind: whisperStage,
+            status: response.status,
+            content_type: contentType,
+            elapsed_ms: httpMs,
+            body_prefix: respText.slice(0, 300),
+            sha1_10: h10,
+            ...(opts.logContext ?? {}),
+          },
+          'whisper http response',
+        );
+      }
+
+      if (!response.ok) {
+        incStageError(stageLabel, tenantLabel);
+        const preview = respText.length > 700 ? `${respText.slice(0, 700)}...` : respText;
+        log.error(
+          { event: 'whisper_error', status: response.status, body_preview: preview, ...(opts.logContext ?? {}) },
+          'whisper request failed',
+        );
+        throw new Error(`whisper error ${response.status}: ${preview}`);
+      }
+
+      // Parse result (prefer JSON if possible, but handle text/plain)
+      let textOut = '';
+
+      if (contentType.includes('application/json')) {
+        let data: unknown;
+        try {
+          data = JSON.parse(respText);
+        } catch {
+          // sometimes server sets JSON content-type but sends non-json
+          data = { text: '' };
+        }
+        textOut = extractText(data);
+        const transcript: STTTranscript = {
+          text: textOut,
+          isFinal,
+          confidence:
+            typeof (data as { confidence?: unknown })?.confidence === 'number'
+              ? ((data as { confidence?: number }).confidence as number)
+              : undefined,
+          raw: data,
+        };
+
+        if (mediaDebugEnabled() || shouldTrace(callControlId)) {
+          log.info(
+            {
+              event: 'whisper_response',
+              status: response.status,
+              kind: whisperStage,
+              sha1_10: h10,
+              transcript_length: transcript.text.length,
+              transcript_preview: previewText(transcript.text),
+              ...(opts.logContext ?? {}),
+            },
+            'whisper response',
+          );
+        }
+
+        return transcript;
+      }
+
+      // text/plain fallback
+      textOut = respText ?? '';
+      if (mediaDebugEnabled() || shouldTrace(callControlId)) {
+        log.info(
+          {
+            event: 'whisper_response',
+            status: response.status,
+            kind: whisperStage,
+            sha1_10: h10,
+            transcript_length: textOut.length,
+            transcript_preview: previewText(textOut),
+            ...(opts.logContext ?? {}),
+          },
           'whisper response',
         );
       }
 
-      return transcript;
+      return { text: textOut, isFinal, raw: textOut };
+    } catch (error) {
+      safeEnd();
+
+      if (!isAbortError(error)) incStageError(stageLabel, tenantLabel);
+      throw error;
     }
-
-    const text = await response.text();
-
-    if (mediaDebugEnabled()) {
-      log.info(
-        { event: 'whisper_response', status: response.status, transcript_length: text.length },
-        'whisper response',
-      );
-    }
-
-    return { text, isFinal, raw: text };
   }
 }

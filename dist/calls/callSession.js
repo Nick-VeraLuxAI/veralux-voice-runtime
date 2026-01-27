@@ -60,6 +60,7 @@ class CallSession {
         this.deadAirMs = env_1.env.DEAD_AIR_MS;
         this.deadAirNoFramesMs = env_1.env.DEAD_AIR_NO_FRAMES_MS;
         this.active = true;
+        this.sttInFlightCount = 0;
         this.isHandlingTranscript = false;
         this.hasStarted = false;
         this.turnSequence = 0;
@@ -173,9 +174,14 @@ class CallSession {
         return previousState !== this.state;
     }
     onAudioFrame(frame) {
-        if (!this.active || this.state === 'ENDED') {
+        if (!this.active || this.state === 'ENDED')
+            return;
+        // PSTN must feed STT with decoded PCM16 only (via onPcm16Frame)
+        if (this.transport.mode === 'pstn') {
+            log_1.log.warn({ event: 'unexpected_audio_frame_on_pstn', ...this.logContext }, 'PSTN transport should call onPcm16Frame (decoded pcm16) not onAudioFrame');
             return;
         }
+        // Non-PSTN / WebRTC can continue using this path if that's how your transport works.
         this.lastDecodedFrameAtMs = Date.now();
         if (this.state === 'INIT' || this.state === 'ANSWERED') {
             this.enterListeningState();
@@ -184,20 +190,28 @@ class CallSession {
             this.scheduleDeadAirTimer();
         }
         this.metrics.lastHeardAt = new Date();
-        // Never gate STT audio feed on playback state; transcript handling is gated separately.
         (0, metrics_1.incSttFramesFed)();
-        this.maybeCaptureRxDump(frame);
+        // IMPORTANT: only do rx dump here if you KNOW these bytes are pcm16.
+        // If you don't, remove this line entirely.
+        // this.maybeCaptureRxDump(frame as unknown as Buffer);
         this.stt.ingest(frame);
     }
     onPcm16Frame(frame) {
         if (!this.active || this.state === 'ENDED') {
             return;
         }
-        this.lastDecodedFrameAtMs = Date.now();
+        const now = Date.now();
+        // “We received inbound audio” marker (even if STT is gated during playback)
+        this.lastDecodedFrameAtMs = now;
+        this.metrics.lastHeardAt = new Date();
+        // State transitions + dead-air arming must happen for every inbound frame
         if (this.state === 'INIT' || this.state === 'ANSWERED') {
             this.enterListeningState();
         }
-        this.metrics.lastHeardAt = new Date();
+        else if (this.state === 'LISTENING') {
+            // ✅ CRITICAL: keep dead-air timer fresh while listening
+            this.scheduleDeadAirTimer();
+        }
         if (frame.sampleRateHz !== this.rxSampleRateHz) {
             log_1.log.warn({
                 event: 'stt_sample_rate_mismatch',
@@ -209,6 +223,10 @@ class CallSession {
         const pcmBuffer = Buffer.from(frame.pcm16.buffer, frame.pcm16.byteOffset, frame.pcm16.byteLength);
         (0, metrics_1.incSttFramesFed)();
         this.maybeCaptureRxDump(pcmBuffer);
+        // ✅ Don’t feed Whisper during playback (prevents TTS bleed / empty transcripts)
+        if (this.isPlaybackActive()) {
+            return;
+        }
         this.stt.ingestPcm16(frame.pcm16, frame.sampleRateHz);
     }
     isPlaybackActive() {
@@ -560,30 +578,38 @@ class CallSession {
         if (!this.active || this.state !== 'LISTENING' || this.repromptInFlight) {
             return;
         }
-        // If we're currently processing a transcript, don't reprompt.
+        // If STT is running / request in flight, don't reprompt.
+        // (Stronger than isHandlingTranscript. Keep both if you want.)
+        if (this.sttInFlightCount && this.sttInFlightCount > 0) {
+            this.scheduleDeadAirTimer();
+            return;
+        }
         if (this.isHandlingTranscript) {
             this.scheduleDeadAirTimer();
             return;
         }
         const now = Date.now();
-        // 1) Grace right after we enter LISTENING (prevents greet/playback -> listening race)
+        // 1) Grace right after we enter LISTENING
         if (this.listeningSinceAtMs > 0 && now - this.listeningSinceAtMs < this.deadAirListeningGraceMs) {
             this.scheduleDeadAirTimer();
             return;
         }
-        // 2) If we recently detected speech start, assume user is talking and STT is behind.
+        // 2) Grace after speech start (STT might be behind)
         if (this.lastSpeechStartAtMs > 0 && now - this.lastSpeechStartAtMs < this.deadAirAfterSpeechStartGraceMs) {
             this.scheduleDeadAirTimer();
             return;
         }
-        // 3) If we are still receiving frames recently, don't reprompt.
-        // If frames are still arriving, do NOT treat this as "no-frames" dead air.
+        // 3) If we recently received frames, don't reprompt
         if (this.lastDecodedFrameAtMs > 0 && now - this.lastDecodedFrameAtMs < this.deadAirNoFramesMs) {
-            // frames are alive; just wait for next deadAirMs tick
             this.scheduleDeadAirTimer();
             return;
         }
-        // 4) Extra safety: never reprompt if playback/tts is active (should already be true, but safe)
+        // 3b) If we haven't received any frame since entering LISTENING, don't reprompt
+        if (!this.lastDecodedFrameAtMs || (this.listeningSinceAtMs > 0 && this.lastDecodedFrameAtMs < this.listeningSinceAtMs)) {
+            this.scheduleDeadAirTimer();
+            return;
+        }
+        // 4) Never reprompt during playback/tts
         if (this.isPlaybackActive()) {
             this.scheduleDeadAirTimer();
             return;
@@ -596,7 +622,7 @@ class CallSession {
         finally {
             this.repromptInFlight = false;
             if (this.state === 'LISTENING') {
-                this.listeningSinceAtMs = Date.now(); // reset grace so it doesn't immediately fire again
+                this.listeningSinceAtMs = Date.now();
                 this.scheduleDeadAirTimer();
             }
         }

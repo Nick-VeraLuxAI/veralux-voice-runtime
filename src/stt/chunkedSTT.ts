@@ -1,14 +1,21 @@
+// src/stt/chunkedSTT.ts
+//
+// ChunkedSTT = conversation manager (VAD + timing + buffering + orchestration)
+// It should NOT “enhance” audio. However, in real-time systems, upstream bugs can cause
+// PCM frame replay (lag-k duplication) even when the AMR storage is clean.
+// This file includes an OPTIONAL, ENV-GATED defensive replay guard:
+//   STT_RX_POSTPROCESS_ENABLED=true  => enables the guard
+//   STT_RX_DEDUPE_WINDOW=32          => drop frames repeated within last N frames (per instance)
+//
+// Default behavior remains unchanged when STT_RX_POSTPROCESS_ENABLED is false.
+
+import crypto from 'crypto';
 import { env } from '../env';
 import { log } from '../log';
 import { incStageError, observeStageDuration, startStageTimer } from '../metrics';
-import type { AudioMeta } from '../diagnostics/audioProbe';
-import { appendLineage, attachAudioMeta, getAudioMeta, markAudioSpan, probePcm } from '../diagnostics/audioProbe'
-import { postprocessPcm16 } from '../audio/postprocess';
-
-
+import { SileroVad } from './vad/sileroVad';
 
 type FinalReason = 'silence' | 'stop' | 'max';
-
 type TranscriptSource = 'partial_fallback' | 'final';
 
 export interface SpeechStartInfo {
@@ -18,21 +25,16 @@ export interface SpeechStartInfo {
   streak: number;
 }
 
-export type STTProviderId = 'http_wav_json' | 'http_pcm16';
+// ChunkedSTT sends PCM16LE to provider.
+// Provider handles WAV wrapping / HTTP / streaming / etc.
+export type STTProviderId = 'http_pcm16';
 
-export type STTAudioInput =
-  | {
-      audio: Buffer;
-      sampleRateHz: number;
-      encoding: 'wav';
-      channels: 1;
-    }
-  | {
-      audio: Buffer;
-      sampleRateHz: number;
-      encoding: 'pcm16le';
-      channels: 1;
-    };
+export type STTAudioInput = {
+  audio: Buffer; // PCM16LE mono
+  sampleRateHz: number;
+  encoding: 'pcm16le';
+  channels: 1;
+};
 
 export interface STTProvider {
   id: STTProviderId;
@@ -44,7 +46,6 @@ export interface STTProvider {
       endpointUrl: string;
       logContext?: Record<string, unknown>;
       signal?: AbortSignal;
-      audioMeta?: AudioMeta;
     },
   ): Promise<{ text: string }>;
 }
@@ -54,19 +55,29 @@ export interface ChunkedSTTOptions {
   whisperUrl: string;
   language?: string;
   logContext?: Record<string, unknown>;
+
   onTranscript: (text: string, source?: TranscriptSource) => void;
   onSpeechStart?: (info: SpeechStartInfo) => void;
+
+  // Optional runtime state hooks (used for logging / safety gates)
   isPlaybackActive?: () => boolean;
   isListening?: () => boolean;
   getTrack?: () => string | undefined;
   getCodec?: () => string | undefined;
+
+  // Input coming into ingest()
   inputCodec?: 'pcmu' | 'pcm16le';
-  sampleRate?: number;
+  sampleRate?: number; // if inputCodec=pcmu default 8000; if pcm16le default 16000
   frameMs?: number;
+
+  // Allow opts override (if omitted, env takes precedence)
+  disableGates?: boolean;
+
   partialIntervalMs?: number;
   preRollMs?: number;
   silenceEndMs?: number;
   maxUtteranceMs?: number;
+
   speechRmsFloor?: number;
   speechPeakFloor?: number;
   speechFramesRequired?: number;
@@ -76,17 +87,27 @@ const DEFAULT_PARTIAL_INTERVAL_MS = 250;
 const DEFAULT_SILENCE_END_MS = 900;
 const DEFAULT_PRE_ROLL_MS = 300;
 const DEFAULT_MAX_UTTERANCE_MS = 6000;
-const DEFAULT_MIN_SECONDS = 0.6;
-const DEFAULT_SILENCE_MIN_SECONDS = 0.45;
+
+const DEFAULT_MIN_SECONDS = 0.6; // must have this much audio before partials
+const DEFAULT_SILENCE_MIN_SECONDS = 0.45; // silence needed to finalize
 const DEFAULT_FINAL_TAIL_CUSHION_MS = 120;
 const DEFAULT_FINAL_MIN_SECONDS = 1.0;
 const DEFAULT_PARTIAL_MIN_MS = 600;
-const DEFAULT_HIGHPASS_CUTOFF_HZ = 100;
 
-// Speech detection defaults (your env.ts may override)
+// Speech detection defaults (env.ts may override)
 const DEFAULT_SPEECH_RMS_FLOOR = 0.03;
 const DEFAULT_SPEECH_PEAK_FLOOR = 0.1;
 const DEFAULT_SPEECH_FRAMES_REQUIRED = 8;
+
+// Replay guard defaults
+const DEFAULT_RX_DEDUPE_WINDOW = 32;
+
+function parseBool(value: string | undefined, def = false): boolean {
+  if (value == null) return def;
+  const v = value.trim().toLowerCase();
+  return v === '1' || v === 'true' || v === 'yes' || v === 'y';
+}
+
 
 function clamp(n: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, n));
@@ -109,20 +130,6 @@ function isNonEmpty(text: string): boolean {
   return normalizeWhitespace(text).length > 0;
 }
 
-function parseBool(value: unknown): boolean {
-  if (typeof value !== 'string') return false;
-  const normalized = value.trim().toLowerCase();
-  return normalized === 'true' || normalized === '1' || normalized === 'yes' || normalized === 'y';
-}
-
-function computeHighpassAlpha(sampleRateHz: number, cutoffHz: number): number {
-  const safeSampleRate = sampleRateHz > 0 ? sampleRateHz : 8000;
-  const safeCutoff = cutoffHz > 0 ? cutoffHz : DEFAULT_HIGHPASS_CUTOFF_HZ;
-  const rc = 1 / (2 * Math.PI * safeCutoff);
-  const dt = 1 / safeSampleRate;
-  return rc / (rc + dt);
-}
-
 function isAbortError(error: unknown): boolean {
   if (!error || typeof error !== 'object') return false;
   const name = (error as { name?: unknown }).name;
@@ -135,15 +142,14 @@ function computeRmsAndPeak(pcm16le: Buffer): { rms: number; peak: number } {
   let sumSquares = 0;
   let peak = 0;
 
-  for (let i = 0; i < samples; i++) {
+  for (let i = 0; i < samples; i += 1) {
     const s = pcm16le.readInt16LE(i * 2) / 32768;
     const a = Math.abs(s);
     if (a > peak) peak = a;
     sumSquares += s * s;
   }
 
-  const rms = Math.sqrt(sumSquares / samples);
-  return { rms, peak };
+  return { rms: Math.sqrt(sumSquares / samples), peak };
 }
 
 function clampInt16(n: number): number {
@@ -152,6 +158,7 @@ function clampInt16(n: number): number {
   return n | 0;
 }
 
+// PCMU -> PCM16LE decoding (kept here only because ingest() receives PCMU in some transports).
 function muLawToPcmSample(uLawByte: number): number {
   const u = (~uLawByte) & 0xff;
   const sign = u & 0x80;
@@ -167,35 +174,77 @@ function muLawToPcmSample(uLawByte: number): number {
 function pcmuToPcm16le(pcmu: Buffer): Buffer {
   const output = Buffer.alloc(pcmu.length * 2);
   for (let i = 0; i < pcmu.length; i += 1) {
-    const sample = muLawToPcmSample(pcmu[i]);
+    const sample = muLawToPcmSample(pcmu[i]!);
     output.writeInt16LE(sample, i * 2);
   }
   return output;
 }
+function upsamplePcm16le8kTo16kLinear(pcm16le: Buffer): Buffer {
+  const sampleCount = Math.floor(pcm16le.length / 2);
+  if (sampleCount === 0) return Buffer.alloc(0);
+
+  const out = Buffer.alloc(sampleCount * 4);
+  for (let i = 0; i < sampleCount - 1; i += 1) {
+    const cur = pcm16le.readInt16LE(i * 2);
+    const next = pcm16le.readInt16LE((i + 1) * 2);
+    const interp = clampInt16(Math.round((cur + next) / 2));
+    const o = i * 4;
+    out.writeInt16LE(cur, o);
+    out.writeInt16LE(interp, o + 2);
+  }
+
+  const last = pcm16le.readInt16LE((sampleCount - 1) * 2);
+  const o = (sampleCount - 1) * 4;
+  out.writeInt16LE(last, o);
+  out.writeInt16LE(last, o + 2);
+  return out;
+}
+
+
+function sha1Hex(buf: Buffer): string {
+  return crypto.createHash('sha1').update(buf).digest('hex');
+}
 
 export class ChunkedSTT {
+
+    // ===== Optional VAD (Silero ONNX) =====
+  private readonly vadEnabled: boolean;
+  private readonly vadThreshold: number;
+  private vad?: SileroVad;
+  private vadInit?: Promise<void>;
+  private vadReady = false;
+
+
+  // VAD smoothing counters (optional but helps avoid flapping)
+  private vadSpeechStreak = 0;
+  private vadSilenceStreak = 0;
+  private vadSpeechNow = false;
+  // VAD hysteresis thresholds (prevents flapping)
+  private readonly vadSpeechFramesRequired = clamp(safeNum(process.env.STT_VAD_SPEECH_FRAMES_REQUIRED, 2), 1, 20);
+  private readonly vadSilenceFramesRequired = clamp(safeNum(process.env.STT_VAD_SILENCE_FRAMES_REQUIRED, 6), 1, 50);
+
+
   private readonly provider: STTProvider;
   private readonly whisperUrl: string;
   private readonly language?: string;
   private readonly logContext?: Record<string, unknown>;
   private readonly tenantLabel: string;
+
   private readonly inputCodec: 'pcmu' | 'pcm16le';
-  private readonly sampleRate: number;
-  private readonly bytesPerSecond: number;
+  private readonly sampleRate: number; // expected input sample rate
+  private readonly bytesPerSecondPcm16: number;
+
   private readonly fallbackFrameMs: number;
+
   private readonly minSpeechMs: number;
   private readonly silenceMinSeconds: number;
   private readonly finalTailCushionMs: number;
   private readonly finalMinBytes: number;
-  private readonly partialMinBytes: number;
   private readonly partialMinMs: number;
-  private readonly highpassEnabled: boolean;
-  private readonly highpassCutoffHz: number;
-  private readonly highpassAlpha: number;
+  private readonly partialMinBytes: number;
 
   private readonly partialIntervalMs: number;
   private readonly preRollMaxMs: number;
-
   private readonly silenceEndMs: number;
   private readonly maxUtteranceMs: number;
 
@@ -206,6 +255,7 @@ export class ChunkedSTT {
 
   private readonly onTranscript: (text: string, source?: TranscriptSource) => void;
   private readonly onSpeechStart?: (info: SpeechStartInfo) => void;
+
   private readonly isPlaybackActive?: () => boolean;
   private readonly isListening?: () => boolean;
   private readonly getTrack?: () => string | undefined;
@@ -215,13 +265,9 @@ export class ChunkedSTT {
 
   // State
   private firstFrameLogged = false;
+
   private inSpeech = false;
-  private speechMs = 0;
-
-  /** updated continuously while speech is happening */
   private lastSpeechAt = 0;
-
-  private silenceMsAccum = 0;
 
   private utteranceMs = 0;
   private utteranceBytes = 0;
@@ -230,7 +276,6 @@ export class ChunkedSTT {
   private preRollMs = 0;
 
   private utteranceFrames: Array<{ buffer: Buffer; ms: number }> = [];
-  private utteranceLineage: string[] = [];
 
   private speechFrameStreak = 0;
   private silenceFrameStreak = 0;
@@ -238,7 +283,6 @@ export class ChunkedSTT {
 
   private lastPartialAt = 0;
   private lastPartialTranscript = '';
-  private lastNonEmptyPartialAt = 0;
 
   private rollingRms = 0;
   private rollingPeak = 0;
@@ -252,9 +296,17 @@ export class ChunkedSTT {
   private inFlightKind?: 'partial' | 'final';
   private inFlightAbort?: AbortController;
   private inFlightToken = 0;
-  private decodedProbeLogged = false;
-  private hpfPrevX = 0;
-  private hpfPrevY = 0;
+
+  // ===== Optional RX replay guard (ENV-gated) =====
+  private readonly rxGuardEnabled: boolean;
+  private readonly rxDedupeWindow: number;
+  private readonly recentRxHashes: string[] = [];
+  private rxFramesDropped = 0;
+  private rxFramesKept = 0;
+  // ===== Playback hard-gate state =====
+  private playbackWasActive = false;
+  private playbackEndedAtMs = 0;
+  private readonly postPlaybackGraceMs = safeNum(process.env.STT_POST_PLAYBACK_GRACE_MS, 650);
 
   public constructor(opts: ChunkedSTTOptions) {
     this.provider = opts.provider;
@@ -262,33 +314,42 @@ export class ChunkedSTT {
     this.language = opts.language;
     this.logContext = opts.logContext;
     this.tenantLabel = (opts.logContext?.tenant_id as string) ?? 'unknown';
-    this.inputCodec = opts.inputCodec ?? 'pcmu';
-    const sampleRate = safeNum(opts.sampleRate, 8000);
-    this.sampleRate = sampleRate > 0 ? sampleRate : 8000;
-    this.bytesPerSecond = this.sampleRate * 2;
-    this.fallbackFrameMs = safeNum(opts.frameMs, env.STT_CHUNK_MS);
-    const minSeconds = safeNum(env.STT_MIN_SECONDS, DEFAULT_MIN_SECONDS);
-    this.minSpeechMs = Math.max(0, minSeconds) * 1000;
-    const silenceMinSeconds = safeNum(env.STT_SILENCE_MIN_SECONDS, DEFAULT_SILENCE_MIN_SECONDS);
-    this.silenceMinSeconds =
-      silenceMinSeconds > 0 ? silenceMinSeconds : DEFAULT_SILENCE_MIN_SECONDS;
-    const finalTailCushionMs = safeNum(env.FINAL_TAIL_CUSHION_MS, DEFAULT_FINAL_TAIL_CUSHION_MS);
-    this.finalTailCushionMs = clamp(finalTailCushionMs, 0, 2000);
-    const finalMinSeconds = safeNum(env.FINAL_MIN_SECONDS, DEFAULT_FINAL_MIN_SECONDS);
-    const computedFinalMinBytes = Math.round(
-      this.bytesPerSecond * Math.max(0, finalMinSeconds),
-    );
-    const finalMinBytes = safeNum(env.FINAL_MIN_BYTES, computedFinalMinBytes);
-    this.finalMinBytes = Math.max(0, Math.round(finalMinBytes));
-    this.partialMinMs = clamp(safeNum(env.STT_PARTIAL_MIN_MS, DEFAULT_PARTIAL_MIN_MS), 200, 5000);
-    this.partialMinBytes = Math.max(0, Math.round((this.bytesPerSecond * this.partialMinMs) / 1000));
 
     this.onTranscript = opts.onTranscript;
     this.onSpeechStart = opts.onSpeechStart;
+
     this.isPlaybackActive = opts.isPlaybackActive;
     this.isListening = opts.isListening;
     this.getTrack = opts.getTrack;
     this.getCodec = opts.getCodec;
+
+    this.inputCodec = opts.inputCodec ?? 'pcmu';
+
+    const defaultHz = this.inputCodec === 'pcm16le' ? 16000 : 8000;
+    const sampleRate = safeNum(opts.sampleRate, defaultHz);
+    this.sampleRate = sampleRate > 0 ? sampleRate : defaultHz;
+
+    // PCM16LE bytes/sec (mono)
+    this.bytesPerSecondPcm16 = this.sampleRate * 2;
+
+    this.fallbackFrameMs = safeNum(opts.frameMs, env.STT_CHUNK_MS);
+
+    const minSeconds = safeNum(env.STT_MIN_SECONDS, DEFAULT_MIN_SECONDS);
+    this.minSpeechMs = Math.max(0, minSeconds) * 1000;
+
+    const silenceMinSeconds = safeNum(env.STT_SILENCE_MIN_SECONDS, DEFAULT_SILENCE_MIN_SECONDS);
+    this.silenceMinSeconds = silenceMinSeconds > 0 ? silenceMinSeconds : DEFAULT_SILENCE_MIN_SECONDS;
+
+    const finalTailCushionMs = safeNum(env.FINAL_TAIL_CUSHION_MS, DEFAULT_FINAL_TAIL_CUSHION_MS);
+    this.finalTailCushionMs = clamp(finalTailCushionMs, 0, 2000);
+
+    const finalMinSeconds = safeNum(env.FINAL_MIN_SECONDS, DEFAULT_FINAL_MIN_SECONDS);
+    const computedFinalMinBytes = Math.round(this.bytesPerSecondPcm16 * Math.max(0, finalMinSeconds));
+    const finalMinBytes = safeNum(env.FINAL_MIN_BYTES, computedFinalMinBytes);
+    this.finalMinBytes = Math.max(0, Math.round(finalMinBytes));
+
+    this.partialMinMs = clamp(safeNum(env.STT_PARTIAL_MIN_MS, DEFAULT_PARTIAL_MIN_MS), 200, 5000);
+    this.partialMinBytes = Math.max(0, Math.round((this.bytesPerSecondPcm16 * this.partialMinMs) / 1000));
 
     this.partialIntervalMs = clamp(
       safeNum(opts.partialIntervalMs, env.STT_PARTIAL_INTERVAL_MS ?? DEFAULT_PARTIAL_INTERVAL_MS),
@@ -297,37 +358,62 @@ export class ChunkedSTT {
     );
 
     this.preRollMaxMs = clamp(safeNum(opts.preRollMs, env.STT_PRE_ROLL_MS ?? DEFAULT_PRE_ROLL_MS), 0, 2000);
-
-    this.silenceEndMs = clamp(safeNum(opts.silenceEndMs, env.STT_SILENCE_END_MS ?? DEFAULT_SILENCE_END_MS), 100, 8000);
-
-    this.maxUtteranceMs = clamp(safeNum(opts.maxUtteranceMs, env.STT_MAX_UTTERANCE_MS ?? DEFAULT_MAX_UTTERANCE_MS), 2000, 60000);
-
-    this.highpassEnabled = env.STT_HIGHPASS_ENABLED ?? true;
-    this.highpassCutoffHz = clamp(
-      safeNum(env.STT_HIGHPASS_CUTOFF_HZ, DEFAULT_HIGHPASS_CUTOFF_HZ),
-      20,
-      300,
+    this.silenceEndMs = clamp(
+      safeNum(opts.silenceEndMs, env.STT_SILENCE_END_MS ?? DEFAULT_SILENCE_END_MS),
+      100,
+      8000,
     );
-    this.highpassAlpha = computeHighpassAlpha(this.sampleRate, this.highpassCutoffHz);
+    this.maxUtteranceMs = clamp(
+      safeNum(opts.maxUtteranceMs, env.STT_MAX_UTTERANCE_MS ?? DEFAULT_MAX_UTTERANCE_MS),
+      2000,
+      60000,
+    );
 
     const rmsFloorEnv = env.STT_RMS_FLOOR ?? env.STT_SPEECH_RMS_FLOOR ?? DEFAULT_SPEECH_RMS_FLOOR;
     const peakFloorEnv = env.STT_PEAK_FLOOR ?? env.STT_SPEECH_PEAK_FLOOR ?? DEFAULT_SPEECH_PEAK_FLOOR;
     this.speechRmsFloor = safeNum(opts.speechRmsFloor, rmsFloorEnv);
     this.speechPeakFloor = safeNum(opts.speechPeakFloor, peakFloorEnv);
+
     this.speechFramesRequired = clamp(
-      safeNum(
-        opts.speechFramesRequired,
-        env.STT_SPEECH_FRAMES_REQUIRED ?? DEFAULT_SPEECH_FRAMES_REQUIRED,
-      ),
+      safeNum(opts.speechFramesRequired, env.STT_SPEECH_FRAMES_REQUIRED ?? DEFAULT_SPEECH_FRAMES_REQUIRED),
       1,
       30,
     );
-    this.disableGates = env.STT_DISABLE_GATES ?? false;
+
+    // honor opts override
+    this.disableGates = opts.disableGates ?? (env.STT_DISABLE_GATES ?? false);
+    this.vadEnabled = parseBool(process.env.STT_VAD_ENABLED, false);
+    this.vadThreshold = safeNum(process.env.STT_VAD_THRESHOLD, 0.5);
+
+    if (this.vadEnabled) {
+      this.vadInit = SileroVad.create({ threshold: this.vadThreshold })
+        .then((v) => {
+          this.vad = v;
+          log.info(
+            { event: 'stt_vad_ready', threshold: this.vadThreshold, ...(this.logContext ?? {}) },
+            'silero vad ready',
+          );
+          this.vadReady = true;
+        })
+        .catch((err) => {
+          log.error({ event: 'stt_vad_init_failed', err, ...(this.logContext ?? {}) }, 'silero vad init failed');
+        })
+        .then(() => undefined);
+    }
+
+
+    // Optional RX replay guard
+    this.rxGuardEnabled = parseBool(process.env.STT_RX_POSTPROCESS_ENABLED, false);
+    const win = Number.parseInt(process.env.STT_RX_DEDUPE_WINDOW ?? '', 10);
+    this.rxDedupeWindow =
+      this.rxGuardEnabled && Number.isFinite(win) && win > 0 ? win : this.rxGuardEnabled ? DEFAULT_RX_DEDUPE_WINDOW : 0;
 
     log.info(
       {
         event: 'stt_tuning',
         stt_tuning: {
+          input_codec: this.inputCodec,
+          sample_rate_hz: this.sampleRate,
           rms_floor: this.speechRmsFloor,
           peak_floor: this.speechPeakFloor,
           frames_required: this.speechFramesRequired,
@@ -339,15 +425,16 @@ export class ChunkedSTT {
           max_utt_ms: this.maxUtteranceMs,
           final_tail_cushion_ms: this.finalTailCushionMs,
           final_min_bytes: this.finalMinBytes,
-          highpass_enabled: this.highpassEnabled,
-          highpass_cutoff_hz: this.highpassCutoffHz,
           disable_gates: this.disableGates,
+          rx_guard_enabled: this.rxGuardEnabled,
+          rx_dedupe_window: this.rxDedupeWindow,
         },
         ...(this.logContext ?? {}),
       },
       'stt tuning',
     );
 
+    // Partial tick only. Finalization happens on silence/max/stop.
     this.timer = setInterval(() => {
       try {
         this.flushIfReady('interval');
@@ -357,76 +444,553 @@ export class ChunkedSTT {
     }, this.partialIntervalMs);
   }
 
-  private buildAudioMeta(overrides: Partial<AudioMeta> = {}): AudioMeta {
-    const callIdRaw = this.logContext?.call_control_id;
-    const callId = typeof callIdRaw === 'string' ? callIdRaw : undefined;
-    const tenantId = typeof this.logContext?.tenant_id === 'string' ? this.logContext.tenant_id : undefined;
-    return {
-      callId,
-      tenantId,
-      logContext: this.logContext,
-      ...overrides,
-    };
+  // Direct PCM16 ingest (already decoded elsewhere).
+  public ingestPcm16(pcm16: Int16Array, sampleRateHz: number): void {
+    if (!pcm16 || pcm16.length === 0) return;
+
+    if (sampleRateHz !== this.sampleRate) {
+      log.warn(
+        {
+          event: 'chunked_stt_sample_rate_mismatch',
+          expected_hz: this.sampleRate,
+          got_hz: sampleRateHz,
+          ...(this.logContext ?? {}),
+        },
+        'chunked stt sample rate mismatch',
+      );
+      return;
+    }
+
+    // IMPORTANT: Buffer.from(Int16Array) treats values as bytes (WRONG).
+    // Create a Buffer view over the underlying ArrayBuffer, then COPY.
+    const view = Buffer.from(pcm16.buffer, pcm16.byteOffset, pcm16.byteLength);
+    const frame = Buffer.from(view);
+
+    const computedFrameMs = (pcm16.length / sampleRateHz) * 1000;
+    const frameMs = Number.isFinite(computedFrameMs) && computedFrameMs > 0 ? computedFrameMs : this.fallbackFrameMs;
+    
+    if (!this.firstFrameLogged) {
+      this.firstFrameLogged = true;
+      log.info(
+        {
+          event: 'stt_first_pcm16_frame',
+          input_codec: 'pcm16le',
+          int16_len: pcm16.length,
+          input_bytes: frame.length,
+          sample_rate_hz: sampleRateHz,
+          computed_frame_ms: Math.round(frameMs),
+          ...(this.logContext ?? {}),
+        },
+        'stt first pcm16 frame',
+      );
+    }
+
+
+    void this.ingestDecodedPcm16(frame, frameMs);
   }
 
-  private mergeLineageFromBuffer(buffer: Buffer): void {
-    const meta = getAudioMeta(buffer);
-    if (!meta?.lineage) return;
-    for (const entry of meta.lineage) {
-      if (!this.utteranceLineage.includes(entry)) {
-        this.utteranceLineage.push(entry);
+  // Unified ingest for either PCMU or PCM16LE input.
+  public ingest(input: Buffer): void {
+    if (!input || input.length === 0) return;
+
+    const bytesPerSampleIn = this.inputCodec === 'pcmu' ? 1 : 2;
+    const samples = input.length / bytesPerSampleIn;
+    const computedFrameMs = (samples / this.sampleRate) * 1000;
+    const frameMs = Number.isFinite(computedFrameMs) && computedFrameMs > 0 ? computedFrameMs : this.fallbackFrameMs;
+
+    if (!this.firstFrameLogged) {
+      this.firstFrameLogged = true;
+
+      const bytesPerSampleIn = this.inputCodec === 'pcmu' ? 1 : 2;
+      const computedSamples = input.length / bytesPerSampleIn;
+
+      log.info(
+        {
+          event: 'stt_first_audio_frame',
+          input_codec: this.inputCodec,
+          input_bytes: input.length,
+          bytes_per_sample_in: bytesPerSampleIn,
+          computed_samples: computedSamples,
+          sample_rate_hz: this.sampleRate,
+          computed_frame_ms: Math.round(frameMs),
+          silence_end_ms: this.silenceEndMs,
+          partial_interval_ms: this.partialIntervalMs,
+          ...(this.logContext ?? {}),
+        },
+        'stt first audio frame',
+      );
+    }
+
+
+    let framePcm16: Buffer;
+    if (this.inputCodec === 'pcmu') {
+      framePcm16 = pcmuToPcm16le(input);
+    } else {
+      // passthrough, but COPY so we don't retain a pooled/reused buffer
+      framePcm16 = Buffer.from(input);
+    }
+
+    void this.ingestDecodedPcm16(framePcm16, frameMs);
+  }
+
+  // Optional defensive replay guard: drops identical frames repeated within last N frames.
+  private shouldDropRxFrame(pcm16: Buffer): { drop: boolean; sha1_10: string; matchedLag?: number } {
+    if (!this.rxGuardEnabled || this.rxDedupeWindow <= 0) return { drop: false, sha1_10: '' };
+
+    // Hash the PCM bytes for replay detection.
+    const h = sha1Hex(pcm16);
+    const h10 = h.slice(0, 10);
+
+    // Check lag-k inside recent window.
+    const recent = this.recentRxHashes;
+    for (let i = recent.length - 1, lag = 1; i >= 0 && lag <= this.rxDedupeWindow; i -= 1, lag += 1) {
+      if (recent[i] === h) return { drop: true, sha1_10: h10, matchedLag: lag };
+    }
+
+    // Keep: push into window
+    recent.push(h);
+    if (recent.length > this.rxDedupeWindow) recent.shift();
+    return { drop: false, sha1_10: h10 };
+  }
+
+  // Post-decode path (PCM16LE mono @ this.sampleRate)
+  private async ingestDecodedPcm16(pcm16: Buffer, frameMs: number): Promise<void> {
+    // ===== HARD GATE during playback (and brief grace after) =====
+    if (!this.disableGates && this.isPlaybackActive?.()) {
+      this.playbackWasActive = true;
+
+      // If we were mid-utterance, kill it—prevents mixing user speech with TTS bleed
+      if (this.inSpeech) this.resetUtteranceState();
+
+      return;
+    }
+
+    if (this.playbackWasActive) {
+      // playback just ended
+      this.playbackWasActive = false;
+      this.playbackEndedAtMs = Date.now();
+
+      // reset VAD state so we don't carry stale speech state across the boundary
+      this.vadSpeechNow = false;
+      this.vadSpeechStreak = 0;
+      this.vadSilenceStreak = 0;
+      if (this.vad) this.vad.reset();
+      this.recentRxHashes.length = 0;
+    }
+
+    if (!this.disableGates && this.playbackEndedAtMs > 0) {
+      const since = Date.now() - this.playbackEndedAtMs;
+      if (since < this.postPlaybackGraceMs) return;
+      this.playbackEndedAtMs = 0;
+    }
+
+
+    // ===== Replay guard here (before any VAD/state) =====
+    const guard = this.shouldDropRxFrame(pcm16);
+    if (guard.drop) {
+      this.rxFramesDropped += 1;
+      // Throttle logs a bit
+      if (this.rxFramesDropped <= 20 || this.rxFramesDropped % 100 === 0) {
+        log.warn(
+          {
+            event: 'stt_rx_replay_dropped',
+            matched_lag: guard.matchedLag,
+            sha1_10: guard.sha1_10,
+            dropped: this.rxFramesDropped,
+            kept: this.rxFramesKept,
+            rx_dedupe_window: this.rxDedupeWindow,
+            ...(this.logContext ?? {}),
+          },
+          'dropping replayed PCM frame before ChunkedSTT buffering',
+        );
+      }
+      return;
+    }
+    this.rxFramesKept += 1;
+
+    const stats = computeRmsAndPeak(pcm16);
+    this.updateRollingStats(stats);
+
+    const gateRms = stats.rms >= this.speechRmsFloor;
+    const gatePeak = stats.peak >= this.speechPeakFloor;
+
+    // === VAD: speech decision ===
+    if (this.vadEnabled && this.vadReady && this.vad) {
+      const pcmForVad =
+        this.sampleRate === 16000
+          ? pcm16
+          : this.sampleRate === 8000
+            ? upsamplePcm16le8kTo16kLinear(pcm16)
+            : null;
+
+      if (pcmForVad) {
+        const res = await this.vad.pushPcm16le16k(pcmForVad);
+        if (res) {
+          this.vadSpeechNow = !!res.isSpeech;
+          if (res.isSpeech) {
+            this.vadSpeechStreak += 1;
+            this.vadSilenceStreak = 0;
+          } else {
+            this.vadSilenceStreak += 1;
+            this.vadSpeechStreak = 0;
+          }
+        }
       }
     }
-  }
 
-  private mergeLineageFromFrames(frames: Array<{ buffer: Buffer }>): void {
-    for (const frame of frames) {
-      this.mergeLineageFromBuffer(frame.buffer);
+    let vadSpeechDecision: boolean | null = null;
+
+    if (this.vadEnabled && this.vadReady && this.vad) {
+      // “Speech” only after N consecutive speech frames
+      // “Silence” only after M consecutive silence frames
+      if (this.vadSpeechStreak >= this.vadSpeechFramesRequired) vadSpeechDecision = true;
+      else if (this.vadSilenceStreak >= this.vadSilenceFramesRequired) vadSpeechDecision = false;
+      else vadSpeechDecision = this.vadSpeechNow; // hold last raw vad output
+    }
+
+    const isSpeech = this.disableGates ? true : (vadSpeechDecision ?? (gateRms && gatePeak));
+
+    if (!this.disableGates && (this.rxFramesKept <= 20 || this.rxFramesKept % 100 === 0)) {
+      log.info(
+        {
+          event: 'stt_speech_decision',
+          is_speech: isSpeech,
+          vad_enabled: this.vadEnabled && this.vadReady,
+          vad_raw: this.vadSpeechNow,
+          vad_speech_streak: this.vadSpeechStreak,
+          vad_silence_streak: this.vadSilenceStreak,
+          vad_speech_req: this.vadSpeechFramesRequired,
+          vad_silence_req: this.vadSilenceFramesRequired,
+          vad_decision: vadSpeechDecision,
+          gate_rms: gateRms,
+          gate_peak: gatePeak,
+          rms: stats.rms,
+          peak: stats.peak,
+          ...(this.logContext ?? {}),
+        },
+        'stt speech decision',
+      );
+    }
+
+
+    // Barge-in: if final request is in-flight and speech resumes, abort and reset.
+    if (this.inFlight && this.inFlightKind === 'final' && isSpeech) {
+      this.abortInFlight('barge_in');
+      this.resetUtteranceState();
+      return;
+    }
+
+    // Not in speech yet: build pre-roll and detect start
+    if (!this.inSpeech) {
+      this.addPreRollFrame(pcm16, frameMs);
+
+      if (isSpeech) {
+        this.silenceFrameStreak = 0;
+        this.silenceToFinalizeTimer = undefined;
+        this.speechFrameStreak += 1;
+      } else {
+        this.speechFrameStreak = 0;
+      }
+
+      if (isSpeech && this.speechFrameStreak >= this.speechFramesRequired) {
+        this.startSpeech(stats, frameMs);
+        this.onSpeechStart?.({ rms: stats.rms, peak: stats.peak, frameMs, streak: this.speechFrameStreak });
+      } else if (!this.disableGates) {
+        const reason = this.resolveGateClosedReason(gateRms, gatePeak, this.speechFrameStreak);
+        if (reason) this.maybeLogGateClosed(reason, stats, frameMs);
+      }
+      return;
+    }
+
+    // In speech: append frames and decide when to finalize
+    this.appendUtterance(pcm16, frameMs);
+
+    if (isSpeech) {
+      this.lastSpeechAt = Date.now();
+      this.silenceFrameStreak = 0;
+      this.silenceToFinalizeTimer = undefined;
+    } else {
+      if (this.silenceFrameStreak === 0) {
+        this.silenceToFinalizeTimer = startStageTimer('stt_silence_to_finalize_ms', this.tenantLabel);
+      }
+      this.silenceFrameStreak += 1;
+
+      const silenceFramesNeeded = Math.max(1, Math.ceil(this.silenceEndMs / frameMs));
+      if (this.silenceFrameStreak >= silenceFramesNeeded) {
+        this.silenceToFinalizeTimer?.();
+        this.silenceToFinalizeTimer = undefined;
+        this.finalizeUtterance('silence');
+        return;
+      }
+    }
+
+    if (this.utteranceMs >= this.maxUtteranceMs) {
+      this.finalizeUtterance('max');
+      return;
     }
   }
 
-  private applyHighpassPcm16(pcm16le: Buffer): Buffer {
-    if (!this.highpassEnabled || pcm16le.length < 2) {
-      return pcm16le;
-    }
-
-    const out = Buffer.allocUnsafe(pcm16le.length);
-    const samples = Math.floor(pcm16le.length / 2);
-    let prevX = this.hpfPrevX;
-    let prevY = this.hpfPrevY;
-    const alpha = this.highpassAlpha;
-
-    for (let i = 0; i < samples; i += 1) {
-      const x = pcm16le.readInt16LE(i * 2) / 32768;
-      const y = alpha * (prevY + x - prevX);
-      prevX = x;
-      prevY = y;
-      out.writeInt16LE(clampInt16(Math.round(y * 32767)), i * 2);
-    }
-
-    this.hpfPrevX = prevX;
-    this.hpfPrevY = prevY;
-    return out;
+  public stop(): void {
+    if (this.timer) clearInterval(this.timer);
+    this.timer = undefined;
+    if (this.inSpeech && this.utteranceBytes > 0) this.flushIfReady('stop');
   }
 
-  private estimateSilenceMs(
-    frames: Array<{ buffer: Buffer; ms: number }>,
-  ): { leadingMs: number; trailingMs: number } {
-    let leadingMs = 0;
-    for (const frame of frames) {
-      const stats = computeRmsAndPeak(frame.buffer);
-      if (stats.rms >= this.speechRmsFloor) break;
-      leadingMs += frame.ms;
-    }
+  private flushIfReady(reason: 'interval' | 'silence' | 'stop'): void {
+    if (reason === 'interval') return void this.maybeSendPartial();
+    if (reason === 'stop') return void this.finalizeUtterance('stop');
+    this.finalizeUtterance('silence');
+  }
 
-    let trailingMs = 0;
+  private addPreRollFrame(pcm16: Buffer, frameMs: number): void {
+    if (this.preRollMaxMs <= 0) return;
+
+    // Snapshot bytes so we don’t keep references to pooled buffers.
+    const snap = Buffer.from(pcm16);
+
+    this.preRollFrames.push({ buffer: snap, ms: frameMs });
+    this.preRollMs += frameMs;
+
+    while (this.preRollMs > this.preRollMaxMs && this.preRollFrames.length > 0) {
+      const dropped = this.preRollFrames.shift();
+      if (!dropped) break;
+      this.preRollMs -= dropped.ms;
+    }
+  }
+
+  private startSpeech(stats: { rms: number; peak: number }, frameMs: number): void {
+    this.inSpeech = true;
+    this.lastSpeechAt = Date.now();
+    this.silenceFrameStreak = 0;
+    this.silenceToFinalizeTimer = undefined;
+
+    // Start utterance with pre-roll
+    this.utteranceFrames = [...this.preRollFrames];
+    this.utteranceMs = this.preRollMs;
+    this.utteranceBytes = this.utteranceFrames.reduce((sum, f) => sum + f.buffer.length, 0);
+
+    this.preRollFrames = [];
+    this.preRollMs = 0;
+
+    this.lastPartialAt = 0;
+    this.lastPartialTranscript = '';
+
+    this.finalFlushAt = 0;
+    this.finalTranscriptAccepted = false;
+
+    log.info(
+      {
+        event: 'stt_speech_start',
+        speech_rms: Number(stats.rms.toFixed(4)),
+        speech_peak: Number(stats.peak.toFixed(4)),
+        frame_ms: Math.round(frameMs),
+        ...(this.logContext ?? {}),
+      },
+      'stt speech start',
+    );
+  }
+
+  private appendUtterance(pcm16: Buffer, frameMs: number): void {
+    const snap = Buffer.from(pcm16);
+    this.utteranceFrames.push({ buffer: snap, ms: frameMs });
+    this.utteranceMs += frameMs;
+    this.utteranceBytes += snap.length;
+  }
+
+  // Final tail trim: keep a small cushion of silence after last detected speech frame.
+  private trimTrailingSilence(frames: Array<{ buffer: Buffer; ms: number }>): Array<{ buffer: Buffer; ms: number }> {
+    if (frames.length === 0) return frames;
+
+    let lastSpeechIndex = -1;
     for (let i = frames.length - 1; i >= 0; i -= 1) {
       const stats = computeRmsAndPeak(frames[i]!.buffer);
-      if (stats.rms >= this.speechRmsFloor) break;
-      trailingMs += frames[i]!.ms;
+      if (stats.rms >= this.speechRmsFloor && stats.peak >= this.speechPeakFloor) {
+        lastSpeechIndex = i;
+        break;
+      }
+    }
+    if (lastSpeechIndex === -1) return frames;
+
+    let endIndex = lastSpeechIndex;
+    let tailMs = 0;
+    for (let i = lastSpeechIndex + 1; i < frames.length; i += 1) {
+      tailMs += frames[i]!.ms;
+      endIndex = i;
+      if (tailMs >= this.finalTailCushionMs) break;
     }
 
-    return { leadingMs, trailingMs };
+    if (endIndex >= frames.length - 1) return frames;
+    return frames.slice(0, endIndex + 1);
+  }
+
+  private maybeSendPartial(): void {
+    if (!this.inSpeech) return;
+    if (this.inFlight) return;
+    if (this.utteranceMs < this.minSpeechMs) return;
+
+    const now = Date.now();
+    if (this.lastPartialAt > 0 && now - this.lastPartialAt < this.partialIntervalMs) return;
+
+    const payload = this.concatFrames(this.utteranceFrames);
+    if (payload.length < this.partialMinBytes) return;
+
+    this.lastPartialAt = now;
+    this.enqueueTranscription(payload, { reason: 'partial', isFinal: false });
+  }
+
+  private finalizeUtterance(reason: FinalReason): void {
+    if (!this.inSpeech || this.utteranceBytes === 0) return;
+
+    if (this.finalFlushAt === 0) {
+      this.finalFlushAt = Date.now();
+      if (reason === 'silence' && this.lastSpeechAt > 0) {
+        observeStageDuration('pre_stt_gate', this.tenantLabel, Date.now() - this.lastSpeechAt);
+      }
+    }
+
+    if (this.inFlight) {
+      if (this.inFlightKind === 'final') return;
+      this.abortInFlight('finalize');
+    }
+
+    const trimmedFrames = this.trimTrailingSilence(this.utteranceFrames);
+    const payload = this.concatFrames(trimmedFrames);
+
+    log.info(
+      {
+        event: 'stt_finalize_payload_stats',
+        reason,
+        frames: trimmedFrames.length,
+        utterance_ms: Math.round((payload.length / this.bytesPerSecondPcm16) * 1000),
+        bytes: payload.length,
+        silence_end_ms: this.silenceEndMs,
+        min_speech_ms: this.minSpeechMs,
+        final_min_bytes: this.finalMinBytes,
+        ...(this.logContext ?? {}),
+      },
+      'finalizing utterance payload',
+    );
+
+    this.enqueueTranscription(payload, {
+      reason: 'final',
+      isFinal: true,
+      finalReason: reason,
+    });
+
+    // IMPORTANT: reset immediately so we can start a new utterance while STT is in-flight.
+    this.resetUtteranceState();
+  }
+
+  private concatFrames(frames: Array<{ buffer: Buffer }>): Buffer {
+    if (frames.length === 1) return frames[0]!.buffer;
+    return Buffer.concat(frames.map((f) => f.buffer));
+  }
+
+  private abortInFlight(reason: 'barge_in' | 'finalize'): void {
+    if (!this.inFlight) return;
+
+    this.inFlightAbort?.abort();
+    this.inFlightAbort = undefined;
+
+    this.inFlight = false;
+    this.inFlightKind = undefined;
+    this.finalizeToResultTimer = undefined;
+    this.finalFlushAt = 0;
+    this.inFlightToken += 1;
+
+    if (reason === 'barge_in') {
+      this.silenceFrameStreak = 0;
+      this.silenceToFinalizeTimer = undefined;
+    }
+  }
+
+  private enqueueTranscription(
+    payloadPcm16: Buffer,
+    meta: { reason: 'partial' | 'final'; isFinal: boolean; finalReason?: FinalReason },
+  ): void {
+    if (this.inFlight) return;
+
+    this.inFlight = true;
+    this.inFlightKind = meta.reason;
+    const token = (this.inFlightToken += 1);
+    this.inFlightAbort = new AbortController();
+
+    if (meta.isFinal) this.finalizeToResultTimer = startStageTimer('stt_finalize_to_result_ms', this.tenantLabel);
+
+    void this.transcribePayload(payloadPcm16, meta, token, this.inFlightAbort.signal)
+      .catch((err) => log.error({ err, ...(this.logContext ?? {}) }, 'stt transcription failed'))
+      .finally(() => {
+        if (this.inFlightToken !== token) return;
+        this.inFlight = false;
+        this.inFlightKind = undefined;
+        this.inFlightAbort = undefined;
+        this.finalizeToResultTimer = undefined;
+      });
+  }
+
+  private async transcribePayload(
+    payloadPcm16: Buffer,
+    meta: { reason: 'partial' | 'final'; isFinal: boolean; finalReason?: FinalReason },
+    token: number,
+    signal: AbortSignal,
+  ): Promise<void> {
+    const startedAt = Date.now();
+
+    const audioInput: STTAudioInput = {
+      audio: payloadPcm16,
+      sampleRateHz: this.sampleRate,
+      encoding: 'pcm16le',
+      channels: 1,
+    };
+
+    const endStt = startStageTimer('stt', this.tenantLabel);
+
+    try {
+      const result = await this.provider.transcribe(audioInput, {
+        language: this.language,
+        isPartial: meta.reason === 'partial',
+        endpointUrl: this.whisperUrl,
+        logContext: this.logContext,
+        signal,
+      });
+
+      endStt();
+      if (token !== this.inFlightToken) return;
+
+      this.finalizeToResultTimer?.();
+      this.finalizeToResultTimer = undefined;
+
+      const text = normalizeWhitespace(result.text ?? '');
+      log.info(
+        {
+          event: 'stt_transcription_result',
+          kind: meta.reason,
+          elapsed_ms: Date.now() - startedAt,
+          text_len: text.length,
+          ...(this.logContext ?? {}),
+        },
+        'stt transcription result',
+      );
+
+      if (!text) return;
+
+      if (meta.reason === 'partial') {
+        if (text === this.lastPartialTranscript) return;
+        this.lastPartialTranscript = text;
+        if (isNonEmpty(text)) this.onTranscript(text, 'partial_fallback');
+        return;
+      }
+
+      if (!this.finalTranscriptAccepted) {
+        this.finalTranscriptAccepted = true;
+        this.onTranscript(text, 'final');
+      }
+    } catch (error) {
+      endStt();
+      if (signal.aborted || isAbortError(error)) return;
+      incStageError('stt', this.tenantLabel);
+      throw error;
+    }
   }
 
   private updateRollingStats(stats: { rms: number; peak: number }): void {
@@ -485,612 +1049,26 @@ export class ChunkedSTT {
     );
   }
 
-  public ingestPcm16(pcm16: Int16Array, sampleRateHz: number): void {
-    if (!pcm16 || pcm16.length === 0) return;
-    if (sampleRateHz !== this.sampleRate) {
-      log.warn(
-        {
-          event: 'chunked_stt_sample_rate_mismatch',
-          expected_hz: this.sampleRate,
-          got_hz: sampleRateHz,
-          ...(this.logContext ?? {}),
-        },
-        'chunked stt sample rate mismatch',
-      );
-      return;
-    }
-    const buf = Buffer.from(pcm16.buffer, pcm16.byteOffset, pcm16.byteLength);
-    this.ingest(buf);
-  }
-
-  public ingest(pcm: Buffer): void {
-    if (!pcm || pcm.length === 0) return;
-
-    const bytesPerSample = this.inputCodec === 'pcmu' ? 1 : 2;
-    const samples = pcm.length / bytesPerSample;
-    const computedFrameMs = (samples / this.sampleRate) * 1000;
-    const frameMs =
-      Number.isFinite(computedFrameMs) && computedFrameMs > 0
-        ? computedFrameMs
-        : this.fallbackFrameMs;
-
-    // First-frame log (helps confirm audio is arriving)
-    if (!this.firstFrameLogged) {
-      this.firstFrameLogged = true;
-      log.info(
-        {
-          event: 'stt_first_audio_frame',
-          frame_bytes: pcm.length,
-          frame_ms: Math.round(frameMs),
-          silence_end_ms: this.silenceEndMs,
-          partial_interval_ms: this.partialIntervalMs,
-          ...(this.logContext ?? {}),
-        },
-        'stt first audio frame',
-      );
-    }
-
-    let rawMeta = getAudioMeta(pcm);
-    if (!rawMeta) {
-      rawMeta = this.buildAudioMeta({
-        format: this.inputCodec === 'pcmu' ? 'pcmu' : 'pcm16le',
-        sampleRateHz: this.sampleRate,
-        channels: 1,
-        bitDepth: this.inputCodec === 'pcmu' ? 8 : 16,
-        lineage: ['rx.telnyx.raw'],
-      });
-      attachAudioMeta(pcm, rawMeta);
-    }
-
-    let frame =
-      this.inputCodec === 'pcmu'
-        ? pcmuToPcm16le(pcm)
-        : pcm;
-
-    // 🔑 APPLY RX POSTPROCESS HERE
-    // 🔑 APPLY RX POSTPROCESS HERE (SAFE LE PCM16 <-> Int16)
-    const sampleCount = Math.floor(frame.length / 2);
-    const safePcm = new Int16Array(sampleCount);
-    for (let i = 0; i < sampleCount; i += 1) {
-      safePcm[i] = frame.readInt16LE(i * 2);
-    }
-
-    const processed = postprocessPcm16(safePcm, this.sampleRate);
-
-    const out = Buffer.allocUnsafe(processed.samples.length * 2);
-    for (let i = 0; i < processed.samples.length; i += 1) {
-      out.writeInt16LE(processed.samples[i]!, i * 2);
-    }
-    frame = out;
-
-
-
-    let decodedMeta = appendLineage(
-      rawMeta,
-      this.inputCodec === 'pcmu' ? 'decode:pcmu->pcm16le' : 'passthrough:pcm16le',
-    );
-    attachAudioMeta(frame, decodedMeta);
-    if (this.highpassEnabled) {
-      frame = this.applyHighpassPcm16(frame);
-      decodedMeta = appendLineage(decodedMeta, `filter:highpass_${this.highpassCutoffHz}hz`);
-      attachAudioMeta(frame, decodedMeta);
-    }
-    if (!this.decodedProbeLogged) {
-      this.decodedProbeLogged = true;
-      probePcm('rx.decoded.pcm', frame, {
-        ...decodedMeta,
-        format: 'pcm16le',
-        sampleRateHz: this.sampleRate,
-        channels: 1,
-        bitDepth: 16,
-      });
-    }
-    const stats = computeRmsAndPeak(frame);
-    this.updateRollingStats(stats);
-    const gateRms = stats.rms >= this.speechRmsFloor;
-    const gatePeak = stats.peak >= this.speechPeakFloor;
-    const isSpeech = this.disableGates ? true : gateRms && gatePeak;
-
-    if (this.inFlight && this.inFlightKind === 'final' && isSpeech) {
-      this.abortInFlight('barge_in');
-      this.resetUtteranceState();
-    }
-
-    if (!this.inSpeech) {
-      // Maintain pre-roll buffer while idle
-      this.addPreRollFrame(frame, frameMs);
-
-      if (isSpeech) {
-        this.silenceFrameStreak = 0;
-        this.silenceToFinalizeTimer = undefined;
-        this.speechFrameStreak += 1;
-      } else {
-        this.speechFrameStreak = 0;
-      }
-
-      if (isSpeech && this.speechFrameStreak >= this.speechFramesRequired) {
-        this.startSpeech(stats, frameMs);
-        if (this.onSpeechStart) {
-          this.onSpeechStart({
-            rms: stats.rms,
-            peak: stats.peak,
-            frameMs,
-            streak: this.speechFrameStreak,
-          });
-        }
-      } else if (!this.disableGates) {
-        const reason = this.resolveGateClosedReason(gateRms, gatePeak, this.speechFrameStreak);
-        if (reason) {
-          this.maybeLogGateClosed(reason, stats, frameMs);
-        }
-      }
-      return;
-    }
-
-    // In speech: append to utterance
-    this.appendUtterance(frame, frameMs);
-
-    if (isSpeech) {
-      // ✅ IMPORTANT: update lastSpeechAt continuously (not just at startSpeech)
-      this.lastSpeechAt = Date.now();
-      this.speechMs += frameMs;
-      this.silenceMsAccum = 0;
-      this.silenceFrameStreak = 0;
-      this.silenceToFinalizeTimer = undefined;
-    } else {
-      this.silenceMsAccum += frameMs;
-      if (this.silenceFrameStreak === 0) {
-        this.silenceToFinalizeTimer = startStageTimer('stt_silence_to_finalize_ms', this.tenantLabel);
-      }
-      this.silenceFrameStreak += 1;
-      const silenceFramesNeeded = Math.max(
-        1,
-        Math.ceil((this.silenceMinSeconds * 1000) / frameMs),
-      );
-      if (this.silenceFrameStreak >= silenceFramesNeeded) {
-        if (this.silenceToFinalizeTimer) {
-          this.silenceToFinalizeTimer();
-          this.silenceToFinalizeTimer = undefined;
-        }
-        this.finalizeUtterance('silence');
-        return;
-      }
-    }
-
-    if (this.utteranceMs >= this.maxUtteranceMs) {
-      this.finalizeUtterance('max');
-      return;
-    }
-  }
-
-  public stop(): void {
-    if (this.timer) clearInterval(this.timer);
-    this.timer = undefined;
-
-    if (this.inSpeech && this.utteranceBytes > 0) {
-      this.flushIfReady('stop');
-    }
-  }
-
-  private flushIfReady(reason: 'interval' | 'silence' | 'stop'): void {
-    if (reason === 'interval') {
-      this.maybeSendPartial();
-      return;
-    }
-
-    if (reason === 'stop') {
-      this.finalizeUtterance('stop');
-      return;
-    }
-
-    this.finalizeUtterance('silence');
-  }
-
-  private addPreRollFrame(pcm: Buffer, frameMs: number): void {
-    if (this.preRollMaxMs <= 0) return;
-
-    this.preRollFrames.push({ buffer: pcm, ms: frameMs });
-    this.preRollMs += frameMs;
-    this.mergeLineageFromBuffer(pcm);
-
-    while (this.preRollMs > this.preRollMaxMs && this.preRollFrames.length > 0) {
-      const dropped = this.preRollFrames.shift();
-      if (!dropped) break;
-      this.preRollMs -= dropped.ms;
-    }
-  }
-
-  private startSpeech(stats: { rms: number; peak: number }, frameMs: number): void {
-    this.inSpeech = true;
-    this.lastSpeechAt = Date.now();
-    this.silenceMsAccum = 0;
-    this.silenceFrameStreak = 0;
-    this.silenceToFinalizeTimer = undefined;
-    this.speechMs = this.speechFrameStreak * frameMs;
-
-    this.utteranceFrames = [...this.preRollFrames];
-    this.utteranceMs = this.preRollMs;
-    this.utteranceBytes = this.utteranceFrames.reduce((sum, frame) => sum + frame.buffer.length, 0);
-    this.utteranceLineage = [];
-    this.mergeLineageFromFrames(this.utteranceFrames);
-
-    this.preRollFrames = [];
-    this.preRollMs = 0;
-
-    this.lastPartialAt = 0;
-    this.lastPartialTranscript = '';
-    this.lastNonEmptyPartialAt = 0;
-
-    this.finalFlushAt = 0;
-    this.finalTranscriptAccepted = false;
-
-    markAudioSpan(
-      'rx',
-      this.buildAudioMeta({
-        lineage: [...this.utteranceLineage],
-      }),
-    );
-
-    log.info(
-      {
-        event: 'stt_speech_start',
-        speech_rms: Number(stats.rms.toFixed(4)),
-        speech_peak: Number(stats.peak.toFixed(4)),
-        ...(this.logContext ?? {}),
-      },
-      'stt speech start',
-    );
-  }
-
-  private appendUtterance(pcm: Buffer, frameMs: number): void {
-    this.utteranceFrames.push({ buffer: pcm, ms: frameMs });
-    this.utteranceMs += frameMs;
-    this.utteranceBytes += pcm.length;
-    this.mergeLineageFromBuffer(pcm);
-  }
-
-  private trimTrailingSilence(
-    frames: Array<{ buffer: Buffer; ms: number }>,
-  ): Array<{ buffer: Buffer; ms: number }> {
-    if (frames.length === 0) return frames;
-
-    let lastSpeechIndex = -1;
-    for (let i = frames.length - 1; i >= 0; i -= 1) {
-      const stats = computeRmsAndPeak(frames[i].buffer);
-      if (stats.rms >= this.speechRmsFloor) {
-        lastSpeechIndex = i;
-        break;
-      }
-    }
-
-    if (lastSpeechIndex === -1) return frames;
-
-    let endIndex = lastSpeechIndex;
-    let tailMs = 0;
-    for (let i = lastSpeechIndex + 1; i < frames.length; i += 1) {
-      tailMs += frames[i].ms;
-      endIndex = i;
-      if (tailMs >= this.finalTailCushionMs) {
-        break;
-      }
-    }
-
-    if (endIndex >= frames.length - 1) return frames;
-    return frames.slice(0, endIndex + 1);
-  }
-
-  private maybeSendPartial(): void {
-    if (!this.inSpeech) return;
-    if (this.inFlight) return;
-    if (this.utteranceMs < this.minSpeechMs) return;
-
-    const now = Date.now();
-    if (this.lastPartialAt > 0 && now - this.lastPartialAt < this.partialIntervalMs) return;
-
-    const payload = this.concatFrames(this.utteranceFrames);
-    if (payload.length < this.partialMinBytes) {
-      const stats = computeRmsAndPeak(payload);
-      const silence = this.estimateSilenceMs(this.utteranceFrames);
-      const audioMs = Math.round((payload.length / this.bytesPerSecond) * 1000);
-      log.info(
-        {
-          event: 'stt_partial_skip_short',
-          audio_ms: audioMs,
-          audio_bytes: payload.length,
-          rms: Number(stats.rms.toFixed(6)),
-          peak: Number(stats.peak.toFixed(6)),
-          leading_silence_ms: Math.round(silence.leadingMs),
-          trailing_silence_ms: Math.round(silence.trailingMs),
-          min_ms: this.partialMinMs,
-          min_bytes: this.partialMinBytes,
-          ...(this.logContext ?? {}),
-        },
-        'stt partial skipped (too short)',
-      );
-      return;
-    }
-
-    this.lastPartialAt = now;
-    const stats = computeRmsAndPeak(payload);
-    const silence = this.estimateSilenceMs(this.utteranceFrames);
-    const audioMs = Math.round((payload.length / this.bytesPerSecond) * 1000);
-    log.info(
-      {
-        event: 'stt_partial_submit',
-        audio_ms: audioMs,
-        audio_bytes: payload.length,
-        rms: Number(stats.rms.toFixed(6)),
-        peak: Number(stats.peak.toFixed(6)),
-        leading_silence_ms: Math.round(silence.leadingMs),
-        trailing_silence_ms: Math.round(silence.trailingMs),
-        ...(this.logContext ?? {}),
-      },
-      'stt partial submit',
-    );
-    this.enqueueTranscription(payload, {
-      reason: 'partial',
-      isFinal: false,
-      lineage: [...this.utteranceLineage],
-    });
-  }
-
-  private finalizeUtterance(reason: FinalReason): void {
-    if (!this.inSpeech || this.utteranceBytes === 0) {
-      return;
-    }
-
-    // ✅ Record pre_stt_gate ONLY ONCE per utterance:
-    // - only when silence triggers finalization
-    // - only the first time we request a final flush (finalFlushAt == 0)
-    if (this.finalFlushAt === 0) {
-      this.finalFlushAt = Date.now();
-
-      if (reason === 'silence' && this.lastSpeechAt > 0) {
-        const gateMs = Date.now() - this.lastSpeechAt;
-        observeStageDuration('pre_stt_gate', this.tenantLabel, gateMs);
-      }
-    }
-
-    if (this.inFlight) {
-      if (this.inFlightKind === 'final') {
-        return;
-      }
-      this.abortInFlight('finalize');
-    }
-
-    const trimmedFrames = this.trimTrailingSilence(this.utteranceFrames);
-    const trimmedMs = trimmedFrames.reduce((sum, frame) => sum + frame.ms, 0);
-    const payload = this.concatFrames(trimmedFrames);
-    const stats = computeRmsAndPeak(payload);
-    const silence = this.estimateSilenceMs(trimmedFrames);
-    const audioMs = Math.round((payload.length / this.bytesPerSecond) * 1000);
-
-    observeStageDuration('stt_finalize_audio_ms', this.tenantLabel, trimmedMs);
-
-    log.info(
-      {
-        event: 'stt_final_flush_forced',
-        final_reason: reason,
-        utterance_bytes: payload.length,
-        utterance_ms: this.utteranceMs,
-        duration_ms_estimate: Math.round(trimmedMs),
-        audio_ms: audioMs,
-        rms: Number(stats.rms.toFixed(6)),
-        peak: Number(stats.peak.toFixed(6)),
-        leading_silence_ms: Math.round(silence.leadingMs),
-        trailing_silence_ms: Math.round(silence.trailingMs),
-        below_floor: payload.length < this.finalMinBytes,
-        ...(this.logContext ?? {}),
-      },
-      'stt final flush forced',
-    );
-
-    const lineage = [...this.utteranceLineage];
-    if (trimmedFrames.length !== this.utteranceFrames.length) {
-      lineage.push('trim:trailing_silence');
-    }
-    this.enqueueTranscription(payload, {
-      reason: 'final',
-      isFinal: true,
-      finalReason: reason,
-      lineage,
-    });
-
-    this.resetUtteranceState();
-  }
-
-  private concatFrames(frames: Array<{ buffer: Buffer }>): Buffer {
-    if (frames.length === 1) return frames[0]!.buffer;
-    return Buffer.concat(frames.map((f) => f.buffer));
-  }
-
-  private abortInFlight(reason: 'barge_in' | 'finalize'): void {
-    if (!this.inFlight) {
-      return;
-    }
-
-    if (this.inFlightAbort) {
-      this.inFlightAbort.abort();
-      this.inFlightAbort = undefined;
-    }
-
-    this.inFlight = false;
-    this.inFlightKind = undefined;
-    this.finalizeToResultTimer = undefined;
-    this.finalFlushAt = 0;
-    this.inFlightToken += 1;
-
-    if (reason === 'barge_in') {
-      this.silenceFrameStreak = 0;
-      this.silenceToFinalizeTimer = undefined;
-    }
-  }
-
-  private enqueueTranscription(
-    payload: Buffer,
-    meta: {
-      reason: 'partial' | 'final';
-      isFinal: boolean;
-      finalReason?: FinalReason;
-      lineage?: string[];
-    },
-  ): void {
-    if (this.inFlight) return;
-
-    this.inFlight = true;
-    this.inFlightKind = meta.reason;
-    const token = (this.inFlightToken += 1);
-    this.inFlightAbort = new AbortController();
-
-    if (meta.isFinal) {
-      this.finalizeToResultTimer = startStageTimer('stt_finalize_to_result_ms', this.tenantLabel);
-    }
-
-    void this.transcribePayload(payload, meta, token, this.inFlightAbort.signal)
-      .catch((err) => {
-        log.error({ err, ...(this.logContext ?? {}) }, 'stt transcription failed');
-      })
-      .finally(() => {
-        if (this.inFlightToken !== token) {
-          return;
-        }
-        this.inFlight = false;
-        this.inFlightKind = undefined;
-        this.inFlightAbort = undefined;
-        this.finalizeToResultTimer = undefined;
-      });
-  }
-
-  private async transcribePayload(
-    payload: Buffer,
-    meta: {
-      reason: 'partial' | 'final';
-      isFinal: boolean;
-      finalReason?: FinalReason;
-      lineage?: string[];
-    },
-    token: number,
-    signal: AbortSignal,
-  ): Promise<void> {
-    const startedAt = Date.now();
-
-    const audioInput =
-      this.provider.id === 'http_wav_json'
-        ? ({
-            audio: payload,
-            sampleRateHz: this.sampleRate,
-            encoding: 'wav',
-            channels: 1,
-          } as const)
-        : ({
-            audio: payload,
-            sampleRateHz: this.sampleRate,
-            encoding: 'pcm16le',
-            channels: 1,
-          } as const);
-
-    const audioMeta = this.buildAudioMeta({
-      format: audioInput.encoding === 'wav' ? 'wav' : 'pcm16le',
-      sampleRateHz: audioInput.sampleRateHz,
-      channels: 1,
-      bitDepth: 16,
-      lineage: meta.lineage ?? [],
-      kind: meta.reason,
-    });
-    markAudioSpan('stt_submit', audioMeta);
-
-    const endStt = startStageTimer('stt', this.tenantLabel);
-
-    try {
-      const result = await this.provider.transcribe(audioInput, {
-        language: this.language,
-        isPartial: meta.reason === 'partial',
-        endpointUrl: this.whisperUrl,
-        logContext: this.logContext,
-        signal,
-        audioMeta,
-      });
-
-      endStt();
-      if (token !== this.inFlightToken) {
-        return;
-      }
-      if (meta.isFinal && this.finalizeToResultTimer) {
-        this.finalizeToResultTimer();
-        this.finalizeToResultTimer = undefined;
-      }
-
-      const elapsedMs = Date.now() - startedAt;
-      const text = normalizeWhitespace(result.text ?? '');
-
-      markAudioSpan('stt_result', audioMeta);
-
-      log.info(
-        {
-          event: 'stt_transcription_result',
-          kind: meta.reason,
-          elapsed_ms: elapsedMs,
-          text_len: text.length,
-          ...(this.logContext ?? {}),
-        },
-        'stt transcription result',
-      );
-
-      if (!text) {
-        // If final came back empty, reset state
-        if (meta.isFinal) {
-          this.resetUtteranceState();
-        }
-        return;
-      }
-
-      if (meta.reason === 'partial') {
-        // De-dupe rapid repeats
-        if (text === this.lastPartialTranscript) return;
-        this.lastPartialTranscript = text;
-
-        if (isNonEmpty(text)) {
-          this.lastNonEmptyPartialAt = Date.now();
-          this.onTranscript(text, 'partial_fallback');
-        }
-        return;
-      }
-
-      // Final
-      if (!this.finalTranscriptAccepted) {
-        this.finalTranscriptAccepted = true;
-        this.onTranscript(text, 'final');
-      }
-
-      this.resetUtteranceState();
-    } catch (error) {
-      endStt();
-      if (signal.aborted || isAbortError(error)) {
-        return;
-      }
-      if (token === this.inFlightToken && meta.isFinal) {
-        this.finalizeToResultTimer = undefined;
-      }
-      incStageError('stt', this.tenantLabel);
-      throw error;
-    }
-  }
-
   private resetUtteranceState(): void {
     this.inSpeech = false;
-    this.speechMs = 0;
-    this.silenceMsAccum = 0;
     this.utteranceMs = 0;
     this.utteranceBytes = 0;
     this.utteranceFrames = [];
-    this.utteranceLineage = [];
+
     this.speechFrameStreak = 0;
     this.silenceFrameStreak = 0;
     this.silenceToFinalizeTimer = undefined;
+
     this.lastPartialTranscript = '';
-    this.lastNonEmptyPartialAt = 0;
     this.finalFlushAt = 0;
     this.finalTranscriptAccepted = false;
     this.lastSpeechAt = 0;
+    // keep playback gating state consistent after resets
+    // (do NOT clear playbackEndedAtMs; it should still apply if playback just ended)
+    
+
+    this.vadSpeechStreak = 0;
+    this.vadSilenceStreak = 0;
+    if (this.vad) this.vad.reset();
   }
 }

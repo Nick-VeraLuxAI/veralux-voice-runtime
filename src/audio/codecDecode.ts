@@ -51,8 +51,6 @@ export interface TelnyxCodecState {
   amrwbDecodeDedupeKept?: number;
 
   // AMR-WB artifact frame de-dupe (sliding window; prevents repeated frames across time)
-  amrwbSelectedSeen?: Set<string>;
-  amrwbSelectedQueue?: string[];
   amrwbSelectedDropped?: number;
   amrwbSelectedKept?: number;
 
@@ -176,7 +174,6 @@ const DEBUG_CHUNK_INTERVAL_MS = 300;
 const DEBUG_WINDOW_MS = 400;
 
 const AMRWB_STREAM_HEADER = Buffer.from('#!AMR-WB\n', 'ascii');
-const AMRWB_STORAGE_FRAME_BYTES_FT2 = 33; // your runtime_selected_storage.awb is FT=2 => 1+32 bytes
 const AMRWB_SELECTED_RECENT_DEDUPE_N = Number.parseInt(process.env.AMRWB_SELECTED_RECENT_DEDUPE_N ?? '32', 10);
 
 // Global per-file write serialization (prevents concurrent append races)
@@ -288,10 +285,7 @@ function dedupeKeyForFrame(frame: Buffer): string {
   return `${frame.length}:${sha1Hex(frame)}`;
 }
 
-function ensureDedupeState(state: TelnyxCodecState): void {
-  if (!state.amrwbSelectedSeen) state.amrwbSelectedSeen = new Set<string>();
-  if (!state.amrwbSelectedQueue) state.amrwbSelectedQueue = [];
-}
+
 function getRecentDedupeForPath(outPath: string): { seen: Set<string>; q: string[] } {
   const existing = AMRWB_SELECTED_RECENT_BY_PATH.get(outPath);
   if (existing) return existing;
@@ -321,25 +315,6 @@ function hasSeenFrameRecentlyForPath(outPath: string, key: string, max: number):
     if (old) st.seen.delete(old);
   }
 
-  return false;
-}
-
-
-function hasSeenFrameRecently(state: TelnyxCodecState, key: string, max: number): boolean {
-  ensureDedupeState(state);
-  const set = state.amrwbSelectedSeen!;
-  const q = state.amrwbSelectedQueue!;
-
-  if (set.has(key)) return true;
-
-  set.add(key);
-  q.push(key);
-
-  // enforce bounded memory
-  while (q.length > max) {
-    const old = q.shift();
-    if (old) set.delete(old);
-  }
   return false;
 }
 
@@ -1132,17 +1107,6 @@ function maybeAppendSelectedStorageFrames(
 
   const MAX_SPEECH_FRAME_BYTES = 1 + 60; // TOC + max payload (FT=8 => 60 bytes payload)
 
-  function isValidStorageSpeechFrame(fr: Buffer): boolean {
-    if (!fr || fr.length < 2) return false;
-    const toc = fr[0] as number;
-    const F = (toc >> 7) & 1;
-    if (F !== 0) return false;
-    const ft = (toc >> 3) & 0x0f;
-    if (ft < 0 || ft > 8) return false; // speech only
-    const expected = 1 + amrWbFrameSize(ft);
-    return expected > 1 && fr.length === expected;
-  }
-
   function parseStorageSpeechFramesFromPayload(payload: Buffer): Buffer[] {
     // payload is storage frames bytes (NO "#!AMR-WB\n" header)
     const out: Buffer[] = [];
@@ -1187,6 +1151,57 @@ function maybeAppendSelectedStorageFrames(
     return out;
   }
 
+    function findLikelyStorageFrameBoundary(payload: Buffer): number {
+    // Try to find an offset where a valid storage speech frame begins.
+    // We accept FT 0..8 speech, F must be 0, and enough bytes must remain.
+    const maxScan = Math.min(payload.length, 1024); // keep it cheap
+    for (let i = 0; i < maxScan; i += 1) {
+      const toc = payload[i];
+      if (toc == null) break;
+
+      // Storage MUST have F=0
+      if ((toc & 0x80) !== 0) continue;
+
+      const ft = (toc >> 3) & 0x0f;
+
+      // Skip reserved FTs
+      if (isAmrWbReservedFt(ft)) continue;
+
+      // We only seed on speech frames (0..8)
+      if (ft < 0 || ft > 8) continue;
+
+      const size = amrWbFrameSize(ft);
+      if (size <= 0) continue;
+
+      const need = 1 + size;
+      if (i + need > payload.length) continue;
+
+      // One more sanity check: next TOC (if present) should also have F=0 and not reserved
+      const nextOff = i + need;
+      if (nextOff < payload.length) {
+        const toc2 = payload[nextOff];
+        if (toc2 != null) {
+          if ((toc2 & 0x80) !== 0) continue;
+          const ft2 = (toc2 >> 3) & 0x0f;
+          if (isAmrWbReservedFt(ft2)) continue;
+          if (ft2 === AMRWB_NO_DATA_FT || ft2 === AMRWB_SPEECH_LOST_FT) {
+            // ok — toc-only frames exist
+          } else if (ft2 === 9) {
+            // ok — SID exists
+          } else if (ft2 < 0 || ft2 > 8) {
+            continue;
+          }
+
+        }
+      }
+
+      return i; // ✅ found a plausible boundary
+    }
+
+    return 0; // fallback
+  }
+
+
   async function readTailAndSeedDedupe(
     fh: fs.promises.FileHandle,
     fileSize: number,
@@ -1212,8 +1227,12 @@ function maybeAppendSelectedStorageFrames(
     const got = r.bytesRead ?? 0;
     if (got <= 0) return { lastFrameSha1: null, seeded: 0 };
 
-    const tailPayload = buf.subarray(0, got); // this is already after header (startPos >= headerLen)
-    const parsed = parseStorageSpeechFramesFromPayload(tailPayload);
+    const tailPayload = buf.subarray(0, got); // bytes after header
+    const alignedOff = findLikelyStorageFrameBoundary(tailPayload);
+    const aligned = alignedOff > 0 ? tailPayload.subarray(alignedOff) : tailPayload;
+
+    const parsed = parseStorageSpeechFramesFromPayload(aligned);
+
 
     // Keep only the last maxRecent parsed frames (in case the tail contains more)
     const lastFrames = parsed.length > maxRecent ? parsed.slice(parsed.length - maxRecent) : parsed;
@@ -1239,8 +1258,10 @@ function maybeAppendSelectedStorageFrames(
         const st = await fh.stat();
 
         // Write header once
-        if (st.size === 0) {
+        let fileSize = st.size;
+        if (fileSize === 0) {
           await fh.write(AMRWB_STREAM_HEADER, 0, AMRWB_STREAM_HEADER.length, null);
+          fileSize = AMRWB_STREAM_HEADER.length; // ✅ keep accurate for tail seeding
         }
 
         // Compute window size ONCE
@@ -1253,12 +1274,19 @@ function maybeAppendSelectedStorageFrames(
         let prevSha1: string | null = null;
 
         try {
-          const seed = await readTailAndSeedDedupe(fh, st.size, maxRecent);
+          const seed = await readTailAndSeedDedupe(fh, fileSize, maxRecent);
+
           prevSha1 = seed.lastFrameSha1 ?? state.amrwbLastSelectedFrameSha1 ?? null;
+
+          // ✅ PERSIST the seeded last-frame hash into state
+          if (seed.lastFrameSha1) {
+            state.amrwbLastSelectedFrameSha1 = seed.lastFrameSha1;
+          }
         } catch {
           // If disk-tail parse fails for any reason, fall back to state only.
           prevSha1 = state.amrwbLastSelectedFrameSha1 ?? null;
         }
+
 
         // --- Lag-1 adjacent dedupe (boundary + within batch) ---
         const afterAdj: Buffer[] = [];
@@ -1268,7 +1296,7 @@ function maybeAppendSelectedStorageFrames(
           if (!fr || fr.length === 0) continue;
 
           // Safety: only write valid speech frames
-          if (!isValidStorageSpeechFrame(fr)) continue;
+          if (!isValidAmrWbStorageSpeechFrame(fr)) continue;
 
           const frSha1 = sha1Hex(fr);
           if (prevSha1 && frSha1 === prevSha1) {
@@ -1421,12 +1449,14 @@ class AmrWbFfmpegStream {
       '-hide_banner',
       '-loglevel',
       'error',
+
+      // ✅ IMPORTANT: use AMR demuxer (handles AMR-WB header correctly in practice)
       '-f',
-      'amrwb',
-      '-c:a',
-      'libopencore_amrwb',
+      'amr',
+
       '-i',
       'pipe:0',
+
       '-f',
       's16le',
       '-ac',
@@ -1435,6 +1465,7 @@ class AmrWbFfmpegStream {
       String(AmrWbFfmpegStream.OUTPUT_RATE_HZ),
       'pipe:1',
     ];
+
 
     this.child = spawn(ffmpegPath, args, { stdio: ['pipe', 'pipe', 'pipe'] });
     this.child.stdout.on('data', (chunk) => this.handleStdout(chunk));
@@ -1672,10 +1703,11 @@ async function decodeAmrWbWithFfmpeg(
       '-hide_banner',
       '-loglevel',
       'error',
+
+      // ✅ IMPORTANT: use AMR demuxer
       '-f',
-      'amrwb',
-      '-c:a',
-      'libopencore_amrwb',
+      'amr',
+
       '-i',
       'pipe:0',
       '-f',
@@ -1686,6 +1718,7 @@ async function decodeAmrWbWithFfmpeg(
       '16000',
       'pipe:1',
     ];
+
 
     const child = spawn(ffmpegPath, args, { stdio: ['pipe', 'pipe', 'pipe'] });
 
@@ -1738,6 +1771,27 @@ function scoreCandidate(c: AmrCandidate): number {
   const modeBonus = c.dep.mode === 'storage' ? 2 : 0;
   return speech * 10 + Math.max(0, total - penalty) + modeBonus;
 }
+
+function isValidAmrWbStorageSpeechFrame(fr: Buffer): boolean {
+  if (!fr || fr.length < 2) return false;
+
+  const toc = fr[0] as number;
+
+  // Storage frames MUST have F=0
+  const F = (toc & 0x80) !== 0;
+  if (F) return false;
+
+  const ft = (toc >> 3) & 0x0f;
+
+  // Speech frames only
+  if (ft < 0 || ft > 8) return false;
+
+  const expected = 1 + amrWbFrameSize(ft);
+  if (expected <= 1) return false;
+
+  return fr.length === expected;
+}
+
 
 /* ---------------------------------- main ---------------------------------- */
 
@@ -1796,48 +1850,22 @@ export async function decodeTelnyxPayloadToPcm16(opts: DecodeTelnyxOptions): Pro
     // 1) Run transcoder FIRST (single source of truth)
     const transcode = transcodeTelnyxAmrWbPayload(opts.payload);
 
-    // artifact capture (optional)
-    if (parseBoolEnv(process.env.TRUTH_CAPTURE_AMRWB) || parseBoolEnv(process.env.AMRWB_ARTIFACT_DEBUG)) {
-      writeAmrwbArtifacts('amrwb_raw_payload', opts.payload, {
-        hasCmr: true,
-        meta: {
-          encoding,
-          payload_len: opts.payload.length,
-          ...(opts.logContext ?? {}),
-        },
-      });
-
-      if (transcode.ok) {
-        // transcoder output is STORAGE frames bytes; treat as storage for artifact writer
-        writeAmrwbArtifacts('amrwb_transcoded_output', transcode.output, {
-          hasCmr: false,
-          meta: {
-            packing: transcode.packing,
-            rtp_stripped: transcode.rtpStripped,
-            toc_count: transcode.tocCount,
-            cmr: transcode.cmr ?? null,
-            cmr_stripped: true,
-            total_bytes_in: transcode.totalBytesIn,
-            total_bytes_out: transcode.totalBytesOut,
-            ...(opts.logContext ?? {}),
-          },
-        });
-      }
-    }
-
     const envDefaultBe = parseBoolEnv(process.env.TELNYX_AMRWB_DEFAULT_BE);
     const forcedBe = opts.forceAmrWbBe === true;
+
+    // BE is "active" if forced, env defaulted, or transcoder explicitly parsed BE
     const beActive = forcedBe || envDefaultBe || (transcode.ok && transcode.packing === 'be');
+
+    // requireBe = hard policy: if true and we cannot parse BE, we reject (NO fallback)
+    const requireBe = forcedBe || parseBoolEnv(process.env.AMRWB_REQUIRE_BE);
 
     // If BE is active, do NOT allow raw octet fallback.
     const octetFallbackAllowed = !beActive && parseBoolEnv(process.env.AMRWB_ALLOW_OCTET_FALLBACK);
 
-    // Optional stricter enforcement: only allow BE when explicitly forced or env requires
-    const requireBe = forcedBe || parseBoolEnv(process.env.AMRWB_REQUIRE_BE);
-
     const logPathSelectOnce = (chosenPath: 'be' | 'octet'): void => {
       if (state.amrwbPathSelectedLogged) return;
       state.amrwbPathSelectedLogged = true;
+
       log.info(
         {
           event: 'amrwb_path_select',
@@ -1855,7 +1883,79 @@ export async function decodeTelnyxPayloadToPcm16(opts: DecodeTelnyxOptions): Pro
       );
     };
 
+    // -------------------- ARTIFACT CAPTURE (optional) --------------------
+    // IMPORTANT:
+    // - Raw Telnyx payload is NOT guaranteed to be octet-aligned storage (and for BE it is *not*).
+    // - Always dump raw bytes; only attempt "storage" artifact when we truly have storage bytes.
+    if (parseBoolEnv(process.env.TRUTH_CAPTURE_AMRWB) || parseBoolEnv(process.env.AMRWB_ARTIFACT_DEBUG)) {
+      writeAmrwbArtifacts('amrwb_raw_payload', opts.payload, {
+        // DO NOT claim CMR/octet-aligned here
+        hasCmr: false,
+        meta: {
+          encoding,
+          payload_len: opts.payload.length,
+          be_active: beActive,
+          require_be: requireBe,
+          forced_be: forcedBe,
+          env_default_be: envDefaultBe,
+          ...(opts.logContext ?? {}),
+        },
+      });
+
+      if (transcode.ok) {
+        // Transcoder output is STORAGE frames bytes; artifact writer should treat it as storage (no CMR).
+        writeAmrwbArtifacts('amrwb_transcoded_output', transcode.output, {
+          hasCmr: false,
+          meta: {
+            packing: transcode.packing,
+            rtp_stripped: transcode.rtpStripped,
+            toc_count: transcode.tocCount,
+            cmr: transcode.cmr ?? null,
+            cmr_stripped: true,
+            total_bytes_in: transcode.totalBytesIn,
+            total_bytes_out: transcode.totalBytesOut,
+            ...(opts.logContext ?? {}),
+          },
+        });
+      }
+    }
+
+    // -------------------- REQUIRE-BE HARD GATE --------------------
+    // Require-BE means: we must be able to parse BE. With the BE-only contract,
+    // "ok:true" implies BE succeeded; failure implies not-BE/invalid for our purposes.
+    if (requireBe && !transcode.ok) {
+      state.amrwbLastError = 'amrwb_require_be_mismatch';
+      logPathSelectOnce('be');
+
+      const invalidCount = (state.amrwbDepackInvalidCount ?? 0) + 1;
+      state.amrwbDepackInvalidCount = invalidCount;
+
+      if (invalidCount <= 10) {
+        const hexPrefix = opts.payload.subarray(0, Math.min(32, opts.payload.length)).toString('hex');
+        log.warn(
+          {
+            event: 'amrwb_require_be_mismatch',
+            reason: transcode.error,
+            payload_len: opts.payload.length,
+            first_bytes_hex: hexPrefix,
+            rtp_stripped: transcode.rtpStripped,
+            forced_be: forcedBe,
+            env_default_be: envDefaultBe,
+            require_be: requireBe,
+            be_active: beActive,
+            ...(opts.logContext ?? {}),
+          },
+          'AMR-WB require-BE is enabled but input did not parse as BE',
+        );
+      }
+
+      return null;
+    }
+
+    // -------------------- TRANSCODE RESULT HANDLING --------------------
     if (!transcode.ok) {
+      // Transcode failed (requireBe already handled above)
+
       const invalidCount = (state.amrwbDepackInvalidCount ?? 0) + 1;
       state.amrwbDepackInvalidCount = invalidCount;
 
@@ -1880,12 +1980,16 @@ export async function decodeTelnyxPayloadToPcm16(opts: DecodeTelnyxOptions): Pro
 
       state.amrwbLastError = 'amrwb_depack_invalid';
 
-      if (beActive || requireBe) {
+      // If BE is active, hard-stop: no octet fallback.
+      if (beActive) {
         state.amrwbLastError = 'amrwb_be_transcode_failed';
         logPathSelectOnce('be');
         return null;
       }
+
+      // Otherwise: we may attempt octet fallback later (if enabled).
     } else {
+      // Transcode succeeded
       if (!state.amrwbDepacketizeLogged) {
         state.amrwbDepacketizeLogged = true;
         log.info(
@@ -1905,22 +2009,6 @@ export async function decodeTelnyxPayloadToPcm16(opts: DecodeTelnyxOptions): Pro
           },
           `AMRWB_DEPACK packing=${transcode.packing} rtpStripped=${transcode.rtpStripped} tocCount=${transcode.tocCount} totalBytesIn=${transcode.totalBytesIn} totalBytesOut=${transcode.totalBytesOut}`,
         );
-      }
-
-      // If we require BE and transcoder says octet, reject (no fallback)
-      if (requireBe && transcode.packing !== 'be') {
-        state.amrwbLastError = 'amrwb_require_be_mismatch';
-        logPathSelectOnce('be');
-        log.warn(
-          {
-            event: 'amrwb_require_be_mismatch',
-            packing: transcode.packing,
-            payload_len: opts.payload.length,
-            ...(opts.logContext ?? {}),
-          },
-          'AMR-WB require-BE is enabled but input did not parse as BE',
-        );
-        return null;
       }
 
       // IMPORTANT: transcoder output is ALWAYS storage frames bytes (NO header).
@@ -1980,6 +2068,7 @@ export async function decodeTelnyxPayloadToPcm16(opts: DecodeTelnyxOptions): Pro
         );
       }
 
+      // If BE is active/required and we still got no candidate, hard-stop.
       if (candidates.length === 0 && (beActive || requireBe)) {
         state.amrwbLastError = 'amrwb_be_storage_parse_failed';
         logPathSelectOnce('be');
@@ -1987,7 +2076,7 @@ export async function decodeTelnyxPayloadToPcm16(opts: DecodeTelnyxOptions): Pro
       }
     }
 
-    // Optional raw octet fallback (ONLY if BE inactive AND env enables it)
+    // -------------------- OPTIONAL RAW OCTET FALLBACK --------------------
     if (octetFallbackAllowed) {
       const rawDep = depacketizeAmrWbToStorage(opts.payload, { skipCmr: false });
       if (rawDep.ok) {
@@ -2028,7 +2117,7 @@ export async function decodeTelnyxPayloadToPcm16(opts: DecodeTelnyxOptions): Pro
     const chosen = transcodedCandidate ?? candidates[0]!;
     const dep = chosen.dep;
 
-    const chosenPath = chosen.label === 'raw' ? 'octet' : transcode.ok && transcode.packing === 'be' ? 'be' : 'octet';
+    const chosenPath: 'be' | 'octet' = chosen.label === 'raw' ? 'octet' : 'be';
     logPathSelectOnce(chosenPath);
 
     if (chosen.label === 'raw' && !state.amrwbFallbackLogged) {
@@ -2053,6 +2142,41 @@ export async function decodeTelnyxPayloadToPcm16(opts: DecodeTelnyxOptions): Pro
       return null;
     }
 
+    // ---- DIAG: fingerprint incoming decoded speech frames (no behavior change)
+    if (parseBoolEnv(process.env.AMRWB_DECODE_TRACE)) {
+      const max = Math.min(dep.frames.length, 40);
+
+      // Hash only speech frames (same filter as your buffer loop) so we don't get fooled by SID/NODATA.
+      const fp: string[] = [];
+      for (let i = 0; i < max; i += 1) {
+        if (dep.frameTypes[i] !== 'speech') continue;
+        const fr = dep.frames[i];
+        if (!fr || fr.length < 2) continue;
+        const h = sha1Hex(fr).slice(0, 10);
+        fp.push(h);
+        if (fp.length >= 20) break;
+      }
+
+      // Count immediate repeats inside the dep.frames list itself (lag-1)
+      let lag1 = 0;
+      for (let i = 1; i < fp.length; i += 1) {
+        if (fp[i] === fp[i - 1]) lag1 += 1;
+      }
+
+      log.info(
+        {
+          event: 'amrwb_dep_frames_fingerprint',
+          dep_mode: dep.mode,
+          dep_total_frames: dep.frames.length,
+          fingerprint_20: fp,
+          lag1_repeats_in_dep: lag1,
+          ...(opts.logContext ?? {}),
+        },
+        'AMR-WB dep.frames fingerprint (speech-only)',
+      );
+    }
+
+
     // -------------------- BUFFER AMR-WB FRAMES --------------------
 
     if (!state.amrwbFrameBuf) state.amrwbFrameBuf = [];
@@ -2064,12 +2188,23 @@ export async function decodeTelnyxPayloadToPcm16(opts: DecodeTelnyxOptions): Pro
       const frame = dep.frames[i]!;
       if (!frame || frame.length < 2) continue;
 
-      const toc = frame[0]!;
-      const ft = (toc >> 3) & 0x0f;
-      const expected = 1 + amrWbFrameSize(ft);
+      if (!isValidAmrWbStorageSpeechFrame(frame)) {
+        // Optional: trace once in a while so you can confirm the 0xF1 is being rejected
+        if (parseBoolEnv(process.env.AMRWB_DECODE_TRACE)) {
+          log.info(
+            {
+              event: 'amrwb_drop_invalid_storage_frame',
+              toc_hex: frame[0]?.toString(16),
+              frame_len: frame.length,
+              frame_hex_prefix: frame.subarray(0, Math.min(8, frame.length)).toString('hex'),
+              ...(opts.logContext ?? {}),
+            },
+            'Dropped invalid AMR-WB storage frame before buffering',
+          );
+        }
+        continue;
+      }
 
-      // Speech frames must match exact size (TOC + speech payload)
-      if (expected <= 1 || frame.length !== expected) continue;
 
       // Dedupe consecutive identical speech frames to prevent overlap/echo
       const frSha1 = sha1Hex(frame);
@@ -2080,10 +2215,6 @@ export async function decodeTelnyxPayloadToPcm16(opts: DecodeTelnyxOptions): Pro
 
       state.amrwbFrameBuf.push(frame);
       state.amrwbFrameBufDecodedFrames = (state.amrwbFrameBufDecodedFrames ?? 0) + 1;
-      // NOTE: Do NOT append frames to runtime_selected_storage.awb here.
-      // We only append frames that are actually decoded (see flush boundary).
-
-
     }
 
     const now = Date.now();
@@ -2111,48 +2242,54 @@ export async function decodeTelnyxPayloadToPcm16(opts: DecodeTelnyxOptions): Pro
       Number.isFinite(AMRWB_STREAM_CHUNK_FRAMES) && AMRWB_STREAM_CHUNK_FRAMES > 0 ? AMRWB_STREAM_CHUNK_FRAMES : 20;
 
     const framesToDecodeRaw = state.amrwbFrameBuf.slice(0, chunkFrames);
+
+    const framesToDecodeRawFiltered = framesToDecodeRaw.filter(isValidAmrWbStorageSpeechFrame);
+
+    if (framesToDecodeRawFiltered.length !== framesToDecodeRaw.length && parseBoolEnv(process.env.AMRWB_DECODE_TRACE)) {
+      log.warn(
+        {
+          event: 'amrwb_filtered_invalid_frames_pre_decode',
+          dropped: framesToDecodeRaw.length - framesToDecodeRawFiltered.length,
+          kept: framesToDecodeRawFiltered.length,
+          ...(opts.logContext ?? {}),
+        },
+        'Filtered invalid AMR-WB frames before decode',
+      );
+    }
+
+
     const remaining = state.amrwbFrameBuf.slice(chunkFrames);
 
     // keep remainder for next flush
     state.amrwbFrameBuf = remaining;
     state.amrwbFrameBufDecodedFrames = remaining.length;
 
-    // ✅ FIX A UPDATE: buffer-start timestamp must reflect oldest frame still buffered
+    // buffer-start timestamp must reflect oldest frame still buffered
     const priorStart = state.amrwbFrameBufLastFlushMs ?? 0;
     if (remaining.length === 0) {
       state.amrwbFrameBufLastFlushMs = 0;
     } else {
-      // keep the original start time for the oldest buffered frame
       state.amrwbFrameBufLastFlushMs = priorStart || now;
     }
-
 
     if (!framesToDecodeRaw || framesToDecodeRaw.length === 0) {
       return null;
     }
 
     // HARD-STOP drift: consecutive duplicate storage-frame dedupe BEFORE decode
-    const dd = dedupeConsecutiveFramesForDecode(state, framesToDecodeRaw);
+    const dd = dedupeConsecutiveFramesForDecode(state, framesToDecodeRawFiltered);
     const framesToDecode = dd.frames;
 
-    // Decode exactly what we kept (no sliding-window dedupe here)
-    const framesToDecodeWindowed = framesToDecode;
-
     let decodedFramesToDecode = 0;
-    for (const fr of framesToDecodeWindowed) {
+    for (const fr of framesToDecode) {
       const ft = (fr[0]! >> 3) & 0x0f;
       if (ft >= 0 && ft <= 8) decodedFramesToDecode += 1; // AMR-WB speech frames only
     }
 
-    // ✅ Append ONLY the frames we are actually decoding (authoritative timeline)
-    // This prevents lag-k frame replay from being written into runtime_selected_storage.awb.
-    maybeAppendSelectedStorageFrames(state, framesToDecodeWindowed, opts.logContext);
+    // Append ONLY the frames we are actually decoding (authoritative timeline)
+    maybeAppendSelectedStorageFrames(state, framesToDecode, opts.logContext);
 
-
-
-
-    const storageForDecode = Buffer.concat([AMRWB_STREAM_HEADER, ...framesToDecodeWindowed]);
-
+    const storageForDecode = Buffer.concat([AMRWB_STREAM_HEADER, ...framesToDecode]);
 
     // ----------------------------- DECODE (FFMPEG) -----------------------------
     // Speech frame timing is 20ms @ 16k = 320 samples per AMR-WB speech frame
@@ -2164,7 +2301,7 @@ export async function decodeTelnyxPayloadToPcm16(opts: DecodeTelnyxOptions): Pro
 
     if (stream) {
       try {
-        const pcm16 = await stream.decode(framesToDecodeWindowed, decodedFramesToDecode);
+        const pcm16 = await stream.decode(framesToDecode, decodedFramesToDecode);
         if (pcm16.length > 0) {
           decoded = { pcm16 };
           usedStream = true;
@@ -2202,48 +2339,34 @@ export async function decodeTelnyxPayloadToPcm16(opts: DecodeTelnyxOptions): Pro
     }
 
     // --------------------------------------------------------------------------
-    // 🔒 FIX A — normalize PCM length to prevent slow / fast / robotic audio
+    // normalize PCM length to prevent slow / fast / robotic audio
     // --------------------------------------------------------------------------
 
-    // AMR-WB decode output is ALWAYS 16k now
     const decodeRateHz = 16000;
 
-    // IMPORTANT: capture raw length BEFORE normalization (padding hides short reads)
     const decodedRaw16k = decoded.pcm16;
     const decodedRawSamplesAt16k = decodedRaw16k.length;
     const shortRead = decodedRawSamplesAt16k < expectedSpeechSamplesAt16k;
 
-    // Strict mode: only fail on TRUE short-read (raw), not on normalized length
     if (amrwbStrictDecodeEnabled() && shortRead) {
       state.amrwbLastError = 'amrwb_short_pcm';
       return null;
     }
 
-    // Normalize at source rate (critical)
     let decoded16k = normalizeAmrWbPcmLength(decodedRaw16k, expectedSpeechSamplesAt16k);
 
-    // Resample ONLY if caller wants a different output rate
-    let pcmOut =
-      targetRate !== decodeRateHz
-        ? resamplePcm16(decoded16k, decodeRateHz, targetRate)
-        : decoded16k;
+    let pcmOut = targetRate !== decodeRateHz ? resamplePcm16(decoded16k, decodeRateHz, targetRate) : decoded16k;
 
-    // Expected output samples (after resample calc)
     const expectedSpeechSamples =
-      targetRate === 16000
-        ? expectedSpeechSamplesAt16k
-        : Math.round(expectedSpeechSamplesAt16k * (targetRate / 16000));
+      targetRate === 16000 ? expectedSpeechSamplesAt16k : Math.round(expectedSpeechSamplesAt16k * (targetRate / 16000));
 
-    // Normalize again after resample (guards rounding drift)
     pcmOut = normalizeAmrWbPcmLength(pcmOut, expectedSpeechSamples);
 
-    // --- stats / dropout detection ---
     const actualSamples = pcmOut.length;
     const zeroCount = countZeroSamples(pcmOut);
     const zeroRatio = actualSamples > 0 ? zeroCount / actualSamples : 1;
     const decodedStats = computePcmStats(pcmOut);
 
-    // Dropout = short read OR mostly zeros OR extremely low RMS
     const dropout = shortRead || zeroRatio > 0.9 || decodedStats.rms < 0.001;
 
     if (shouldLogAmrwbDebug(state, Date.now(), dropout)) {
@@ -2278,7 +2401,6 @@ export async function decodeTelnyxPayloadToPcm16(opts: DecodeTelnyxOptions): Pro
         'AMR-WB decode debug',
       );
     }
-        // ----------------------------- FINALIZE ---------------------------------
 
     state.amrwbFfmpegUsable = true;
     state.amrwbLastError = undefined;
@@ -2292,8 +2414,9 @@ export async function decodeTelnyxPayloadToPcm16(opts: DecodeTelnyxOptions): Pro
       decodedFrames: decodedFramesToDecode,
       decodeFailures: 0,
     };
-
   }
+
+
 
   // G.722
   if (encoding === 'G722') {

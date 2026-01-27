@@ -608,9 +608,20 @@ exports.MediaIngestHealthMonitor = MediaIngestHealthMonitor;
 /* --------------------------------- ingest --------------------------------- */
 class MediaIngest {
     constructor(options) {
+        // ---- reprompt suppression ----
+        this.lastGoodDecodedAtMs = 0; // set whenever we successfully decode audio / emit a frame
+        this.lastRepromptAtMs = 0; // throttle reprompts
+        // tuning knobs (safe defaults)
+        this.repromptCooldownMs = 5000; // don't reprompt more often than this
+        this.repromptSpeechGraceMs = 1500; // don't reprompt right after speech starts
+        this.repromptRequireNoGoodAudioMs = 1200; // only reprompt if we've had no good audio recently
         this.decodeChain = Promise.resolve();
         this.healthMonitor = new MediaIngestHealthMonitor();
         this.tappedFirstDecoded = false;
+        this.playbackSuppressUntilMs = 0;
+        this.playbackGuardMs = Number.isFinite(Number(process.env.STT_PLAYBACK_GUARD_MS))
+            ? Math.max(0, Math.floor(Number(process.env.STT_PLAYBACK_GUARD_MS)))
+            : 750; // good default: 400–900ms
         /**
          * ✅ Telnyx PSTN inbound AMR-WB should be treated as Bandwidth-Efficient (BE) as-received.
          * This flag is set at the ingest "policy" layer and enforced downstream in codecDecode.ts.
@@ -706,6 +717,27 @@ class MediaIngest {
             accept_codecs: Array.from(this.acceptCodecs),
             ...(this.logContext ?? {}),
         }, 'media ingest start');
+    }
+    shouldFireReprompt(reason) {
+        void reason;
+        const now = Date.now();
+        // Only reprompt if we are in LISTENING mode (if hook is provided)
+        if (this.isListening && !this.isListening())
+            return false;
+        // Never reprompt during playback (greeting / TTS)
+        if (this.isPlaybackActive && this.isPlaybackActive())
+            return false;
+        // Cooldown to prevent spam
+        if (this.lastRepromptAtMs && now - this.lastRepromptAtMs < this.repromptCooldownMs)
+            return false;
+        // If speech just started, don't reprompt
+        const lastSpeechStart = this.getLastSpeechStartAtMs ? this.getLastSpeechStartAtMs() ?? 0 : 0;
+        if (lastSpeechStart && now - lastSpeechStart < this.repromptSpeechGraceMs)
+            return false;
+        // If we decoded good audio recently, don't reprompt
+        if (this.lastGoodDecodedAtMs && now - this.lastGoodDecodedAtMs < this.repromptRequireNoGoodAudioMs)
+            return false;
+        return true;
     }
     handleBinary(buffer) {
         if (buffer.length === 0)
@@ -915,7 +947,7 @@ class MediaIngest {
         // Use the existing variable that was used for candidate selection.
         // const currentCodec = normalizeCodec(this.mediaEncoding);
         // basic "decoded bytes too short" gate (same as your existing logic)
-        const minDecodedLen = currentCodec === 'AMR-WB' ? 2 : 10;
+        const minDecodedLen = currentCodec === 'AMR-WB' ? 6 : 10;
         if (buffer.length < minDecodedLen) {
             log_1.log.info({
                 event: 'media_payload_suspicious',
@@ -948,7 +980,43 @@ class MediaIngest {
             }, 'media track skipped');
             return;
         }
-        // Commit Telnyx seq ONLY after we decided to keep the frame (post-track-gating)
+        // -------------------- PLAYBACK ECHO GUARD --------------------
+        // If playback is active, drop inbound media so Whisper can't hear our own TTS.
+        // Also keep a short grace window after playback ends to avoid jitter-delivered frames.
+        const nowMs = Date.now();
+        const playbackActive = this.isPlaybackActive?.() === true;
+        if (playbackActive) {
+            this.playbackSuppressUntilMs = nowMs + this.playbackGuardMs;
+            if (capture && !capture.stopped) {
+                void appendCaptureRecord(capture, {
+                    ts: new Date().toISOString(),
+                    call_control_id: this.callControlId,
+                    ws_event: 'media',
+                    kind: 'media_dropped',
+                    reason: 'playback_active',
+                    seq: seqForPipeline ?? null,
+                });
+            }
+            // ✅ IMPORTANT: do not commit seq for dropped frames
+            return;
+        }
+        if (nowMs < this.playbackSuppressUntilMs) {
+            if (capture && !capture.stopped) {
+                void appendCaptureRecord(capture, {
+                    ts: new Date().toISOString(),
+                    call_control_id: this.callControlId,
+                    ws_event: 'media',
+                    kind: 'media_dropped',
+                    reason: 'post_playback_grace',
+                    suppress_until_ms: this.playbackSuppressUntilMs,
+                    seq: seqForPipeline ?? null,
+                });
+            }
+            // ✅ IMPORTANT: do not commit seq for dropped frames
+            return;
+        }
+        // -------------------------------------------------------------
+        // ✅ Commit Telnyx seq ONLY after we fully accept the frame (post-track + post-playback gates)
         if (shouldCommitSeq && this.activeStreamId && typeof seqNum === 'number' && Number.isFinite(seqNum)) {
             this.lastSeqByStream.set(this.activeStreamId, seqNum);
         }
@@ -1053,8 +1121,8 @@ class MediaIngest {
                 payloadLen: trimmedPayload.length,
                 decodedLen: buffer.length,
                 hexPrefix: buffer.subarray(0, 24).toString('hex'),
-                playbackActive: this.isPlaybackActive?.(),
-                listening: this.isListening?.(),
+                playbackActive: this.isPlaybackActive?.() ?? false,
+                listening: this.isListening?.() ?? false,
                 lastSpeechStartAtMs: this.getLastSpeechStartAtMs?.() ?? null,
             });
         }
@@ -1503,6 +1571,7 @@ class MediaIngest {
             (0, audioProbe_1.attachAudioMeta)(pcmBuffer, meta);
             (0, audioProbe_1.probePcm)('rx.decoded.pcm16', pcmBuffer, meta);
         }
+        this.lastGoodDecodedAtMs = Date.now();
         this.onFrame({
             callControlId: this.callControlId,
             pcm16: pending,
@@ -1583,7 +1652,7 @@ class MediaIngest {
                 decoded_len: decodedLen,
                 decoded_prefix_hex: decodedPrefixHex,
                 note: note ?? (buffer ? undefined : 'decoded_payload_unavailable'),
-                frame_seq: seq ?? this.frameSeq,
+                frame_seq: typeof seq === 'number' ? seq : null,
                 ...(this.logContext ?? {}),
             }, buffer ? 'MEDIA_PAYLOAD_DEBUG raw payload' : 'MEDIA_PAYLOAD_DEBUG decoded payload unavailable');
         }
@@ -1616,6 +1685,8 @@ class MediaIngest {
             this.checkHealth(encoding);
             return;
         }
+        // ✅ Mark "good decoded audio" as soon as we know decode succeeded
+        this.lastGoodDecodedAtMs = Date.now();
         const pcm16 = decodeResult.pcm16;
         // -------------------- AUDIO TAP: decoded PCM (pre-framing) --------------------
         if (this.audioTap && pcm16.length > 0) {
@@ -1805,25 +1876,66 @@ class MediaIngest {
     async handleUnhealthy(reason, codec) {
         // AMR-WB payloads are naturally small; never restart stream for "tiny_payloads".
         if (codec === 'AMR-WB' && reason === 'tiny_payloads') {
-            this.onReprompt?.(reason);
+            if (this.shouldFireReprompt(reason)) {
+                this.lastRepromptAtMs = Date.now();
+                this.onReprompt?.(reason);
+            }
             return;
         }
         if (reason === 'low_rms') {
-            this.onReprompt?.(reason);
+            if (this.shouldFireReprompt(reason)) {
+                this.lastRepromptAtMs = Date.now();
+                this.onReprompt?.(reason);
+            }
             return;
         }
         if (this.transportMode !== 'pstn') {
-            this.onReprompt?.(reason);
+            if (this.shouldFireReprompt(reason)) {
+                this.lastRepromptAtMs = Date.now();
+                this.onReprompt?.(reason);
+            }
             return;
         }
         if (this.restartAttempts >= this.maxRestartAttempts) {
-            this.onReprompt?.(reason);
+            if (this.shouldFireReprompt(reason)) {
+                this.lastRepromptAtMs = Date.now();
+                this.onReprompt?.(reason);
+            }
             return;
         }
         if (!this.onRestartStreaming) {
-            this.onReprompt?.(reason);
+            if (this.shouldFireReprompt(reason)) {
+                this.lastRepromptAtMs = Date.now();
+                this.onReprompt?.(reason);
+            }
             return;
         }
+        // Determine what codec we would actually request on restart
+        const requestedCodec = this.transportMode === 'pstn' &&
+            this.allowAmrWb &&
+            this.acceptCodecs.has('AMR-WB')
+            ? 'AMR-WB'
+            : codec;
+        // 🚫 STOP NO-OP RESTARTS (this is the bug)
+        // If the restart would not change codecs, do NOT restart.
+        // This was causing stream flapping + echo.
+        if (requestedCodec === codec) {
+            log_1.log.warn({
+                event: 'media_ingest_restart_suppressed',
+                call_control_id: this.callControlId,
+                reason,
+                previous_codec: codec,
+                requested_codec: requestedCodec,
+                note: 'suppressed restart because requested_codec === previous_codec',
+                ...(this.logContext ?? {}),
+            }, 'media ingest restart suppressed (noop)');
+            if (this.shouldFireReprompt(reason)) {
+                this.lastRepromptAtMs = Date.now();
+                this.onReprompt?.(reason);
+            }
+            return;
+        }
+        // ✅ REAL restart begins here
         this.restartAttempts += 1;
         this.healthMonitor.disable();
         log_1.log.warn({
@@ -1832,11 +1944,10 @@ class MediaIngest {
             attempt: this.restartAttempts,
             reason,
             previous_codec: codec,
-            requested_codec: codec,
+            requested_codec: requestedCodec,
             ...(this.logContext ?? {}),
         }, 'media ingest restart streaming');
         try {
-            const requestedCodec = this.transportMode === 'pstn' && this.allowAmrWb && this.acceptCodecs.has('AMR-WB') ? 'AMR-WB' : codec;
             this.activeStreamId = null;
             this.lastSeqByStream.clear();
             const ok = await this.onRestartStreaming(requestedCodec, reason);
@@ -1845,8 +1956,16 @@ class MediaIngest {
                 this.maybeEnableForceBe('AMR-WB', 'payload');
             }
             if (!ok) {
-                log_1.log.warn({ event: 'media_ingest_restart_failed', call_control_id: this.callControlId, reason, ...(this.logContext ?? {}) }, 'media ingest restart failed');
-                this.onReprompt?.(reason);
+                log_1.log.warn({
+                    event: 'media_ingest_restart_failed',
+                    call_control_id: this.callControlId,
+                    reason,
+                    ...(this.logContext ?? {}),
+                }, 'media ingest restart failed');
+                if (this.shouldFireReprompt(reason)) {
+                    this.lastRepromptAtMs = Date.now();
+                    this.onReprompt?.(reason);
+                }
             }
         }
         catch (error) {
@@ -1857,7 +1976,10 @@ class MediaIngest {
                 err: error,
                 ...(this.logContext ?? {}),
             }, 'media ingest restart failed');
-            this.onReprompt?.(reason);
+            if (this.shouldFireReprompt(reason)) {
+                this.lastRepromptAtMs = Date.now();
+                this.onReprompt?.(reason);
+            }
         }
     }
 }
