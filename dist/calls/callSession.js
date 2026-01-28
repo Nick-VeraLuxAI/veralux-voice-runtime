@@ -53,6 +53,15 @@ function encodePcm16Wav(pcm16le, sampleRateHz) {
     return Buffer.concat([header, pcm16le]);
 }
 class CallSession {
+    // ===== STT in-flight tracking (prevents dead-air reprompt while Whisper HTTP is running) =====
+    onSttRequestStart(kind) {
+        this.sttInFlightCount += 1;
+        log_1.log.info({ event: 'stt_req_start', kind, in_flight: this.sttInFlightCount, ...this.logContext }, 'stt request started');
+    }
+    onSttRequestEnd(kind) {
+        this.sttInFlightCount = Math.max(0, this.sttInFlightCount - 1);
+        log_1.log.info({ event: 'stt_req_end', kind, in_flight: this.sttInFlightCount, ...this.logContext }, 'stt request ended');
+    }
     constructor(config) {
         this.state = 'INIT';
         this.transcriptBuffer = [];
@@ -144,6 +153,9 @@ class CallSession {
             onSpeechStart: (info) => {
                 void this.handleSpeechStart(info);
             },
+            // ✅ STT in-flight hooks (ChunkedSTT calls these when provider requests start/end)
+            onSttRequestStart: (kind) => this.onSttRequestStart(kind),
+            onSttRequestEnd: (kind) => this.onSttRequestEnd(kind),
             isPlaybackActive: () => this.isPlaybackActive(),
             isListening: () => this.isListening(),
             getTrack: () => env_1.env.TELNYX_STREAM_TRACK,
@@ -223,10 +235,6 @@ class CallSession {
         const pcmBuffer = Buffer.from(frame.pcm16.buffer, frame.pcm16.byteOffset, frame.pcm16.byteLength);
         (0, metrics_1.incSttFramesFed)();
         this.maybeCaptureRxDump(pcmBuffer);
-        // ✅ Don’t feed Whisper during playback (prevents TTS bleed / empty transcripts)
-        if (this.isPlaybackActive()) {
-            return;
-        }
         this.stt.ingestPcm16(frame.pcm16, frame.sampleRateHz);
     }
     isPlaybackActive() {

@@ -14,19 +14,19 @@ fi
 
 BASE_DIR="/tmp/veralux-stt-debug/${CALL_ID}"
 OCTET_IN="${BASE_DIR}/octet_aligned.awb"
-BE_IN="${BASE_DIR}/be_converted.awb"
+STORAGE_IN="${BASE_DIR}/runtime_selected_storage.awb"
 RAW_IN="${BASE_DIR}/raw_frames.bin"
 
 OCTET_OUT="${BASE_DIR}/octet_aligned.wav"
-BE_OUT="${BASE_DIR}/be_converted.wav"
+STORAGE_OUT="${BASE_DIR}/runtime_selected_storage.wav"
 RAW_OUT="${BASE_DIR}/raw_frames_guess.wav"
 
 if [[ -f "$OCTET_IN" ]]; then
   ffmpeg -hide_banner -loglevel error -y -f amrwb -i "$OCTET_IN" "$OCTET_OUT"
 fi
 
-if [[ -f "$BE_IN" ]]; then
-  ffmpeg -hide_banner -loglevel error -y -f amrwb -i "$BE_IN" "$BE_OUT"
+if [[ -f "$STORAGE_IN" ]]; then
+  ffmpeg -hide_banner -loglevel error -y -f amrwb -i "$STORAGE_IN" "$STORAGE_OUT"
 fi
 
 if [[ -f "$RAW_IN" ]]; then
@@ -34,5 +34,5 @@ if [[ -f "$RAW_IN" ]]; then
 fi
 
 echo "octet_aligned.wav: $OCTET_OUT"
-echo "be_converted.wav:  $BE_OUT"
+echo "runtime_selected_storage.wav: $STORAGE_OUT"
 echo "raw_frames_guess.wav: $RAW_OUT"

@@ -59,6 +59,10 @@ export interface ChunkedSTTOptions {
   onTranscript: (text: string, source?: TranscriptSource) => void;
   onSpeechStart?: (info: SpeechStartInfo) => void;
 
+  // Optional lifecycle hooks (used by CallSession to suppress dead-air while STT in-flight)
+  onSttRequestStart?: (kind: 'partial' | 'final') => void;
+  onSttRequestEnd?: (kind: 'partial' | 'final') => void;
+
   // Optional runtime state hooks (used for logging / safety gates)
   isPlaybackActive?: () => boolean;
   isListening?: () => boolean;
@@ -92,6 +96,7 @@ const DEFAULT_MIN_SECONDS = 0.6; // must have this much audio before partials
 const DEFAULT_SILENCE_MIN_SECONDS = 0.45; // silence needed to finalize
 const DEFAULT_FINAL_TAIL_CUSHION_MS = 120;
 const DEFAULT_FINAL_MIN_SECONDS = 1.0;
+const DEFAULT_FINAL_MIN_BYTES_FALLBACK = 0;
 const DEFAULT_PARTIAL_MIN_MS = 600;
 
 // Speech detection defaults (env.ts may override)
@@ -107,7 +112,6 @@ function parseBool(value: string | undefined, def = false): boolean {
   const v = value.trim().toLowerCase();
   return v === '1' || v === 'true' || v === 'yes' || v === 'y';
 }
-
 
 function clamp(n: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, n));
@@ -179,6 +183,7 @@ function pcmuToPcm16le(pcmu: Buffer): Buffer {
   }
   return output;
 }
+
 function upsamplePcm16le8kTo16kLinear(pcm16le: Buffer): Buffer {
   const sampleCount = Math.floor(pcm16le.length / 2);
   if (sampleCount === 0) return Buffer.alloc(0);
@@ -200,29 +205,25 @@ function upsamplePcm16le8kTo16kLinear(pcm16le: Buffer): Buffer {
   return out;
 }
 
-
 function sha1Hex(buf: Buffer): string {
   return crypto.createHash('sha1').update(buf).digest('hex');
 }
 
 export class ChunkedSTT {
-
-    // ===== Optional VAD (Silero ONNX) =====
+  // ===== Optional VAD (Silero ONNX) =====
   private readonly vadEnabled: boolean;
   private readonly vadThreshold: number;
   private vad?: SileroVad;
-  private vadInit?: Promise<void>;
   private vadReady = false;
-
 
   // VAD smoothing counters (optional but helps avoid flapping)
   private vadSpeechStreak = 0;
   private vadSilenceStreak = 0;
   private vadSpeechNow = false;
+
   // VAD hysteresis thresholds (prevents flapping)
   private readonly vadSpeechFramesRequired = clamp(safeNum(process.env.STT_VAD_SPEECH_FRAMES_REQUIRED, 2), 1, 20);
   private readonly vadSilenceFramesRequired = clamp(safeNum(process.env.STT_VAD_SILENCE_FRAMES_REQUIRED, 6), 1, 50);
-
 
   private readonly provider: STTProvider;
   private readonly whisperUrl: string;
@@ -256,6 +257,9 @@ export class ChunkedSTT {
   private readonly onTranscript: (text: string, source?: TranscriptSource) => void;
   private readonly onSpeechStart?: (info: SpeechStartInfo) => void;
 
+  private readonly onSttRequestStart?: (kind: 'partial' | 'final') => void;
+  private readonly onSttRequestEnd?: (kind: 'partial' | 'final') => void;
+
   private readonly isPlaybackActive?: () => boolean;
   private readonly isListening?: () => boolean;
   private readonly getTrack?: () => string | undefined;
@@ -278,6 +282,8 @@ export class ChunkedSTT {
   private utteranceFrames: Array<{ buffer: Buffer; ms: number }> = [];
 
   private speechFrameStreak = 0;
+  private playbackSpeechStreak = 0;
+
   private silenceFrameStreak = 0;
   private silenceToFinalizeTimer?: () => void;
 
@@ -303,6 +309,7 @@ export class ChunkedSTT {
   private readonly recentRxHashes: string[] = [];
   private rxFramesDropped = 0;
   private rxFramesKept = 0;
+
   // ===== Playback hard-gate state =====
   private playbackWasActive = false;
   private playbackEndedAtMs = 0;
@@ -317,6 +324,9 @@ export class ChunkedSTT {
 
     this.onTranscript = opts.onTranscript;
     this.onSpeechStart = opts.onSpeechStart;
+
+    this.onSttRequestStart = opts.onSttRequestStart;
+    this.onSttRequestEnd = opts.onSttRequestEnd;
 
     this.isPlaybackActive = opts.isPlaybackActive;
     this.isListening = opts.isListening;
@@ -346,7 +356,7 @@ export class ChunkedSTT {
     const finalMinSeconds = safeNum(env.FINAL_MIN_SECONDS, DEFAULT_FINAL_MIN_SECONDS);
     const computedFinalMinBytes = Math.round(this.bytesPerSecondPcm16 * Math.max(0, finalMinSeconds));
     const finalMinBytes = safeNum(env.FINAL_MIN_BYTES, computedFinalMinBytes);
-    this.finalMinBytes = Math.max(0, Math.round(finalMinBytes));
+    this.finalMinBytes = Math.max(0, Math.round(finalMinBytes ?? DEFAULT_FINAL_MIN_BYTES_FALLBACK));
 
     this.partialMinMs = clamp(safeNum(env.STT_PARTIAL_MIN_MS, DEFAULT_PARTIAL_MIN_MS), 200, 5000);
     this.partialMinBytes = Math.max(0, Math.round((this.bytesPerSecondPcm16 * this.partialMinMs) / 1000));
@@ -386,7 +396,7 @@ export class ChunkedSTT {
     this.vadThreshold = safeNum(process.env.STT_VAD_THRESHOLD, 0.5);
 
     if (this.vadEnabled) {
-      this.vadInit = SileroVad.create({ threshold: this.vadThreshold })
+      void SileroVad.create({ threshold: this.vadThreshold })
         .then((v) => {
           this.vad = v;
           log.info(
@@ -400,7 +410,6 @@ export class ChunkedSTT {
         })
         .then(() => undefined);
     }
-
 
     // Optional RX replay guard
     this.rxGuardEnabled = parseBool(process.env.STT_RX_POSTPROCESS_ENABLED, false);
@@ -428,6 +437,7 @@ export class ChunkedSTT {
           disable_gates: this.disableGates,
           rx_guard_enabled: this.rxGuardEnabled,
           rx_dedupe_window: this.rxDedupeWindow,
+          post_playback_grace_ms: this.postPlaybackGraceMs,
         },
         ...(this.logContext ?? {}),
       },
@@ -468,7 +478,7 @@ export class ChunkedSTT {
 
     const computedFrameMs = (pcm16.length / sampleRateHz) * 1000;
     const frameMs = Number.isFinite(computedFrameMs) && computedFrameMs > 0 ? computedFrameMs : this.fallbackFrameMs;
-    
+
     if (!this.firstFrameLogged) {
       this.firstFrameLogged = true;
       log.info(
@@ -485,7 +495,6 @@ export class ChunkedSTT {
       );
     }
 
-
     void this.ingestDecodedPcm16(frame, frameMs);
   }
 
@@ -501,7 +510,6 @@ export class ChunkedSTT {
     if (!this.firstFrameLogged) {
       this.firstFrameLogged = true;
 
-      const bytesPerSampleIn = this.inputCodec === 'pcmu' ? 1 : 2;
       const computedSamples = input.length / bytesPerSampleIn;
 
       log.info(
@@ -521,7 +529,6 @@ export class ChunkedSTT {
       );
     }
 
-
     let framePcm16: Buffer;
     if (this.inputCodec === 'pcmu') {
       framePcm16 = pcmuToPcm16le(input);
@@ -533,21 +540,75 @@ export class ChunkedSTT {
     void this.ingestDecodedPcm16(framePcm16, frameMs);
   }
 
+  private nowMs(): number {
+    return Date.now();
+  }
+
+  private playbackGateActive(): boolean {
+    if (this.disableGates) return false;
+
+    const active = !!this.isPlaybackActive?.();
+    if (active) return true;
+
+    if (this.playbackEndedAtMs > 0) {
+      const since = this.nowMs() - this.playbackEndedAtMs;
+      if (since >= 0 && since < this.postPlaybackGraceMs) return true;
+    }
+
+    return false;
+  }
+
+  private handlePlaybackTransitionIfNeeded(): void {
+    if (this.disableGates) return;
+
+    const active = !!this.isPlaybackActive?.();
+
+    if (active) {
+      // Playback is active now: abort any in-flight STT and reset utterance state to avoid mixing.
+      if (!this.playbackWasActive) {
+        this.playbackWasActive = true;
+
+        if (this.inFlight) {
+          this.abortInFlight('finalize');
+        }
+
+        if (this.inSpeech) {
+          this.resetUtteranceState();
+        }
+      }
+      return;
+    }
+
+    if (this.playbackWasActive) {
+      // Playback just ended
+      this.playbackWasActive = false;
+      this.playbackEndedAtMs = this.nowMs();
+      this.playbackSpeechStreak = 0;
+
+
+      // reset VAD state so we don't carry stale speech state across the boundary
+      this.vadSpeechNow = false;
+      this.vadSpeechStreak = 0;
+      this.vadSilenceStreak = 0;
+      if (this.vad) this.vad.reset();
+
+      // if we have RX dedupe, clear it across boundary
+      this.recentRxHashes.length = 0;
+    }
+  }
+
   // Optional defensive replay guard: drops identical frames repeated within last N frames.
   private shouldDropRxFrame(pcm16: Buffer): { drop: boolean; sha1_10: string; matchedLag?: number } {
     if (!this.rxGuardEnabled || this.rxDedupeWindow <= 0) return { drop: false, sha1_10: '' };
 
-    // Hash the PCM bytes for replay detection.
     const h = sha1Hex(pcm16);
     const h10 = h.slice(0, 10);
 
-    // Check lag-k inside recent window.
     const recent = this.recentRxHashes;
     for (let i = recent.length - 1, lag = 1; i >= 0 && lag <= this.rxDedupeWindow; i -= 1, lag += 1) {
       if (recent[i] === h) return { drop: true, sha1_10: h10, matchedLag: lag };
     }
 
-    // Keep: push into window
     recent.push(h);
     if (recent.length > this.rxDedupeWindow) recent.shift();
     return { drop: false, sha1_10: h10 };
@@ -555,58 +616,60 @@ export class ChunkedSTT {
 
   // Post-decode path (PCM16LE mono @ this.sampleRate)
   private async ingestDecodedPcm16(pcm16: Buffer, frameMs: number): Promise<void> {
+    // Detect playback transitions & enforce boundary resets.
+    this.handlePlaybackTransitionIfNeeded();
+
     // ===== HARD GATE during playback (and brief grace after) =====
-    if (!this.disableGates && this.isPlaybackActive?.()) {
-      this.playbackWasActive = true;
+    // IMPORTANT: We still run VAD/speech detection during playback so barge-in works.
+    // We only block *buffering/transcription* during playback/grace.
+    const gatedForPlayback = this.playbackGateActive();
 
-      // If we were mid-utterance, kill it—prevents mixing user speech with TTS bleed
-      if (this.inSpeech) this.resetUtteranceState();
 
-      return;
-    }
-
-    if (this.playbackWasActive) {
-      // playback just ended
-      this.playbackWasActive = false;
-      this.playbackEndedAtMs = Date.now();
-
-      // reset VAD state so we don't carry stale speech state across the boundary
-      this.vadSpeechNow = false;
-      this.vadSpeechStreak = 0;
-      this.vadSilenceStreak = 0;
-      if (this.vad) this.vad.reset();
-      this.recentRxHashes.length = 0;
-    }
-
+    // Once grace has elapsed, clear the marker.
     if (!this.disableGates && this.playbackEndedAtMs > 0) {
-      const since = Date.now() - this.playbackEndedAtMs;
-      if (since < this.postPlaybackGraceMs) return;
-      this.playbackEndedAtMs = 0;
+      const since = this.nowMs() - this.playbackEndedAtMs;
+      if (since >= this.postPlaybackGraceMs) this.playbackEndedAtMs = 0;
     }
-
 
     // ===== Replay guard here (before any VAD/state) =====
-    const guard = this.shouldDropRxFrame(pcm16);
-    if (guard.drop) {
-      this.rxFramesDropped += 1;
-      // Throttle logs a bit
-      if (this.rxFramesDropped <= 20 || this.rxFramesDropped % 100 === 0) {
-        log.warn(
-          {
-            event: 'stt_rx_replay_dropped',
-            matched_lag: guard.matchedLag,
-            sha1_10: guard.sha1_10,
-            dropped: this.rxFramesDropped,
-            kept: this.rxFramesKept,
-            rx_dedupe_window: this.rxDedupeWindow,
-            ...(this.logContext ?? {}),
-          },
-          'dropping replayed PCM frame before ChunkedSTT buffering',
-        );
+    // Goal:
+    // - If playback-gated: skip RX guard & counters (we return later anyway)
+    // - If RX guard enabled: drop frames repeated within last N frames
+    // - Always advance rxFramesKept for non-gated frames so log throttles behave
+
+    if (!gatedForPlayback) {
+      if (this.rxGuardEnabled) {
+        const guard = this.shouldDropRxFrame(pcm16);
+
+        if (guard.drop) {
+          this.rxFramesDropped += 1;
+
+          if (this.rxFramesDropped <= 20 || this.rxFramesDropped % 100 === 0) {
+            log.warn(
+              {
+                event: 'stt_rx_replay_dropped',
+                matched_lag: guard.matchedLag,
+                sha1_10: guard.sha1_10,
+                dropped: this.rxFramesDropped,
+                kept: this.rxFramesKept,
+                rx_dedupe_window: this.rxDedupeWindow,
+                ...(this.logContext ?? {}),
+              },
+              'dropping replayed PCM frame before ChunkedSTT buffering',
+            );
+          }
+
+          return; // critical: do NOT continue into VAD/buffering
+        }
+
+        // Guard enabled and frame not dropped
+        this.rxFramesKept += 1;
+      } else {
+        // Guard disabled: still advance for log throttling / observability
+        this.rxFramesKept += 1;
       }
-      return;
     }
-    this.rxFramesKept += 1;
+
 
     const stats = computeRmsAndPeak(pcm16);
     this.updateRollingStats(stats);
@@ -639,16 +702,38 @@ export class ChunkedSTT {
     }
 
     let vadSpeechDecision: boolean | null = null;
-
     if (this.vadEnabled && this.vadReady && this.vad) {
-      // “Speech” only after N consecutive speech frames
-      // “Silence” only after M consecutive silence frames
       if (this.vadSpeechStreak >= this.vadSpeechFramesRequired) vadSpeechDecision = true;
       else if (this.vadSilenceStreak >= this.vadSilenceFramesRequired) vadSpeechDecision = false;
-      else vadSpeechDecision = this.vadSpeechNow; // hold last raw vad output
+      else vadSpeechDecision = this.vadSpeechNow;
     }
 
     const isSpeech = this.disableGates ? true : (vadSpeechDecision ?? (gateRms && gatePeak));
+    // If we're in playback/grace, allow barge-in detection but do not buffer/transcribe.
+    if (gatedForPlayback) {
+      if (isSpeech) {
+        this.playbackSpeechStreak += 1;
+
+        if (this.playbackSpeechStreak >= this.speechFramesRequired) {
+          this.onSpeechStart?.({
+            rms: stats.rms,
+            peak: stats.peak,
+            frameMs,
+            streak: this.playbackSpeechStreak,
+          });
+
+          // Reset so we don't spam onSpeechStart repeatedly.
+          this.playbackSpeechStreak = 0;
+        }
+      } else {
+        this.playbackSpeechStreak = 0;
+      }
+
+      // Do not buffer any frames or build utterances during playback/grace.
+      return;
+    }
+
+
 
     if (!this.disableGates && (this.rxFramesKept <= 20 || this.rxFramesKept % 100 === 0)) {
       log.info(
@@ -671,7 +756,6 @@ export class ChunkedSTT {
         'stt speech decision',
       );
     }
-
 
     // Barge-in: if final request is in-flight and speech resumes, abort and reset.
     if (this.inFlight && this.inFlightKind === 'final' && isSpeech) {
@@ -706,7 +790,7 @@ export class ChunkedSTT {
     this.appendUtterance(pcm16, frameMs);
 
     if (isSpeech) {
-      this.lastSpeechAt = Date.now();
+      this.lastSpeechAt = this.nowMs();
       this.silenceFrameStreak = 0;
       this.silenceToFinalizeTimer = undefined;
     } else {
@@ -745,7 +829,6 @@ export class ChunkedSTT {
   private addPreRollFrame(pcm16: Buffer, frameMs: number): void {
     if (this.preRollMaxMs <= 0) return;
 
-    // Snapshot bytes so we don’t keep references to pooled buffers.
     const snap = Buffer.from(pcm16);
 
     this.preRollFrames.push({ buffer: snap, ms: frameMs });
@@ -760,11 +843,10 @@ export class ChunkedSTT {
 
   private startSpeech(stats: { rms: number; peak: number }, frameMs: number): void {
     this.inSpeech = true;
-    this.lastSpeechAt = Date.now();
+    this.lastSpeechAt = this.nowMs();
     this.silenceFrameStreak = 0;
     this.silenceToFinalizeTimer = undefined;
 
-    // Start utterance with pre-roll
     this.utteranceFrames = [...this.preRollFrames];
     this.utteranceMs = this.preRollMs;
     this.utteranceBytes = this.utteranceFrames.reduce((sum, f) => sum + f.buffer.length, 0);
@@ -797,7 +879,6 @@ export class ChunkedSTT {
     this.utteranceBytes += snap.length;
   }
 
-  // Final tail trim: keep a small cushion of silence after last detected speech frame.
   private trimTrailingSilence(frames: Array<{ buffer: Buffer; ms: number }>): Array<{ buffer: Buffer; ms: number }> {
     if (frames.length === 0) return frames;
 
@@ -826,9 +907,15 @@ export class ChunkedSTT {
   private maybeSendPartial(): void {
     if (!this.inSpeech) return;
     if (this.inFlight) return;
+
+    // ✅ NEW: never send partials during playback/grace
+    this.handlePlaybackTransitionIfNeeded();
+
+    if (this.playbackGateActive()) return;
+
     if (this.utteranceMs < this.minSpeechMs) return;
 
-    const now = Date.now();
+    const now = this.nowMs();
     if (this.lastPartialAt > 0 && now - this.lastPartialAt < this.partialIntervalMs) return;
 
     const payload = this.concatFrames(this.utteranceFrames);
@@ -841,10 +928,20 @@ export class ChunkedSTT {
   private finalizeUtterance(reason: FinalReason): void {
     if (!this.inSpeech || this.utteranceBytes === 0) return;
 
+    // ✅ NEW: never finalize during playback/grace
+    this.handlePlaybackTransitionIfNeeded();
+
+    // ✅ FIX: never finalize during playback/grace
+    if (this.playbackGateActive()) {
+      // During playback/grace, do not finalize or send STT.
+      // Keep buffering state so we can finalize once gate clears.
+      return;
+    }
+
     if (this.finalFlushAt === 0) {
-      this.finalFlushAt = Date.now();
+      this.finalFlushAt = this.nowMs();
       if (reason === 'silence' && this.lastSpeechAt > 0) {
-        observeStageDuration('pre_stt_gate', this.tenantLabel, Date.now() - this.lastSpeechAt);
+        observeStageDuration('pre_stt_gate', this.tenantLabel, this.nowMs() - this.lastSpeechAt);
       }
     }
 
@@ -877,7 +974,6 @@ export class ChunkedSTT {
       finalReason: reason,
     });
 
-    // IMPORTANT: reset immediately so we can start a new utterance while STT is in-flight.
     this.resetUtteranceState();
   }
 
@@ -910,6 +1006,10 @@ export class ChunkedSTT {
   ): void {
     if (this.inFlight) return;
 
+    // ✅ NEW: final safety net
+    this.handlePlaybackTransitionIfNeeded();
+    if (this.playbackGateActive()) return;
+
     this.inFlight = true;
     this.inFlightKind = meta.reason;
     const token = (this.inFlightToken += 1);
@@ -917,14 +1017,22 @@ export class ChunkedSTT {
 
     if (meta.isFinal) this.finalizeToResultTimer = startStageTimer('stt_finalize_to_result_ms', this.tenantLabel);
 
+    // notify CallSession if wired
+    this.onSttRequestStart?.(meta.reason);
+
     void this.transcribePayload(payloadPcm16, meta, token, this.inFlightAbort.signal)
       .catch((err) => log.error({ err, ...(this.logContext ?? {}) }, 'stt transcription failed'))
       .finally(() => {
         if (this.inFlightToken !== token) return;
+
+        const kind = this.inFlightKind ?? meta.reason;
+
         this.inFlight = false;
         this.inFlightKind = undefined;
         this.inFlightAbort = undefined;
         this.finalizeToResultTimer = undefined;
+
+        this.onSttRequestEnd?.(kind);
       });
   }
 
@@ -934,7 +1042,11 @@ export class ChunkedSTT {
     token: number,
     signal: AbortSignal,
   ): Promise<void> {
-    const startedAt = Date.now();
+    // ✅ NEW: last safety net before calling provider
+    this.handlePlaybackTransitionIfNeeded();
+    if (this.playbackGateActive()) return;
+
+    const startedAt = this.nowMs();
 
     const audioInput: STTAudioInput = {
       audio: payloadPcm16,
@@ -965,7 +1077,7 @@ export class ChunkedSTT {
         {
           event: 'stt_transcription_result',
           kind: meta.reason,
-          elapsed_ms: Date.now() - startedAt,
+          elapsed_ms: this.nowMs() - startedAt,
           text_len: text.length,
           ...(this.logContext ?? {}),
         },
@@ -1015,7 +1127,7 @@ export class ChunkedSTT {
     stats: { rms: number; peak: number },
     frameMs: number,
   ): void {
-    const now = Date.now();
+    const now = this.nowMs();
     if (now - this.lastGateLogAtMs < 1000) return;
     this.lastGateLogAtMs = now;
 
@@ -1056,6 +1168,8 @@ export class ChunkedSTT {
     this.utteranceFrames = [];
 
     this.speechFrameStreak = 0;
+    this.playbackSpeechStreak = 0;
+
     this.silenceFrameStreak = 0;
     this.silenceToFinalizeTimer = undefined;
 
@@ -1063,9 +1177,6 @@ export class ChunkedSTT {
     this.finalFlushAt = 0;
     this.finalTranscriptAccepted = false;
     this.lastSpeechAt = 0;
-    // keep playback gating state consistent after resets
-    // (do NOT clear playbackEndedAtMs; it should still apply if playback just ended)
-    
 
     this.vadSpeechStreak = 0;
     this.vadSilenceStreak = 0;

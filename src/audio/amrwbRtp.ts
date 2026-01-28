@@ -192,6 +192,69 @@ function amrWbSpeechBytes(ft: number): number | null {
   return null;
 }
 
+type AmrWbStorageValidationStats = {
+  badF: number;
+  badFt: number;
+  badLength: number;
+};
+
+type AmrWbStorageValidationResult = {
+  frames: Buffer[];
+  stats: AmrWbStorageValidationStats;
+};
+
+function initAmrWbStorageValidationStats(): AmrWbStorageValidationStats {
+  return { badF: 0, badFt: 0, badLength: 0 };
+}
+
+function totalInvalidAmrWbStorageFrames(stats: AmrWbStorageValidationStats): number {
+  return stats.badF + stats.badFt + stats.badLength;
+}
+
+function expectedAmrWbStorageFrameLength(ft: number): number | null {
+  if (isAmrWbInvalidFt(ft)) return null;
+  const bytes = amrWbSpeechBytes(ft);
+  if (bytes === null) return null;
+  return 1 + bytes;
+}
+
+function validateAmrWbStorageFramesBytes(payload: Buffer): AmrWbStorageValidationResult {
+  const stats = initAmrWbStorageValidationStats();
+  const frames: Buffer[] = [];
+
+  let offset = 0;
+  while (offset < payload.length) {
+    const toc = payload[offset];
+    if (toc == null) break;
+
+    const f = (toc & 0x80) !== 0;
+    if (f) {
+      stats.badF += 1;
+      offset += 1;
+      continue;
+    }
+
+    const ft = (toc >> 3) & 0x0f;
+    const expectedLen = expectedAmrWbStorageFrameLength(ft);
+    if (expectedLen === null) {
+      stats.badFt += 1;
+      offset += 1;
+      continue;
+    }
+
+    if (offset + expectedLen > payload.length) {
+      stats.badLength += 1;
+      break;
+    }
+
+    const fr = payload.subarray(offset, offset + expectedLen);
+    frames.push(Buffer.from(fr));
+    offset += expectedLen;
+  }
+
+  return { frames, stats };
+}
+
 /* -------------------------------- BitReader -------------------------------- */
 
 class BitReader {
@@ -515,8 +578,9 @@ function looksLikeAmrWbStorageFrames(buf: Buffer): boolean {
   const b = stripAmrWbHeaderIfPresent(buf);
   if (b.length < 1) return false;
 
-  // Storage: TOC bytes have F=0 always.
   const toc0 = b[0] as number;
+
+  // Storage TOC must have F=0. If F=1, this is not storage (often BE misread).
   if ((toc0 & 0x80) !== 0) return false;
 
   const ft0 = (toc0 >> 3) & 0x0f;
@@ -524,19 +588,13 @@ function looksLikeAmrWbStorageFrames(buf: Buffer): boolean {
 
   const size0 = amrWbSpeechBytes(ft0);
   if (size0 === null) return false;
-  if (size0 === 0) return true;
+
+  // Extra: reject if we'd need more bytes than exist
   if (b.length < 1 + size0) return false;
 
-  // Quick plausibility check of next TOC (if any)
-  const nextOff = 1 + size0;
-  if (b.length > nextOff) {
-    const toc1 = b[nextOff] as number;
-    if ((toc1 & 0x80) !== 0) return false;
-    const ft1 = (toc1 >> 3) & 0x0f;
-    if (isAmrWbInvalidFt(ft1)) return false;
-  }
   return true;
 }
+
 
 function ensureAmrWbStreamHeader(buf: Buffer): Buffer {
   if (buf.length >= AMRWB_STREAM_HEADER.length && buf.subarray(0, AMRWB_STREAM_HEADER.length).equals(AMRWB_STREAM_HEADER)) {
@@ -610,9 +668,46 @@ export function writeAmrwbArtifacts(
   try {
     fs.writeFileSync(rawPath, payloadOrStorage);
 
-    // If it already looks like storage frames or already includes "#!AMR-WB\n", just prefix header and write.
-    if (looksLikeAmrWbStorageFrames(payloadOrStorage) || stripAmrWbHeaderIfPresent(payloadOrStorage) !== payloadOrStorage) {
-      const awb = storageFramesToAwb(payloadOrStorage);
+    const alreadyHasHeader = stripAmrWbHeaderIfPresent(payloadOrStorage) !== payloadOrStorage;
+    const looksStorage = looksLikeAmrWbStorageFrames(payloadOrStorage);
+
+    const writeValidatedAwb = (
+      storageBytes: Buffer,
+      treatedAs: 'storage' | 'octet_aligned',
+      extraMeta?: Record<string, unknown>,
+    ): void => {
+      const meta = { ...(opts.meta ?? {}), ...(extraMeta ?? {}) };
+      const validation = validateAmrWbStorageFramesBytes(storageBytes);
+      const invalidTotal = totalInvalidAmrWbStorageFrames(validation.stats);
+      const frames = validation.frames;
+
+      if (invalidTotal > 0) {
+        log.warn(
+          {
+            event: 'amrwb_storage_invalid_frames_dropped',
+            label,
+            dropped_bad_f: validation.stats.badF,
+            dropped_bad_ft: validation.stats.badFt,
+            dropped_bad_length: validation.stats.badLength,
+            dropped_total: invalidTotal,
+            kept_frames: frames.length,
+            treated_as: treatedAs,
+            ...meta,
+          },
+          'AMR-WB artifacts dropped invalid storage frames',
+        );
+      }
+
+      if (frames.length === 0) {
+        log.warn(
+          { event: 'amrwb_artifacts_no_valid_frames', label, treated_as: treatedAs, ...meta },
+          'AMR-WB artifacts: no valid storage frames to write',
+        );
+        return;
+      }
+
+      const payload = frames.length === 1 ? frames[0]! : Buffer.concat(frames);
+      const awb = storageFramesToAwb(payload);
       fs.writeFileSync(awbPath, awb);
 
       log.info(
@@ -622,16 +717,47 @@ export function writeAmrwbArtifacts(
           raw_bytes: rawPath,
           storage_awb: awbPath,
           bytes_len: payloadOrStorage.length,
-          treated_as: 'storage',
+          treated_as: treatedAs,
+          dropped_bad_f: validation.stats.badF,
+          dropped_bad_ft: validation.stats.badFt,
+          dropped_bad_length: validation.stats.badLength,
+          dropped_total: invalidTotal,
+          ...meta,
+        },
+        `AMR-WB artifacts written (${treatedAs})`,
+      );
+    };
+
+    // If it already looks like storage frames or already includes "#!AMR-WB\n", validate and write.
+    if (looksStorage || alreadyHasHeader) {
+      const storageBytes = stripAmrWbHeaderIfPresent(payloadOrStorage);
+      writeValidatedAwb(storageBytes, 'storage');
+      return;
+    }
+
+    // NEW: do not "guess" octet-aligned unless explicitly told.
+    // This prevents BE / unknown bytes from being mis-parsed and creating confusing .awb artifacts.
+    const explicitOctet = Boolean((opts.meta as any)?.explicitOctetAligned);
+    if (!explicitOctet) {
+      log.info(
+        {
+          event: 'amrwb_artifacts_written_raw_only',
+          label,
+          raw_bytes: rawPath,
+          bytes_len: payloadOrStorage.length,
+          treated_as: 'raw_only',
           ...(opts.meta ?? {}),
         },
-        'AMR-WB artifacts written (storage)',
+        'AMR-WB artifacts: wrote raw only (format unknown; not attempting octet-aligned parse)',
       );
       return;
     }
 
-    // Otherwise, treat as octet-aligned RTP payload and convert.
-    const parsed = opts.hasCmr ? tryParseAmrWbOctetAligned(payloadOrStorage) : tryParseAmrWbOctetAlignedNoCmr(payloadOrStorage);
+    // Otherwise, treat as octet-aligned RTP payload and convert (ONLY when explicitly requested).
+    const parsed = opts.hasCmr
+      ? tryParseAmrWbOctetAligned(payloadOrStorage)
+      : tryParseAmrWbOctetAlignedNoCmr(payloadOrStorage);
+
     if (!parsed.ok) {
       log.warn(
         {
@@ -647,23 +773,7 @@ export function writeAmrwbArtifacts(
     }
 
     const storageFrames = buildStorageFromOctetAligned(payloadOrStorage, parsed, opts.hasCmr);
-    const awb = storageFramesToAwb(storageFrames);
-    fs.writeFileSync(awbPath, awb);
-
-    log.info(
-      {
-        event: 'amrwb_artifacts_written',
-        label,
-        raw_bytes: rawPath,
-        storage_awb: awbPath,
-        bytes_len: payloadOrStorage.length,
-        treated_as: 'octet_aligned',
-        hasCmr: opts.hasCmr,
-        toc_count: parsed.frames.length,
-        ...(opts.meta ?? {}),
-      },
-      'AMR-WB artifacts written (octet-aligned)',
-    );
+    writeValidatedAwb(storageFrames, 'octet_aligned', { hasCmr: opts.hasCmr, toc_count: parsed.frames.length });
   } catch (err) {
     log.warn({ event: 'amrwb_artifacts_write_failed', label, err: String(err) }, 'AMR-WB artifact write failed');
   }

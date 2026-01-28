@@ -34,6 +34,10 @@ let captureConsumed = false;
 let captureActiveCallId = null;
 const SENSITIVE_KEY_REGEX = /(token|authorization|auth|signature|secret|api_key)/i;
 const AMRWB_FILE_HEADER = Buffer.from('#!AMR-WB\n', 'ascii');
+const AMRWB_CONTRACT_TEXT = 'amr-wb contract\n' +
+    '- inbound: telnyx amr-wb bandwidth-efficient (BE)\n' +
+    '- canonical: amr-wb storage frames bytes (TOC F=0), .awb = "#!AMR-WB\\n" + storage frames\n' +
+    '- whisper: wav pcm16 16k mono (decoded from canonical storage stream)\n';
 /* ---------------------------------- env ---------------------------------- */
 function parseBoolEnv(value) {
     if (!value)
@@ -130,26 +134,7 @@ function getHexPrefix(buf, len = 16) {
     return buf.subarray(0, len).toString('hex');
 }
 function looksLikeAmrWbMagic(buf) {
-    const magic = Buffer.from('#!AMR-WB\n', 'ascii');
-    return buf.length >= magic.length && buf.subarray(0, magic.length).equals(magic);
-}
-/** Telnyx PSTN inbound AMR-WB speech payloads observed as 33 bytes. */
-function isLikelyAmrwbSpeechPayload(payload) {
-    return payload.length === 33;
-}
-function looksLikeTelnyxNoCmrToc33(buf) {
-    if (buf.length !== 33)
-        return false;
-    const toc = buf[0] ?? 0;
-    const ft = (toc >> 3) & 0x0f;
-    const qSet = (toc & 0x04) !== 0;
-    // valid speech FT are 0..9 (10-13 invalid, 14 lost, 15 no-data)
-    if (!qSet)
-        return false;
-    if (ft >= 10)
-        return false;
-    // In your observed case we expect FT=2 most of the time => toc == 0x14
-    return true;
+    return buf.length >= AMRWB_FILE_HEADER.length && buf.subarray(0, AMRWB_FILE_HEADER.length).equals(AMRWB_FILE_HEADER);
 }
 function looksLikeWavRiff(buf) {
     if (buf.length < 12)
@@ -208,6 +193,49 @@ function amrWbFrameSize(ft) {
     if (ft === 9)
         return AMRWB_SID_FRAME_BYTES;
     return 0;
+}
+/**
+ * Classify whether a payload is a valid AMR-WB single-frame payload
+ * (octet-aligned, no CMR). This replaces the misleading
+ * payload.length === 33 heuristic.
+ */
+function classifyAmrwbSingleFrame(payload) {
+    if (payload.length < 2)
+        return { ok: false, reason: 'too_short' };
+    const toc = payload[0] ?? 0;
+    const f = (toc & 0x80) !== 0; // Follow bit
+    const ft = (toc >> 3) & 0x0f; // Frame type
+    const q = (toc & 0x04) !== 0; // Quality bit
+    // Multi-TOC or not a simple single-frame packet
+    if (f) {
+        return { ok: false, reason: 'f_bit_set_multi_toc_or_not_single_frame', toc, ft, q };
+    }
+    // Invalid frame types
+    if (ft >= 10 && ft <= 13) {
+        return { ok: false, reason: `invalid_ft_${ft}`, toc, ft, q };
+    }
+    // Not speech
+    if (ft === 14)
+        return { ok: false, reason: 'speech_lost_ft_14', toc, ft, q };
+    if (ft === 15)
+        return { ok: false, reason: 'no_data_ft_15', toc, ft, q };
+    const speechBytes = ft === 9 ? AMRWB_SID_FRAME_BYTES : amrWbFrameSize(ft);
+    if (!speechBytes) {
+        return { ok: false, reason: `unknown_ft_${ft}`, toc, ft, q };
+    }
+    const expected = 1 + speechBytes; // TOC + speech bytes
+    if (payload.length !== expected) {
+        return {
+            ok: false,
+            reason: `len_mismatch_expected_${expected}_got_${payload.length}`,
+            toc,
+            ft,
+            q,
+            expectedBytes: expected,
+        };
+    }
+    // Q=0 is still a frame (bad quality), do NOT treat as non-speech
+    return { ok: true, reason: 'ok_single_frame', toc, ft, q, expectedBytes: expected };
 }
 function debugParseAmrWbOctetAligned(payload, startOffset) {
     // payload[0] is CMR when startOffset === 1 (octet-aligned mode).
@@ -643,7 +671,7 @@ class MediaIngest {
         this.dumpErrorLogged = false;
         this.amrwbCaptureChain = Promise.resolve();
         this.amrwbCaptureDirReady = false;
-        this.amrwbCaptureBeHeaderWritten = false;
+        this.amrwbCaptureContractWritten = false;
         this.amrwbCaptureDisabled = false;
         this.amrwbCaptureErrorLogged = false;
         this.frameSeq = 0;
@@ -1058,7 +1086,13 @@ class MediaIngest {
             const notAudio = currentCodec === 'AMR-WB' ? buffer.length < 20 : buffer.length < 10;
             if (notAudio)
                 capture.notAudioFrames += 1;
-            const amrwbParse = currentCodec === 'AMR-WB' ? debugParseAmrWbPayload(buffer) : null;
+            const shouldParseOctetAligned = currentCodec === 'AMR-WB' &&
+                this.transportMode !== 'pstn' && // PSTN = BE in our system
+                !this.forceAmrWbBe &&
+                buffer.length >= 2;
+            const amrwbParse = shouldParseOctetAligned
+                ? debugParseAmrWbPayload(buffer)
+                : null;
             if (!amrwbParse?.ok && amrwbParse && !this.amrwbCaptureParseFailedLogged) {
                 this.amrwbCaptureParseFailedLogged = true;
                 log_1.log.warn({
@@ -1152,28 +1186,22 @@ class MediaIngest {
     /* --------------------------- AMR-WB BE truth capture -------------------------- */
     // AMR-WB storage (AWB) frames are: [1-byte frame header] + [speech bytes]
     // Telnyx BE RTP single-frame payloads are: [1-byte TOC] + [speech bytes]
-    buildBeConvertedCandidate(payload) {
-        // Only accept the Telnyx single-frame BE speech packets we observed.
-        if (payload.length !== 33)
-            return null;
-        const toc = payload[0] ?? 0;
-        const f = (toc & 0x80) !== 0;
-        if (f)
-            return null; // multi-frame TOC not supported here
-        const ft = (toc >> 3) & 0x0f; // frame type
-        const q = (toc & 0x04) !== 0; // quality bit
-        // Reject non-speech / invalid
-        if (ft >= 10 && ft <= 13)
-            return null; // invalid reserved
-        if (ft === 14 || ft === 15)
-            return null; // speech lost / no data
-        const speech = payload.subarray(1);
-        // For payload_len=33, the only valid speech size is 32 bytes (WB FT=2)
-        if (speech.length !== 32)
-            return null;
-        // AWB frame header byte: (FT << 3) | Qbit(0x04)
-        const awbHdr = ((ft & 0x0f) << 3) | (q ? 0x04 : 0x00);
-        return Buffer.concat([Buffer.from([awbHdr]), speech]);
+    async ensureAmrwbContractFile() {
+        if (this.amrwbCaptureContractWritten)
+            return;
+        const contractPath = path_1.default.join(this.amrwbCaptureDir, 'amrwb_contract.txt');
+        try {
+            await fs_1.default.promises.writeFile(contractPath, AMRWB_CONTRACT_TEXT, { flag: 'wx' });
+        }
+        catch (error) {
+            const err = error;
+            if (err?.code !== 'EEXIST') {
+                log_1.log.warn({ event: 'amrwb_contract_write_failed', call_control_id: this.callControlId, err, ...(this.logContext ?? {}) }, 'amrwb contract write failed');
+            }
+        }
+        finally {
+            this.amrwbCaptureContractWritten = true;
+        }
     }
     logAmrwbCaptureErrorOnce(error, note) {
         if (this.amrwbCaptureErrorLogged)
@@ -1205,54 +1233,23 @@ class MediaIngest {
             }
             this.amrwbCaptureDirReady = true;
         }
-        const rawPath = path_1.default.join(this.amrwbCaptureDir, 'raw_frames.bin');
-        const bePath = path_1.default.join(this.amrwbCaptureDir, 'be_converted.awb');
+        await this.ensureAmrwbContractFile();
+        const rawPath = path_1.default.join(this.amrwbCaptureDir, 'raw_frames.lenbin');
         try {
-            if (!this.amrwbCaptureBeHeaderWritten) {
-                await fs_1.default.promises.writeFile(bePath, AMRWB_FILE_HEADER);
-                this.amrwbCaptureBeHeaderWritten = true;
-            }
-            await fs_1.default.promises.appendFile(rawPath, payload);
+            const lenBuf = Buffer.alloc(4);
+            lenBuf.writeUInt32BE(payload.length, 0);
+            await fs_1.default.promises.appendFile(rawPath, Buffer.concat([lenBuf, payload]));
         }
         catch (error) {
             this.amrwbCaptureDisabled = true;
             this.logAmrwbCaptureErrorOnce(error, 'write_raw');
             return;
         }
-        // ✅ Gate BE capture: only speech frames (33 bytes) should be appended
-        const isSpeech = isLikelyAmrwbSpeechPayload(payload);
-        let beAppended = false;
-        let droppedNonSpeech = false;
-        // NEW: explain WHY we did/didn’t append
-        let beCandidateOk = false;
-        let beCandidateReason = null;
-        // NEW: tiny sanity sniff so we know what “shape” this payload is
-        const firstByte = payload.length > 0 ? payload[0] : null;
-        const firstByteHiNibble = firstByte === null ? null : (firstByte >> 4) & 0x0f;
-        const tocFt = firstByte === null ? null : (firstByte >> 3) & 0x0f;
-        const tocQ = firstByte === null ? null : (firstByte & 0x04) !== 0;
-        if (!isSpeech) {
-            droppedNonSpeech = true;
-            beCandidateReason = 'not_len_33';
-        }
-        else {
-            const beCandidate = this.buildBeConvertedCandidate(payload);
-            if (!beCandidate) {
-                beCandidateReason = 'build_candidate_returned_null';
-            }
-            else {
-                beCandidateOk = true;
-                try {
-                    await fs_1.default.promises.appendFile(bePath, beCandidate);
-                    beAppended = true;
-                }
-                catch (error) {
-                    this.amrwbCaptureDisabled = true;
-                    this.logAmrwbCaptureErrorOnce(error, 'write_be');
-                    beCandidateReason = 'append_be_failed';
-                }
-            }
-        }
+        // Decide what we think this payload is (policy-based)
+        const payloadMode = this.transportMode === 'pstn' || this.forceAmrWbBe ? 'be' : 'octet';
+        // Only run the “single-frame octet-aligned” classifier when we’re in octet mode.
+        // For BE payloads this classifier is not meaningful.
+        const single = payloadMode === 'octet' ? classifyAmrwbSingleFrame(payload) : null;
         const first8Hex = getHexPrefix(payload, 8);
         log_1.log.info({
             event: 'amrwb_truth_capture_frame',
@@ -1260,22 +1257,18 @@ class MediaIngest {
             frame_index: frameIndex,
             payload_len: payload.length,
             first8_hex: first8Hex,
-            // what we decided
-            is_speech: isSpeech,
-            dropped_non_speech: droppedNonSpeech,
-            be_candidate_ok: beCandidateOk,
-            be_candidate_reason: beCandidateReason,
-            // what the bytes look like (tells us if this is really [TOC + 32])
-            first_byte: firstByte,
-            first_byte_hi_nibble: firstByteHiNibble,
-            toc_ft: tocFt,
-            toc_q: tocQ,
-            appended_streams: {
-                raw: true,
-                be: beAppended,
-            },
+            payload_mode: payloadMode,
+            // only meaningful when payload_mode === 'octet'
+            single_frame_ok: single?.ok ?? null,
+            single_frame_reason: single?.reason ?? null,
+            single_toc: single?.toc ?? null,
+            single_ft: single?.ft ?? null,
+            single_q: typeof single?.q === 'boolean' ? single.q : null,
+            single_expected_bytes: single?.expectedBytes ?? null,
+            appended_streams: { raw: true },
+            be_output_disabled: true,
             ...(this.logContext ?? {}),
-        }, `amrwb truth capture callId=${this.callControlId} frame_index=${frameIndex} payload_len=${payload.length} first8_hex=${first8Hex} speech=${isSpeech} be_ok=${beCandidateOk} be_reason=${beCandidateReason} appended_be=${beAppended}`);
+        }, 'amrwb truth capture...');
     }
     /* ------------------------------ low-level helpers ----------------------------- */
     getTelnyxStreamId(message) {
@@ -1319,10 +1312,6 @@ class MediaIngest {
         log_1.log.warn({ event: 'media_dump_error', call_control_id: this.callControlId, note, err: error, ...(this.logContext ?? {}) }, 'media dump failed');
     }
     guessDumpKind(raw) {
-        if (looksLikeAmrWbMagic(raw))
-            return 'amrwb_magic';
-        if (looksLikeTelnyxNoCmrToc33(raw))
-            return 'amrwb_toc_like';
         if (looksLikeWavRiff(raw))
             return 'wav_riff';
         return 'unknown';
@@ -1361,10 +1350,11 @@ class MediaIngest {
         const guessedKind = this.guessDumpKind(raw);
         let prepared = null;
         let preparedHex16 = null;
-        if (guessedKind === 'amrwb_magic' || guessedKind === 'amrwb_toc_like') {
+        // If this call is AMR-WB, try prepare on the raw bytes regardless of “magic header”
+        if (normalizeCodec(this.mediaEncoding) === 'AMR-WB') {
             const prep = (0, prepareAmrWbPayload_1.prepareAmrWbPayload)(raw);
-            prepared = prep.prepared;
-            preparedHex16 = getHexPrefix(prepared, 16);
+            prepared = prep.prepared ?? null;
+            preparedHex16 = prepared ? getHexPrefix(prepared, 16) : null;
         }
         try {
             await fs_1.default.promises.writeFile(`${basePath}.b64.txt`, base64Payload);
@@ -1679,10 +1669,12 @@ class MediaIngest {
             forceAmrWbBe: this.forceAmrWbBe,
         });
         if (!decodeResult) {
-            // Don't mark AMR-WB frames as "tiny" just because decode failed.
+            const amrwbBuffering = encoding === 'AMR-WB' && this.codecState?.amrwbLastError === 'amrwb_buffering';
+            // Don't mark AMR-WB frames as "tiny" just because decode failed/buffered.
             const pseudoDecodedLen = encoding === 'AMR-WB' ? 999 : 0;
-            this.healthMonitor.recordPayload(buffer.length, pseudoDecodedLen, 0, 0, false);
-            this.checkHealth(encoding);
+            this.healthMonitor.recordPayload(buffer.length, pseudoDecodedLen, 0, 0, amrwbBuffering ? true : false);
+            if (!amrwbBuffering)
+                this.checkHealth(encoding);
             return;
         }
         // ✅ Mark "good decoded audio" as soon as we know decode succeeded

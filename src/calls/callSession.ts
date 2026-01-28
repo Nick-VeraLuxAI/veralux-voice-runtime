@@ -119,6 +119,22 @@ export class CallSession {
   // pick reasonable defaults; you can env-ize later
   private readonly deadAirListeningGraceMs = 1200;  // prevents immediate reprompt right after enter LISTENING
   private readonly deadAirAfterSpeechStartGraceMs = 1500; // prevents reprompt while user has started speaking but transcript not ready
+  // ===== STT in-flight tracking (prevents dead-air reprompt while Whisper HTTP is running) =====
+  private onSttRequestStart(kind: 'partial' | 'final'): void {
+    this.sttInFlightCount += 1;
+    log.info(
+      { event: 'stt_req_start', kind, in_flight: this.sttInFlightCount, ...this.logContext },
+      'stt request started',
+    );
+  }
+
+  private onSttRequestEnd(kind: 'partial' | 'final'): void {
+    this.sttInFlightCount = Math.max(0, this.sttInFlightCount - 1);
+    log.info(
+      { event: 'stt_req_end', kind, in_flight: this.sttInFlightCount, ...this.logContext },
+      'stt request ended',
+    );
+  }
 
 
   constructor(config: CallSessionConfig) {
@@ -194,6 +210,10 @@ export class CallSession {
       onSpeechStart: (info: SpeechStartInfo) => {
         void this.handleSpeechStart(info);
       },
+      // ✅ STT in-flight hooks (ChunkedSTT calls these when provider requests start/end)
+      onSttRequestStart: (kind) => this.onSttRequestStart(kind),
+      onSttRequestEnd: (kind) => this.onSttRequestEnd(kind),
+
       isPlaybackActive: () => this.isPlaybackActive(),
       isListening: () => this.isListening(),
       getTrack: () => env.TELNYX_STREAM_TRACK,
@@ -300,10 +320,6 @@ export class CallSession {
     incSttFramesFed();
     this.maybeCaptureRxDump(pcmBuffer);
 
-    // ✅ Don’t feed Whisper during playback (prevents TTS bleed / empty transcripts)
-    if (this.isPlaybackActive()) {
-      return;
-    }
 
     this.stt.ingestPcm16(frame.pcm16, frame.sampleRateHz);
   }
