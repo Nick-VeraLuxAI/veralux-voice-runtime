@@ -19,6 +19,43 @@ function getErrorMessage(error: unknown): string {
   return 'unknown_error';
 }
 
+type SdpAudioLines = {
+  mLine: string | null;
+  rtpmapLines: string[];
+  fmtpLines: string[];
+  notes: string[];
+};
+
+function extractAudioSdpLines(sdp: string | undefined): SdpAudioLines {
+  const notes: string[] = [];
+  if (!sdp) {
+    notes.push('missing_sdp');
+    return { mLine: null, rtpmapLines: [], fmtpLines: [], notes };
+  }
+
+  const lines = sdp
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0);
+  const audioIndex = lines.findIndex((line) => line.startsWith('m=audio'));
+  if (audioIndex === -1) {
+    notes.push('missing_m_audio');
+    return { mLine: null, rtpmapLines: [], fmtpLines: [], notes };
+  }
+
+  const mLine = lines[audioIndex] ?? null;
+  let sectionEnd = lines.findIndex((line, idx) => idx > audioIndex && line.startsWith('m='));
+  if (sectionEnd === -1) sectionEnd = lines.length;
+  const section = lines.slice(audioIndex + 1, sectionEnd);
+  const rtpmapLines = section.filter((line) => line.startsWith('a=rtpmap:'));
+  const fmtpLines = section.filter((line) => line.startsWith('a=fmtp:'));
+
+  if (rtpmapLines.length === 0) notes.push('missing_rtpmap');
+  if (fmtpLines.length === 0) notes.push('missing_fmtp');
+
+  return { mLine, rtpmapLines, fmtpLines, notes };
+}
+
 
 let _wrtc: any | null = null;
 
@@ -320,6 +357,7 @@ export class WebRtcHdTransportSession implements TransportSession {
   private readonly outputSampleRate: number;
   private audioSink?: wrtcTypes.nonstandard.RTCAudioSink;
   private readonly onSessionEnded?: (reason: string) => void;
+  private sdpAudioLogged = false;
 
   constructor(options: {
     sessionId: string;
@@ -396,6 +434,8 @@ export class WebRtcHdTransportSession implements TransportSession {
       if (!this.pc.localDescription) {
         throw new Error('missing_local_description');
       }
+      // instrumentation: log SDP audio details once per call
+      this.logSdpAudioOnce(offer.sdp, this.pc.localDescription.sdp);
       return this.pc.localDescription;
     } finally {
       endHandshake();
@@ -404,6 +444,36 @@ export class WebRtcHdTransportSession implements TransportSession {
 
   async start(): Promise<void> {
     // WebRTC is started by offer/answer; nothing to do here.
+  }
+
+  private logSdpAudioOnce(offerSdp: string | undefined, answerSdp: string | undefined): void {
+    if (this.sdpAudioLogged) return;
+    this.sdpAudioLogged = true;
+    try {
+      const offer = extractAudioSdpLines(offerSdp);
+      const answer = extractAudioSdpLines(answerSdp);
+      log.info(
+        {
+          event: 'sdp_audio',
+          offer: {
+            m_line: offer.mLine,
+            rtpmap_lines: offer.rtpmapLines,
+            fmtp_lines: offer.fmtpLines,
+            notes: offer.notes,
+          },
+          answer: {
+            m_line: answer.mLine,
+            rtpmap_lines: answer.rtpmapLines,
+            fmtp_lines: answer.fmtpLines,
+            notes: answer.notes,
+          },
+          ...this.logContext,
+        },
+        'SDP_AUDIO audio sdp',
+      );
+    } catch (error) {
+      log.warn({ event: 'sdp_audio_log_failed', err: error, ...this.logContext }, 'SDP_AUDIO logging failed');
+    }
   }
 
   async stop(reason?: string): Promise<void> {

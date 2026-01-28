@@ -8,6 +8,34 @@ function getErrorMessage(error) {
         return error.message;
     return 'unknown_error';
 }
+function extractAudioSdpLines(sdp) {
+    const notes = [];
+    if (!sdp) {
+        notes.push('missing_sdp');
+        return { mLine: null, rtpmapLines: [], fmtpLines: [], notes };
+    }
+    const lines = sdp
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .filter((line) => line.length > 0);
+    const audioIndex = lines.findIndex((line) => line.startsWith('m=audio'));
+    if (audioIndex === -1) {
+        notes.push('missing_m_audio');
+        return { mLine: null, rtpmapLines: [], fmtpLines: [], notes };
+    }
+    const mLine = lines[audioIndex] ?? null;
+    let sectionEnd = lines.findIndex((line, idx) => idx > audioIndex && line.startsWith('m='));
+    if (sectionEnd === -1)
+        sectionEnd = lines.length;
+    const section = lines.slice(audioIndex + 1, sectionEnd);
+    const rtpmapLines = section.filter((line) => line.startsWith('a=rtpmap:'));
+    const fmtpLines = section.filter((line) => line.startsWith('a=fmtp:'));
+    if (rtpmapLines.length === 0)
+        notes.push('missing_rtpmap');
+    if (fmtpLines.length === 0)
+        notes.push('missing_fmtp');
+    return { mLine, rtpmapLines, fmtpLines, notes };
+}
 let _wrtc = null;
 function loadWrtc() {
     if (_wrtc)
@@ -247,6 +275,7 @@ class WebRtcHdTransportSession {
     constructor(options) {
         this.mode = 'webrtc_hd';
         this.audioInput = { codec: 'pcm16le', sampleRateHz: 16000 };
+        this.sdpAudioLogged = false;
         this.id = options.sessionId;
         this.tenantLabel = options.tenantId ?? 'unknown';
         this.logContext = {
@@ -310,6 +339,8 @@ class WebRtcHdTransportSession {
             if (!this.pc.localDescription) {
                 throw new Error('missing_local_description');
             }
+            // instrumentation: log SDP audio details once per call
+            this.logSdpAudioOnce(offer.sdp, this.pc.localDescription.sdp);
             return this.pc.localDescription;
         }
         finally {
@@ -318,6 +349,34 @@ class WebRtcHdTransportSession {
     }
     async start() {
         // WebRTC is started by offer/answer; nothing to do here.
+    }
+    logSdpAudioOnce(offerSdp, answerSdp) {
+        if (this.sdpAudioLogged)
+            return;
+        this.sdpAudioLogged = true;
+        try {
+            const offer = extractAudioSdpLines(offerSdp);
+            const answer = extractAudioSdpLines(answerSdp);
+            log_1.log.info({
+                event: 'sdp_audio',
+                offer: {
+                    m_line: offer.mLine,
+                    rtpmap_lines: offer.rtpmapLines,
+                    fmtp_lines: offer.fmtpLines,
+                    notes: offer.notes,
+                },
+                answer: {
+                    m_line: answer.mLine,
+                    rtpmap_lines: answer.rtpmapLines,
+                    fmtp_lines: answer.fmtpLines,
+                    notes: answer.notes,
+                },
+                ...this.logContext,
+            }, 'SDP_AUDIO audio sdp');
+        }
+        catch (error) {
+            log_1.log.warn({ event: 'sdp_audio_log_failed', err: error, ...this.logContext }, 'SDP_AUDIO logging failed');
+        }
     }
     async stop(reason) {
         try {

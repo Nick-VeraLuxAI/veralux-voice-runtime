@@ -1,3 +1,4 @@
+import { env } from '../env';
 import { log } from '../log';
 import { TelnyxClient } from '../telnyx/telnyxClient';
 import type { AudioIngest, AudioPlayback, PlaybackInput, TransportSession } from './types';
@@ -89,7 +90,10 @@ export class PstnTelnyxTransportSession implements TransportSession {
   public readonly mode = 'pstn' as const;
   public readonly ingest: PstnAudioIngest;
   public readonly playback: PstnAudioPlayback;
-  public readonly audioInput = { codec: 'pcmu' as const, sampleRateHz: 8000 };
+  public readonly audioInput = {
+    codec: 'pcm16le' as const,
+    sampleRateHz: env.TELNYX_TARGET_SAMPLE_RATE, // import env here
+  };
 
   private readonly telnyx: TelnyxClient;
   private readonly logContext: Record<string, unknown>;
