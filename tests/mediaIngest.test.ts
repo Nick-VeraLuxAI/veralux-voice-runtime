@@ -22,6 +22,7 @@ test('MediaIngestHealthMonitor flags low RMS early', async () => {
 
   for (let i = 0; i < 12; i += 1) {
     monitor.recordPayload(80, 80, 0.0001, 0.0002, true);
+    monitor.recordEmittedChunk(0.0001, 0.0002);
   }
 
   const reason = monitor.evaluate(start + 1200);

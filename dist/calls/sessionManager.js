@@ -1,9 +1,14 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.SessionManager = void 0;
+// src/calls/sessionManager.ts
 const capacity_1 = require("../limits/capacity");
 const log_1 = require("../log");
+const metrics_1 = require("../metrics");
 const callSession_1 = require("./callSession");
+const codecDecode_1 = require("../audio/codecDecode");
+const farEndReference_1 = require("../audio/farEndReference");
+const aecProcessor_1 = require("../audio/aecProcessor");
 const DEFAULT_IDLE_TTL_MINUTES = 10;
 const DEFAULT_SWEEP_INTERVAL_MS = 60000;
 class SessionManager {
@@ -13,6 +18,7 @@ class SessionManager {
         this.mediaConnections = new Map();
         this.transports = new Map();
         this.inactiveCalls = new Map();
+        this.pendingMediaWsConnectedAt = new Map();
         const idleMinutes = options.idleTtlMinutes ?? DEFAULT_IDLE_TTL_MINUTES;
         this.idleTtlMs = Math.max(idleMinutes, 1) * 60000;
         this.capacityRelease = options.capacityRelease ?? capacity_1.release;
@@ -42,14 +48,36 @@ class SessionManager {
             }, 'call session exists');
             return existing;
         }
-        const session = new callSession_1.CallSession({ ...config, requestId: context.requestId ?? config.requestId });
+        const session = new callSession_1.CallSession({
+            ...config,
+            requestId: context.requestId ?? config.requestId,
+        });
         this.sessions.set(config.callControlId, session);
+        if (this.pendingMediaWsConnectedAt.has(config.callControlId)) {
+            session.onMediaWsConnected();
+            this.pendingMediaWsConnectedAt.delete(config.callControlId);
+        }
+        // ===== Anchor: transport wiring =====
         const transport = session.getTransport();
         this.transports.set(config.callControlId, transport);
+        // Inbound media frames
         transport.ingest.onFrame((frame) => session.onAudioFrame(frame));
-        transport.playback.onPlaybackEnd(() => session.onPlaybackEnded());
+        // 🔒 PLAYBACK_END_WIRING (authoritative: pstn=webhook, webrtc=transport)
+        // ✅ Playback end wiring:
+        // - WebRTC: transport can reliably emit "playback ended"
+        // - PSTN: DO NOT wire this; only Telnyx webhook (call.playback.ended) is authoritative
+        if (transport.mode !== 'pstn') {
+            transport.playback.onPlaybackEnd(() => {
+                session.onPlaybackEnded();
+            });
+        }
         void Promise.resolve(transport.ingest.start()).catch((error) => {
-            log_1.log.warn({ err: error, call_control_id: session.callControlId, tenant_id: session.tenantId, requestId: context.requestId }, 'transport ingest start failed');
+            log_1.log.warn({
+                err: error,
+                call_control_id: session.callControlId,
+                tenant_id: session.tenantId,
+                requestId: context.requestId,
+            }, 'transport ingest start failed');
         });
         session.start({ autoAnswer: options.autoAnswer });
         log_1.log.info({
@@ -84,6 +112,13 @@ class SessionManager {
             requestId: context.requestId,
         }, 'call session answered');
     }
+    onTelnyxPlaybackEnded(callControlId, meta) {
+        const session = this.sessions.get(callControlId);
+        if (!session)
+            return;
+        // ✅ This is the only correct entrypoint for Telnyx webhook playback-ended
+        session.onTelnyxPlaybackEnded(meta);
+    }
     onPlaybackEnded(callControlId, context = {}) {
         const session = this.sessions.get(callControlId);
         if (!session) {
@@ -95,18 +130,32 @@ class SessionManager {
             return;
         }
         const transport = this.transports.get(callControlId);
-        if (transport?.notifyPlaybackEnded) {
-            transport.notifyPlaybackEnded();
+        // ✅ Guard: this handler is intended for Telnyx PSTN webhook playback end.
+        // If we ever get here for WebRTC, ignore to prevent double/incorrect cleanup.
+        // If transport is missing, we still accept it (PSTN webhook is authoritative).
+        if (transport?.mode === 'webrtc_hd') {
+            log_1.log.warn({
+                event: 'call_session_playback_end_ignored_non_pstn',
+                call_control_id: callControlId,
+                tenant_id: session.tenantId,
+                requestId: context.requestId,
+                mode: transport.mode,
+            }, 'ignoring webhook playback end for non-pstn transport');
+            return;
         }
-        else {
-            session.onPlaybackEnded();
-        }
+        // ✅ Webhook-driven PSTN playback end: CallSession owns cleanup + LISTENING transition.
+        session.onTelnyxPlaybackEnded({
+            requestId: context.requestId,
+            source: 'telnyx_webhook',
+        });
         log_1.log.info({
             event: 'call_session_playback_end',
             call_control_id: session.callControlId,
             tenant_id: session.tenantId,
             state: session.getState(),
             requestId: context.requestId,
+            mode: transport?.mode ?? 'unknown',
+            path: 'direct_session_telnyx',
         }, 'call session playback ended');
     }
     isCallActive(callControlId) {
@@ -115,6 +164,34 @@ class SessionManager {
         }
         const session = this.sessions.get(callControlId);
         return session ? session.isActive() : true;
+    }
+    isPlaybackActive(callControlId) {
+        const session = this.sessions.get(callControlId);
+        return session ? session.isPlaybackActive() : false;
+    }
+    isListening(callControlId) {
+        const session = this.sessions.get(callControlId);
+        return session ? session.isListening() : false;
+    }
+    getLastSpeechStartAtMs(callControlId) {
+        const session = this.sessions.get(callControlId);
+        return session ? session.getLastSpeechStartAtMs() : 0;
+    }
+    getTransportMode(callControlId) {
+        const transport = this.transports.get(callControlId);
+        return transport?.mode;
+    }
+    notifyIngestFailure(callControlId, reason) {
+        const session = this.sessions.get(callControlId);
+        if (!session) {
+            log_1.log.warn({
+                event: 'call_session_ingest_missing',
+                call_control_id: callControlId,
+                reason,
+            }, 'call session missing for ingest failure');
+            return;
+        }
+        session.notifyIngestFailure(reason);
     }
     onHangup(callControlId, reason, context = {}) {
         const session = this.sessions.get(callControlId);
@@ -140,9 +217,23 @@ class SessionManager {
             state: session.getState(),
             requestId: context.requestId,
         }, 'call session hangup');
-        this.teardown(callControlId, reason ?? 'hangup', context);
+        // If STT is in flight, defer teardown until transcript is captured or grace period expires.
+        // That way the final transcript is available before we log teardown and release capacity.
+        if (session.getSttInFlightCount() > 0) {
+            session.armDeferredTeardown(() => {
+                this.teardown(callControlId, reason ?? 'hangup', context);
+            });
+        }
+        else {
+            this.teardown(callControlId, reason ?? 'hangup', context);
+        }
     }
     teardown(callControlId, reason, context = {}) {
+        // ✅ Always clear codec session cache on teardown (session exists OR missing)
+        (0, codecDecode_1.clearTelnyxCodecSession)({ call_control_id: callControlId });
+        (0, farEndReference_1.releaseFarEndBuffer)(callControlId);
+        (0, aecProcessor_1.releaseAecProcessor)(callControlId);
+        this.pendingMediaWsConnectedAt.delete(callControlId);
         const session = this.sessions.get(callControlId);
         if (!session) {
             this.inactiveCalls.set(callControlId, Date.now());
@@ -193,6 +284,21 @@ class SessionManager {
         }
         const metrics = session.getMetrics();
         const durationMs = Date.now() - metrics.createdAt.getTime();
+        // Tier 5: per-call metrics for production hardening
+        const emptyPct = metrics.transcriptsTotal > 0
+            ? Math.round((100 * metrics.transcriptsEmpty) / metrics.transcriptsTotal)
+            : 0;
+        const avgCharsPerSec = metrics.totalUtteranceMs > 0
+            ? (metrics.totalTranscribedChars / metrics.totalUtteranceMs) * 1000
+            : 0;
+        (0, metrics_1.recordCallMetrics)({
+            tenantId: session.tenantId,
+            reason: reason ?? 'teardown',
+            durationMs,
+            turns: metrics.turns,
+            transcriptsTotal: metrics.transcriptsTotal,
+            transcriptsEmpty: metrics.transcriptsEmpty,
+        });
         log_1.log.info({
             event: 'call_session_teardown',
             call_control_id: session.callControlId,
@@ -202,12 +308,20 @@ class SessionManager {
             turns: metrics.turns,
             session_duration_ms: durationMs,
             last_heard_at: metrics.lastHeardAt?.toISOString(),
+            transcripts_total: metrics.transcriptsTotal,
+            transcripts_empty: metrics.transcriptsEmpty,
+            empty_transcript_pct: emptyPct,
+            total_utterance_ms: metrics.totalUtteranceMs,
+            total_transcribed_chars: metrics.totalTranscribedChars,
+            avg_chars_per_sec: Math.round(avgCharsPerSec * 10) / 10,
             requestId: context.requestId,
         }, 'call session teardown');
     }
     pushAudio(callControlId, frame) {
+        (0, metrics_1.incInboundAudioFrames)();
         const session = this.sessions.get(callControlId);
         if (!session) {
+            (0, metrics_1.incInboundAudioFramesDropped)('missing_session');
             log_1.log.warn({
                 event: 'call_session_missing_audio',
                 call_control_id: callControlId,
@@ -215,6 +329,7 @@ class SessionManager {
             return false;
         }
         if (!session.isActive() || session.getState() === 'ENDED') {
+            (0, metrics_1.incInboundAudioFramesDropped)('inactive_session');
             log_1.log.warn({
                 event: 'call_session_audio_ended',
                 call_control_id: callControlId,
@@ -231,15 +346,30 @@ class SessionManager {
         return true;
     }
     pushPcm16(callControlId, pcm16, sampleRateHz) {
-        if (sampleRateHz <= 0) {
+        return this.pushPcm16Frame(callControlId, { pcm16, sampleRateHz, channels: 1 });
+    }
+    pushPcm16Frame(callControlId, frame) {
+        (0, metrics_1.incInboundAudioFrames)();
+        const session = this.sessions.get(callControlId);
+        if (!session) {
+            (0, metrics_1.incInboundAudioFramesDropped)('missing_session');
+            log_1.log.warn({ event: 'call_session_missing_pcm16', call_control_id: callControlId }, 'missing session for pcm16');
+            return false;
+        }
+        if (!session.isActive() || session.getState() === 'ENDED') {
+            (0, metrics_1.incInboundAudioFramesDropped)('inactive_session');
+            log_1.log.warn({ event: 'call_session_pcm16_ended', call_control_id: callControlId }, 'session ended for pcm16');
+            return false;
+        }
+        if (frame.sampleRateHz <= 0) {
             log_1.log.warn({
                 event: 'call_session_pcm16_invalid_rate',
                 call_control_id: callControlId,
-                sample_rate_hz: sampleRateHz,
-            }, 'invalid pcm16 sample rate');
+                sample_rate_hz: frame.sampleRateHz,
+            }, 'invalid pcm16 rate');
         }
-        const buffer = Buffer.from(pcm16.buffer, pcm16.byteOffset, pcm16.byteLength);
-        return this.pushAudio(callControlId, buffer);
+        session.onPcm16Frame(frame);
+        return true;
     }
     registerMediaConnection(callControlId, connection) {
         const connections = this.mediaConnections.get(callControlId) ?? new Set();
@@ -255,6 +385,36 @@ class SessionManager {
         if (connections.size === 0) {
             this.mediaConnections.delete(callControlId);
         }
+    }
+    onMediaWsConnected(callControlId) {
+        const session = this.sessions.get(callControlId);
+        if (!session) {
+            this.pendingMediaWsConnectedAt.set(callControlId, Date.now());
+            log_1.log.warn({ event: 'call_session_media_ws_missing', call_control_id: callControlId }, 'media ws connected for missing session');
+            return;
+        }
+        this.pendingMediaWsConnectedAt.delete(callControlId);
+        session.onMediaWsConnected();
+    }
+    onMediaWsDisconnected(callControlId) {
+        const session = this.sessions.get(callControlId);
+        if (!session) {
+            this.pendingMediaWsConnectedAt.delete(callControlId);
+            return;
+        }
+        session.onMediaWsDisconnected();
+    }
+    onMediaStreamingStopped(callControlId, context = {}) {
+        const session = this.sessions.get(callControlId);
+        if (!session) {
+            log_1.log.warn({
+                event: 'call_session_streaming_stopped_missing',
+                call_control_id: callControlId,
+                requestId: context.requestId,
+            }, 'call session missing on streaming stopped');
+            return;
+        }
+        session.onMediaStreamingStopped();
     }
     async runQueue(callControlId, queue) {
         while (queue.items.length > 0) {

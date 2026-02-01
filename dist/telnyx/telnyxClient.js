@@ -214,7 +214,7 @@ async function telnyxCallControl(callControlId, action, body, logContext = {}) {
             const { media_format: _mediaFormat, ...rest } = body;
             normalizedBody = {
                 ...rest,
-                stream_codec: process.env.TELNYX_STREAM_CODEC ?? 'PCMU',
+                stream_codec: process.env.TELNYX_STREAM_CODEC ?? 'AMR-WB',
             };
         }
     }
@@ -273,11 +273,25 @@ class TelnyxClient {
             ...this.logContext,
         }, 'telnyx playback stop requested');
     }
-    async startStreaming(callControlId, streamUrl) {
+    async startStreaming(callControlId, streamUrl, options = {}) {
+        const normalizeStreamTrack = (track) => {
+            switch (track) {
+                case 'inbound':
+                    return 'inbound_track';
+                case 'outbound':
+                    return 'outbound_track';
+                case 'both':
+                    return 'both_tracks';
+                default:
+                    return track;
+            }
+        };
+        const fallbackCodec = env_1.env.TRANSPORT_MODE === 'webrtc_hd' ? 'OPUS' : 'PCMU';
+        const streamTrack = normalizeStreamTrack(options.streamTrack ?? env_1.env.TELNYX_STREAM_TRACK);
         const requestBody = {
             stream_url: streamUrl,
-            stream_track: env_1.env.TELNYX_STREAM_TRACK,
-            stream_codec: process.env.TELNYX_STREAM_CODEC ?? 'PCMU',
+            stream_track: streamTrack,
+            stream_codec: options.streamCodec ?? env_1.env.TELNYX_STREAM_CODEC ?? fallbackCodec,
         };
         if ((0, audioProbe_1.diagnosticsEnabled)()) {
             log_1.log.info({

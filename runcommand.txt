@@ -1,0 +1,25 @@
+rm -rf /private/tmp/veralux-stt-debug /private/tmp/veralux-stt_bug /tmp/runtime.log
+mkdir -p /private/tmp/veralux-stt-debug
+
+export WHISPER_URL="http://127.0.0.1:9000/transcribe"
+export AMRWB_SELECTED_RECENT_DEDUPE_N=8
+
+TRUTH_CAPTURE_AMRWB=true \
+AMRWB_ARTIFACT_DEBUG=true \
+AMRWB_DECODE_TRACE=true \
+MEDIA_DEBUG=true \
+STT_TRACE=true \
+STT_TRACE_LIMIT=300 \
+STT_VAD_ENABLED=true \
+STT_VAD_THRESHOLD=0.45 \
+STT_RX_POSTPROCESS_ENABLED=true \
+STT_RX_DEDUPE_WINDOW=32 \
+STT_POST_PLAYBACK_GRACE_MS=200 \
+STT_DEBUG_DUMP_WHISPER_WAVS=true \
+STT_DEBUG_DUMP_RX_WAV=true \
+STT_PRE_ROLL_MS=900 \
+STT_SPEECH_FRAMES_REQUIRED=1 \
+STT_SILENCE_END_MS=900 \
+FINAL_TAIL_CUSHION_MS=600 \
+STT_MAX_UTTERANCE_MS=12000 \
+npm run dev 2>&1 | tee /tmp/runtime.log

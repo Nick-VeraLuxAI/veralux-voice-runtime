@@ -13,7 +13,8 @@ Configuration is read from environment variables via `dotenv` and validated at s
 - `WHISPER_URL`: Whisper HTTP endpoint.
 - `KOKORO_URL`: Kokoro HTTP endpoint.
 - `STT_CHUNK_MS`: STT chunk interval in milliseconds.
-- `STT_SILENCE_MS`: Silence timeout before flushing a chunk.
+- `STT_SILENCE_MS`: Silence timeout before flushing a chunk. Lower values (e.g. 500–700 ms) finalize utterances sooner so the assistant can respond before the user hangs up; higher values wait for longer pauses.
+- `STT_NO_FRAME_FINALIZE_MS` (default `1000`): If no audio frames are received for this many ms while in speech, the utterance is finalized (so the assistant can respond even when the stream goes quiet before disconnect). Clamped 400–5000 ms.
 - `DEAD_AIR_MS`: Timeout before a reprompt.
 - `REDIS_URL`: Redis connection URL.
 - `GLOBAL_CONCURRENCY_CAP`: Global concurrent call limit.
@@ -29,6 +30,22 @@ Configuration is read from environment variables via `dotenv` and validated at s
 - `AUDIO_CLEANUP_HOURS` (default `24`): Max age before local audio cleanup.
 - `TELNYX_WEBHOOK_SECRET`: HMAC secret for webhook verification when using HMAC.
 - `LOG_LEVEL` (default `info`): Logging verbosity.
+- `STT_PRE_ROLL_MS` (default `1200`): Pre-roll buffer length (ms) prepended to each utterance.
+- `STT_AEC_ENABLED` (default `false`): Enable SpeexDSP acoustic echo cancellation. Requires libspeexdsp: `brew install speexdsp` (macOS) or `apt install libspeexdsp-dev` (Linux). Uses the far-end reference from Tier 3 to suppress assistant playback in mic capture.
+
+### Tier 5: Production hardening
+
+- `STT_NOISE_FLOOR_ENABLED` (default `true`): Estimate ambient noise floor from pre-speech frames and adapt RMS/peak thresholds dynamically.
+- `STT_NOISE_FLOOR_ALPHA` (default `0.05`): Exponential smoothing factor for noise floor estimation.
+- `STT_NOISE_FLOOR_MIN_SAMPLES` (default `30`): Minimum frames before using adaptive thresholds.
+- `STT_ADAPTIVE_RMS_MULTIPLIER` (default `2.0`): Speech RMS floor = noise_floor × multiplier.
+- `STT_ADAPTIVE_PEAK_MULTIPLIER` (default `2.5`): Speech peak floor = noise_floor × multiplier.
+- `STT_ADAPTIVE_FLOOR_MIN_RMS` (default `0.01`): Minimum RMS floor regardless of noise.
+- `STT_ADAPTIVE_FLOOR_MIN_PEAK` (default `0.03`): Minimum peak floor regardless of noise.
+- `STT_LATE_FINAL_WATCHDOG_ENABLED` (default `true`): Force finalization if speech has been ongoing for too long without silence-based finalize.
+- `STT_LATE_FINAL_WATCHDOG_MS` (default `8000`): Max ms of continuous speech before watchdog forces final.
+
+Per-call metrics are logged at teardown (`call_session_teardown`) and recorded to Prometheus: `call_completions_total`, `call_duration_seconds`, `call_turns`, `call_empty_transcript_pct`.
 
 ## Tenant configuration in Redis (tenantcfg v1)
 
@@ -63,6 +80,7 @@ WHISPER_URL=https://stt.example.com/v1/whisper
 KOKORO_URL=https://tts.example.com/v1/kokoro
 STT_CHUNK_MS=800
 STT_SILENCE_MS=1200
+STT_PRE_ROLL_MS=1200
 DEAD_AIR_MS=15000
 REDIS_URL=redis://localhost:6379
 GLOBAL_CONCURRENCY_CAP=200

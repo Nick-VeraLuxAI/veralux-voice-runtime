@@ -3,6 +3,8 @@ const HPF_CUTOFF_HZ = 100;
 const DEFAULT_SAMPLE_RATE_HZ = 16000;
 const SOFT_LIMIT_THRESHOLD = 0.9;
 const OUTPUT_SAMPLE_RATE_HZ = 16000;
+const MIN_PEAK_FOR_GAIN = 500;
+const MAX_POSTPROCESS_GAIN = 10;
 
 export interface PostprocessResult {
   audio: Buffer;
@@ -184,7 +186,16 @@ export function postprocessPcm16(
     if (abs > peak) peak = abs;
   }
 
-  const gain = peak > 0 ? TARGET_PEAK / peak : 1;
+  let gain = 1;
+  if (peak > 0) {
+    const targetGain = TARGET_PEAK / peak;
+    if (targetGain < 1) {
+      gain = targetGain;
+    } else {
+      // Allow boosting even when the signal is quiet (but non-zero)
+      gain = Math.min(targetGain, MAX_POSTPROCESS_GAIN);
+    }
+  }
   const sr = sampleRateHz > 0 ? sampleRateHz : DEFAULT_SAMPLE_RATE_HZ;
   const dt = 1 / sr;
   const rc = 1 / (2 * Math.PI * HPF_CUTOFF_HZ);

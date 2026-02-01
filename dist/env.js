@@ -4,13 +4,14 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
 };
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.env = void 0;
+// src/env.ts
 const dotenv_1 = __importDefault(require("dotenv"));
 const zod_1 = require("zod");
 dotenv_1.default.config();
+// ───────────────────────── helpers ─────────────────────────
 const emptyToUndefined = (value) => {
-    if (typeof value === 'string' && value.trim() === '') {
+    if (typeof value === 'string' && value.trim() === '')
         return undefined;
-    }
     return value;
 };
 const stringToBoolean = (value) => {
@@ -25,18 +26,60 @@ const stringToBoolean = (value) => {
     }
     return value;
 };
+const numberFromEnv = (value) => {
+    // prevent z.coerce.number from treating booleans as 1/0
+    if (typeof value === 'boolean')
+        return NaN;
+    if (typeof value === 'string') {
+        const trimmed = value.trim();
+        if (trimmed === '')
+            return undefined;
+        // prevent 'true'/'false' from becoming NaN later in confusing ways
+        const normalized = trimmed.toLowerCase();
+        if (normalized === 'true' || normalized === 'false')
+            return NaN;
+        return trimmed; // allow z.coerce.number to do the conversion
+    }
+    return value;
+};
+// Back-compat: STT_RMS_THRESHOLD → STT_SPEECH_RMS_FLOOR
 const sttRmsFloorFallback = (value) => {
     const normalized = emptyToUndefined(value);
     if (normalized !== undefined)
         return normalized;
     return emptyToUndefined(process.env.STT_RMS_THRESHOLD);
 };
+// ✅ Back-compat / aliasing for frames-required
+// Prefer the actual knob: STT_SPEECH_FRAMES_REQUIRED
+// Allow legacy: STT_FRAMES_REQUIRED
+const sttFramesRequiredFallback = (value) => {
+    const normalized = numberFromEnv(value);
+    if (normalized !== undefined)
+        return normalized;
+    const fromSpeech = numberFromEnv(process.env.STT_SPEECH_FRAMES_REQUIRED);
+    if (fromSpeech !== undefined)
+        return fromSpeech;
+    return numberFromEnv(process.env.STT_FRAMES_REQUIRED);
+};
+// ✅ Make STT_SILENCE_END_MS default to STT_SILENCE_MS when not set
+// (So your CLI `STT_SILENCE_MS=900` actually drives endpointing if END_MS is missing.)
+const sttSilenceEndFallback = (value) => {
+    const normalized = numberFromEnv(value);
+    if (normalized !== undefined)
+        return normalized;
+    const fromEnd = numberFromEnv(process.env.STT_SILENCE_END_MS);
+    if (fromEnd !== undefined)
+        return fromEnd;
+    return numberFromEnv(process.env.STT_SILENCE_MS);
+};
+// Back-compat: KOKORO_SAMPLE_RATE → TTS_SAMPLE_RATE
 const ttsSampleRateFallback = (value) => {
     const normalized = emptyToUndefined(value);
     if (normalized !== undefined)
         return normalized;
     return emptyToUndefined(process.env.KOKORO_SAMPLE_RATE);
 };
+// ───────────────────────── schema ─────────────────────────
 const EnvSchema = zod_1.z.object({
     /* ───────────────────────── Core ───────────────────────── */
     PORT: zod_1.z.coerce.number().int().positive(),
@@ -48,11 +91,18 @@ const EnvSchema = zod_1.z.object({
     /* ───────────────────────── Telnyx ───────────────────────── */
     TELNYX_API_KEY: zod_1.z.string().min(1),
     TELNYX_PUBLIC_KEY: zod_1.z.string().min(1),
-    TELNYX_STREAM_TRACK: zod_1.z
-        .enum(['inbound_track', 'outbound_track', 'both_tracks'])
-        .default('inbound_track'),
+    TELNYX_STREAM_TRACK: zod_1.z.enum(['inbound_track', 'outbound_track', 'both_tracks']).default('inbound_track'),
+    TELNYX_STREAM_CODEC: zod_1.z.preprocess(emptyToUndefined, zod_1.z.string().optional()),
     TELNYX_SKIP_SIGNATURE: zod_1.z.preprocess(stringToBoolean, zod_1.z.boolean().default(false)),
     TELNYX_ACCEPT_CODECS: zod_1.z.preprocess(emptyToUndefined, zod_1.z.string().default('PCMU')),
+    TELNYX_STREAM_RESTART_MAX: zod_1.z.preprocess(emptyToUndefined, zod_1.z.coerce.number().int().nonnegative().default(1)),
+    TELNYX_INGEST_HEALTH_GRACE_MS: zod_1.z.preprocess(emptyToUndefined, zod_1.z.coerce.number().int().nonnegative().default(1200)),
+    TELNYX_INGEST_HEALTH_ENABLED: zod_1.z.preprocess(stringToBoolean, zod_1.z.boolean().default(true)),
+    TELNYX_INGEST_HEALTH_RESTART_ENABLED: zod_1.z.preprocess(stringToBoolean, zod_1.z.boolean().default(true)),
+    TELNYX_INGEST_POST_PLAYBACK_GRACE_MS: zod_1.z.preprocess(emptyToUndefined, zod_1.z.coerce.number().int().nonnegative().default(1200)),
+    TELNYX_INGEST_MIN_AUDIO_MS_SINCE_PLAYBACK_END: zod_1.z.preprocess(emptyToUndefined, zod_1.z.coerce.number().int().nonnegative().default(2000)),
+    TELNYX_AMRWB_MIN_DECODED_BYTES: zod_1.z.preprocess(emptyToUndefined, zod_1.z.coerce.number().int().positive().default(320)),
+    TELNYX_INGEST_DECODE_FAILURES_BEFORE_FALLBACK: zod_1.z.preprocess(emptyToUndefined, zod_1.z.coerce.number().int().positive().default(3)),
     TELNYX_TARGET_SAMPLE_RATE: zod_1.z.preprocess(emptyToUndefined, zod_1.z.coerce.number().int().positive().default(16000)),
     TELNYX_OPUS_DECODE: zod_1.z.preprocess(stringToBoolean, zod_1.z.boolean().default(false)),
     TELNYX_G722_DECODE: zod_1.z.preprocess(stringToBoolean, zod_1.z.boolean().default(false)),
@@ -64,13 +114,15 @@ const EnvSchema = zod_1.z.object({
     AUDIO_STORAGE_DIR: zod_1.z.string().min(1),
     /* ───────────────────────── STT (Whisper) ───────────────────────── */
     WHISPER_URL: zod_1.z.string().min(1),
+    ALLOW_HTTP_WAV_JSON: zod_1.z.preprocess(stringToBoolean, zod_1.z.boolean().default(false)),
     STT_CHUNK_MS: zod_1.z.coerce.number().int().positive(),
     STT_SILENCE_MS: zod_1.z.coerce.number().int().positive(),
     STT_MIN_SECONDS: zod_1.z.preprocess(emptyToUndefined, zod_1.z.coerce.number().positive().default(0.6)),
     STT_SILENCE_MIN_SECONDS: zod_1.z.preprocess(emptyToUndefined, zod_1.z.coerce.number().positive().default(0.45)),
     /* Endpointing + gating (used by chunkedSTT.ts) */
-    STT_SILENCE_END_MS: zod_1.z.preprocess(emptyToUndefined, zod_1.z.coerce.number().int().positive().default(700)),
-    STT_PRE_ROLL_MS: zod_1.z.preprocess(emptyToUndefined, zod_1.z.coerce.number().int().positive().default(200)),
+    // ✅ default to STT_SILENCE_MS via preprocess fallback
+    STT_SILENCE_END_MS: zod_1.z.preprocess(sttSilenceEndFallback, zod_1.z.coerce.number().int().positive().default(700)),
+    STT_PRE_ROLL_MS: zod_1.z.preprocess(emptyToUndefined, zod_1.z.coerce.number().int().positive().default(1200)),
     STT_MIN_UTTERANCE_MS: zod_1.z.preprocess(emptyToUndefined, zod_1.z.coerce.number().int().positive().default(400)),
     STT_MAX_UTTERANCE_MS: zod_1.z.preprocess(emptyToUndefined, zod_1.z.coerce.number().int().positive().default(6000)),
     /* Final utterance trimming */
@@ -78,13 +130,43 @@ const EnvSchema = zod_1.z.object({
     FINAL_MIN_SECONDS: zod_1.z.preprocess(emptyToUndefined, zod_1.z.coerce.number().positive().default(1.0)),
     FINAL_MIN_BYTES: zod_1.z.preprocess(emptyToUndefined, zod_1.z.coerce.number().int().positive().optional()),
     /* Speech detection thresholds */
+    STT_RMS_FLOOR: zod_1.z.preprocess(emptyToUndefined, zod_1.z.coerce.number().positive().default(0.015)),
+    STT_PEAK_FLOOR: zod_1.z.preprocess(emptyToUndefined, zod_1.z.coerce.number().positive().default(0.05)),
+    STT_DISABLE_GATES: zod_1.z.preprocess(stringToBoolean, zod_1.z.boolean().default(false)),
     STT_SPEECH_RMS_FLOOR: zod_1.z.preprocess(sttRmsFloorFallback, zod_1.z.coerce.number().positive().default(0.03)),
     STT_SPEECH_PEAK_FLOOR: zod_1.z.preprocess(emptyToUndefined, zod_1.z.coerce.number().positive().default(0.05)),
-    STT_SPEECH_FRAMES_REQUIRED: zod_1.z.preprocess(emptyToUndefined, zod_1.z.coerce.number().int().positive().optional()),
+    STT_SPEECH_FRAMES_REQUIRED: zod_1.z.preprocess(sttFramesRequiredFallback, zod_1.z.coerce.number().int().positive().optional()),
     /* Partial transcription */
     STT_PARTIAL_INTERVAL_MS: zod_1.z.preprocess(emptyToUndefined, zod_1.z.coerce.number().int().positive().default(250)),
+    STT_PARTIAL_MIN_MS: zod_1.z.preprocess(emptyToUndefined, zod_1.z.coerce.number().int().positive().default(600)),
+    /* STT input DSP */
+    STT_HIGHPASS_ENABLED: zod_1.z.preprocess(stringToBoolean, zod_1.z.boolean().default(true)),
+    STT_HIGHPASS_CUTOFF_HZ: zod_1.z.preprocess(emptyToUndefined, zod_1.z.coerce.number().int().positive().default(100)),
+    /* Tier 2: measured listen-after-playback grace (300–900ms based on segment length) */
+    STT_POST_PLAYBACK_GRACE_MS: zod_1.z.preprocess(emptyToUndefined, zod_1.z.coerce.number().int().positive().optional()),
+    STT_POST_PLAYBACK_GRACE_MIN_MS: zod_1.z.preprocess(emptyToUndefined, zod_1.z.coerce.number().int().positive().default(300)),
+    STT_POST_PLAYBACK_GRACE_MAX_MS: zod_1.z.preprocess(emptyToUndefined, zod_1.z.coerce.number().int().positive().default(900)),
+    /* STT debug dumps */
+    STT_DEBUG_DUMP_WHISPER_WAVS: zod_1.z.preprocess(stringToBoolean, zod_1.z.boolean().default(false)),
+    STT_DEBUG_DUMP_PCM16: zod_1.z.preprocess(stringToBoolean, zod_1.z.boolean().default(false)),
+    STT_DEBUG_DUMP_RX_WAV: zod_1.z.preprocess(stringToBoolean, zod_1.z.boolean().default(false)),
+    STT_DEBUG_DUMP_FAR_END_REF: zod_1.z.preprocess(stringToBoolean, zod_1.z.boolean().default(false)),
+    /* Tier 4: SpeexDSP AEC (requires libspeexdsp: brew install speex / apt install libspeexdsp-dev) */
+    STT_AEC_ENABLED: zod_1.z.preprocess(stringToBoolean, zod_1.z.boolean().default(false)),
+    /* Tier 5: Auto-calibration (noise floor + adaptive thresholds) */
+    STT_NOISE_FLOOR_ENABLED: zod_1.z.preprocess(stringToBoolean, zod_1.z.boolean().default(true)),
+    STT_NOISE_FLOOR_ALPHA: zod_1.z.preprocess(emptyToUndefined, zod_1.z.coerce.number().positive().max(1).default(0.05)),
+    STT_NOISE_FLOOR_MIN_SAMPLES: zod_1.z.preprocess(emptyToUndefined, zod_1.z.coerce.number().int().positive().default(30)),
+    STT_ADAPTIVE_RMS_MULTIPLIER: zod_1.z.preprocess(emptyToUndefined, zod_1.z.coerce.number().positive().default(2.0)),
+    STT_ADAPTIVE_PEAK_MULTIPLIER: zod_1.z.preprocess(emptyToUndefined, zod_1.z.coerce.number().positive().default(2.5)),
+    STT_ADAPTIVE_FLOOR_MIN_RMS: zod_1.z.preprocess(emptyToUndefined, zod_1.z.coerce.number().positive().default(0.01)),
+    STT_ADAPTIVE_FLOOR_MIN_PEAK: zod_1.z.preprocess(emptyToUndefined, zod_1.z.coerce.number().positive().default(0.03)),
+    /* Tier 5: Late-final watchdog (force final if speech but no final in X sec) */
+    STT_LATE_FINAL_WATCHDOG_ENABLED: zod_1.z.preprocess(stringToBoolean, zod_1.z.boolean().default(true)),
+    STT_LATE_FINAL_WATCHDOG_MS: zod_1.z.preprocess(emptyToUndefined, zod_1.z.coerce.number().int().positive().default(8000)),
     /* Dead air protection */
     DEAD_AIR_MS: zod_1.z.coerce.number().int().positive(),
+    DEAD_AIR_NO_FRAMES_MS: zod_1.z.preprocess(emptyToUndefined, zod_1.z.coerce.number().int().positive().default(1500)),
     /* ───────────────────────── TTS ───────────────────────── */
     KOKORO_URL: zod_1.z.string().min(1),
     KOKORO_VOICE_ID: zod_1.z.preprocess(emptyToUndefined, zod_1.z.string().min(1).optional()),
@@ -113,9 +195,7 @@ const EnvSchema = zod_1.z.object({
 });
 const parsed = EnvSchema.safeParse(process.env);
 if (!parsed.success) {
-    const issues = parsed.error.issues
-        .map((issue) => `${issue.path.join('.')}: ${issue.message}`)
-        .join(', ');
+    const issues = parsed.error.issues.map((issue) => `${issue.path.join('.')}: ${issue.message}`).join(', ');
     throw new Error(`Invalid environment variables: ${issues}`);
 }
 exports.env = parsed.data;

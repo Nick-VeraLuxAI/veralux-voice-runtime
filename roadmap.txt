@@ -1,0 +1,187 @@
+Here’s the roadmap I’d keep taped to the monitor for this project. It’s ordered to kill the biggest failure modes first, and it matches what ChatGPT-style systems do (endpointing → barge-in → echo control), without you getting trapped in “tuning knob hell”.
+
+## Roadmap (Tiered, with clear exit criteria)
+
+### Tier 0 — Instrumentation Lock
+
+**Goal:** You can *prove* what happened on every call in under 60 seconds.
+
+**You already have most of this. Keep it.**
+
+* Artifacts:
+
+  * RX wav dumps (pre-Whisper)
+  * Whisper final wav dumps
+  * runtime_selected_storage.awb
+* Logs (already good):
+
+  * `stt_speech_start`
+  * `stt_finalize_payload_stats`
+  * `stt_transcription_result`
+  * gate logs + trace logs
+
+**Exit criteria**
+
+* For any bad call you can answer: “Did we miss the start? miss the end? over-trim? playback gate? no finalize? Whisper heard it but LLM didn’t?”
+
+---
+
+### Tier 1 — Robust Endpointing (Dynamic Finalization) ✅ **Do this next**
+
+**Goal:** Stop missing or truncating utterances across environments.
+
+**What changes conceptually**
+
+* `STT_SILENCE_END_MS` becomes a *cap*, not the decision.
+* Finalization depends on:
+
+  1. **Speech actually happened** (min speech bytes/ms)
+  2. **Silence observed after speech**
+  3. Optional: **partial stability** (same transcript repeated / no longer growing)
+  4. Max utterance guard (already exists)
+
+**Implementation targets**
+
+* `src/stt/chunkedSTT.ts`
+
+  * Replace “silenceFramesNeeded = ceil(STT_SILENCE_END_MS / frameMs)” with a **dynamic** silence window:
+
+    * short utterance → shorter silence needed
+    * long utterance → longer silence needed
+    * loud/clear speech → shorter silence needed
+    * borderline speech → longer silence needed
+  * Add **finalize fallback**: if stop/max happens and you have enough bytes, finalize even if silence logic didn’t trigger.
+
+**Exit criteria**
+
+* 20 test calls in 2 different rooms/mics:
+
+  * 95%+ final transcripts contain complete question (no “what time do you…” truncation)
+  * No “no response” because final never fired
+
+---
+
+### Tier 2 — Playback / Barge-In / Turn Policy Consistency
+
+**Goal:** No echo transcripts and no “assistant talks over user” weirdness.
+
+**What you already did (good)**
+
+* Playback gate in `ChunkedSTT` + grace window
+* “Final-only turn policy” in `CallSession.handleTranscript()` (partials don’t trigger)
+
+**What to add**
+
+* Make sure **deferred final** always gets processed when playback ends.
+
+  * (You already store `deferredTranscript`; confirm there’s a playback-end hook that replays it.)
+* Add a **listen-after-playback** delay that’s *measured*, not guessed:
+
+  * e.g. 300–900ms based on last playback segment length / pipeline tail
+
+**Exit criteria**
+
+* 20 calls with TTS playback:
+
+  * Whisper final WAV never contains assistant voice
+  * User can barge-in and interrupt (if desired) without corrupting the next utterance
+
+---
+
+### Tier 3 — Far-End Reference Tap (Required for Real Echo Control on Telnyx URL Playback)
+
+**Goal:** Create the signal needed for true AEC in PSTN/Telnyx environments.
+
+**This is what Codex pointed out.**
+
+* On the Telnyx “play by URL” path, you don’t get streaming frames.
+* So you must generate a **local far-end reference stream** yourself:
+
+  * Right after TTS (WAV buffer exists in memory)
+  * Decode/resample → 10/20ms PCM16 frames
+  * Push into a ring buffer keyed by `callControlId`
+
+**Implementation targets**
+
+* `src/calls/callSession.ts` (or wherever playTtsSegment is)
+
+  * After synth/pipeline and before storeWav/playAudio:
+
+    * decode wav → pcm16 → resample to STT rate (16k)
+    * emit frames into `FarEndReferenceBuffer.push(callControlId, frames)`
+* New file:
+
+  * `src/audio/farEndReference.ts` (ring buffer + helpers)
+
+**Exit criteria**
+
+* For any call, you can dump the far-end reference frames and confirm they match the played WAV timing.
+
+---
+
+### Tier 4 — Add AEC (SpeexDSP or WebRTC AEC)
+
+**Goal:** Suppress assistant playback leaking into inbound mic capture.
+
+**Two options**
+
+* **SpeexDSP AEC** (classic, lightweight, C-based)
+* **WebRTC AEC3** (stronger, more complex)
+
+**How it fits**
+
+* AEC needs:
+
+  * near-end (mic) frames
+  * far-end (playback) reference frames  ✅ Tier 3 produces this
+* Then output cleaned near-end → VAD/endpointing → Whisper
+
+**Implementation targets**
+
+* `src/stt/chunkedSTT.ts` (or just before it)
+
+  * Insert `processAec(nearFrame, farFrame)` when far frames exist
+* New native binding:
+
+  * node-addon-api / ffi-napi / prebuilt binary strategy
+
+**Exit criteria**
+
+* Whisper final WAV shows no assistant echo even with speakerphone + reflective room
+
+---
+
+### Tier 5 — Production Hardening
+
+**Goal:** Works on customer machines without babysitting.
+
+* Auto-calibration:
+
+  * noise floor estimation
+  * adaptive thresholds
+* Watchdogs:
+
+  * “final didn’t fire in X seconds but speech happened” → force final
+* Metrics:
+
+  * per-call success rate
+  * avg utterance length vs transcribed length
+  * % empty transcripts
+
+**Exit criteria**
+
+* 1 week of live calls with minimal knob changes
+
+---
+
+## What we do next (so we stay aligned)
+
+**Next milestone:** Tier 1 dynamic endpointing (because it fixes “why can’t we capture a full utterance?” immediately)
+
+If you want, I’ll convert Tier 1 into a *single surgical patch* in `src/stt/chunkedSTT.ts` with:
+
+* exact blocks to highlight (first/last lines)
+* drop-in replacements
+* new env vars (min/max caps + dynamic curve)
+
+Just say: “Patch Tier 1 now” and I’ll write it in your preferred “highlight block → replacement block” format.

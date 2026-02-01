@@ -11,6 +11,7 @@ export type CallSessionState =
   | 'SPEAKING'
   | 'ENDED';
 
+
 export type TranscriptSegment = string;
 export type TranscriptBuffer = TranscriptSegment[];
 
@@ -24,6 +25,14 @@ export interface CallSessionMetrics {
   createdAt: Date;
   lastHeardAt?: Date;
   turns: number;
+  /** Tier 5: transcripts received (final) this call */
+  transcriptsTotal: number;
+  /** Tier 5: transcripts that were empty (Whisper returned nothing) */
+  transcriptsEmpty: number;
+  /** Tier 5: total utterance audio ms sent to Whisper */
+  totalUtteranceMs: number;
+  /** Tier 5: total transcribed character count */
+  totalTranscribedChars: number;
 }
 
 export interface CallSessionConfig {
