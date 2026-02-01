@@ -63,6 +63,38 @@ const inboundAudioFramesDroppedTotal = new client.Counter({
   registers: [register],
 });
 
+// Tier 5: per-call metrics
+const callCompletionsTotal = new client.Counter({
+  name: `${METRICS_PREFIX}call_completions_total`,
+  help: 'Calls completed (teardown)',
+  labelNames: ['tenant', 'reason'] as const,
+  registers: [register],
+});
+
+const callDurationSeconds = new client.Histogram({
+  name: `${METRICS_PREFIX}call_duration_seconds`,
+  help: 'Call duration in seconds',
+  labelNames: ['tenant'] as const,
+  buckets: [5, 10, 30, 60, 120, 300],
+  registers: [register],
+});
+
+const callTurns = new client.Histogram({
+  name: `${METRICS_PREFIX}call_turns`,
+  help: 'Number of turns per call',
+  labelNames: ['tenant'] as const,
+  buckets: [0, 1, 2, 3, 5, 10, 20],
+  registers: [register],
+});
+
+const callEmptyTranscriptPct = new client.Histogram({
+  name: `${METRICS_PREFIX}call_empty_transcript_pct`,
+  help: 'Percentage of empty transcripts per call (0-100)',
+  labelNames: ['tenant'] as const,
+  buckets: [0, 5, 10, 25, 50, 75, 100],
+  registers: [register],
+});
+
 // ---------- helpers ----------
 
 function nowNs(): bigint {
@@ -162,4 +194,29 @@ export function incSttFramesFed(count = 1): void {
 export function incInboundAudioFramesDropped(reason: string, count = 1): void {
   const label = reason && reason.trim() !== '' ? reason : 'unknown';
   inboundAudioFramesDroppedTotal.inc({ reason: label }, count);
+}
+
+/** Tier 5: record per-call metrics at teardown */
+export function recordCallMetrics(opts: {
+  tenantId?: string;
+  reason?: string;
+  durationMs: number;
+  turns: number;
+  transcriptsTotal: number;
+  transcriptsEmpty: number;
+}): void {
+  try {
+    const tenant = opts.tenantId ?? 'unknown';
+    const reason = opts.reason ?? 'unknown';
+    callCompletionsTotal.inc({ tenant, reason });
+    callDurationSeconds.observe({ tenant }, opts.durationMs / 1000);
+    callTurns.observe({ tenant }, opts.turns);
+    const emptyPct =
+      opts.transcriptsTotal > 0
+        ? (100 * opts.transcriptsEmpty) / opts.transcriptsTotal
+        : 0;
+    callEmptyTranscriptPct.observe({ tenant }, emptyPct);
+  } catch {
+    // swallow
+  }
 }

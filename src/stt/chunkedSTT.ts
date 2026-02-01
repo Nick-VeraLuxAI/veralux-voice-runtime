@@ -23,7 +23,21 @@ export interface SpeechStartInfo {
   peak: number;
   frameMs: number;
   streak: number;
+  prependedMs?: number;
 }
+
+export interface UtteranceEndInfo {
+  preRollMs: number;
+  utteranceMs: number;
+  speechMs: number;
+  trailingSilenceMs: number;
+}
+
+type ExternalPreRoll = {
+  frames: Array<{ buffer: Buffer; ms: number }>;
+  totalMs: number;
+  sampleRateHz: number;
+};
 
 // ChunkedSTT sends PCM16LE to provider.
 // Provider handles WAV wrapping / HTTP / streaming / etc.
@@ -58,6 +72,15 @@ export interface ChunkedSTTOptions {
 
   onTranscript: (text: string, source?: TranscriptSource) => void;
   onSpeechStart?: (info: SpeechStartInfo) => void;
+  onUtteranceEnd?: (info: UtteranceEndInfo) => void;
+  /** Tier 5: called for every final STT result (including empty) for per-call metrics */
+  onFinalResult?: (opts: { isEmpty: boolean; textLength: number; utteranceMs: number }) => void;
+  consumePreRoll?: () => ExternalPreRoll | null;
+
+  // ===== BARGE-IN (NEW) =====
+  // Fired when speech is confidently detected DURING playback/grace.
+  // CallSession should stop playback immediately when this triggers.
+  onBargeInDetected?: (info: SpeechStartInfo & { duringPlayback: true }) => void;
 
   // Optional lifecycle hooks (used by CallSession to suppress dead-air while STT in-flight)
   onSttRequestStart?: (kind: 'partial' | 'final') => void;
@@ -68,6 +91,14 @@ export interface ChunkedSTTOptions {
   isListening?: () => boolean;
   getTrack?: () => string | undefined;
   getCodec?: () => string | undefined;
+
+  // Call lifecycle hook (CallSession should provide this)
+  isCallActive?: () => boolean;
+
+  // Tier 2: measured listen-after-playback delay (300–900ms based on last segment length).
+  // When provided, overrides postPlaybackGraceMs (fixed fallback).
+  getPostPlaybackGraceMs?: () => number;
+
 
   // Input coming into ingest()
   inputCodec?: 'pcmu' | 'pcm16le';
@@ -87,9 +118,10 @@ export interface ChunkedSTTOptions {
   speechFramesRequired?: number;
 }
 
+
 const DEFAULT_PARTIAL_INTERVAL_MS = 250;
 const DEFAULT_SILENCE_END_MS = 900;
-const DEFAULT_PRE_ROLL_MS = 300;
+const DEFAULT_PRE_ROLL_MS = 1200;
 const DEFAULT_MAX_UTTERANCE_MS = 6000;
 
 const DEFAULT_MIN_SECONDS = 0.6; // must have this much audio before partials
@@ -106,6 +138,100 @@ const DEFAULT_SPEECH_FRAMES_REQUIRED = 8;
 
 // Replay guard defaults
 const DEFAULT_RX_DEDUPE_WINDOW = 32;
+const FINAL_STOP_ABORT_GRACE_MS = 150;
+
+// ============================================================================
+// TIER_1_DYNAMIC_ENDPOINTING (ANCHOR BLOCK)
+// - Adds dynamic silence finalization to prevent truncation / never-finalize
+// - Replaces fixed silenceFramesNeeded logic with a curve based on speech length + RMS
+// - Also enables a finalize fallback for stop/max when we have enough audio
+// ============================================================================
+
+function numEnv(key: string, fallback: number): number {
+  const raw = process.env[key];
+  if (raw == null) return fallback;
+  const n = Number(raw);
+  return Number.isFinite(n) ? n : fallback;
+}
+
+function clampN(x: number, lo: number, hi: number): number {
+  return Math.min(hi, Math.max(lo, x));
+}
+
+// NOTE: we keep your existing env.STT_SILENCE_END_MS behavior as the "baseline"
+// and clamp dynamic silence within min/max.
+
+const T1_SILENCE_MIN_MS = numEnv('STT_SILENCE_DYNAMIC_MIN_MS', 220);
+const T1_SILENCE_MAX_MS = numEnv('STT_SILENCE_DYNAMIC_MAX_MS', 1200);
+
+// How much extra silence we add as speech gets longer (log curve)
+const T1_SILENCE_GROWTH_MS = numEnv('STT_SILENCE_GROWTH_MS', 280);
+const T1_SILENCE_LOG_K = numEnv('STT_SILENCE_LOG_K', 0.8);
+
+// Loud speech reduces required trailing silence
+const T1_LOUD_BONUS_MS = numEnv('STT_SILENCE_LOUD_BONUS_MS', 160);
+const T1_LOUD_RMS_REF = numEnv('STT_SILENCE_LOUD_RMS_REF', 0.06); // RMS is normalized (0..1)
+
+// Weak/borderline speech increases required trailing silence
+const T1_WEAK_PENALTY_MS = numEnv('STT_SILENCE_WEAK_PENALTY_MS', 220);
+const T1_WEAK_RMS_FLOOR = numEnv('STT_SILENCE_WEAK_RMS_FLOOR', 0.03);
+
+// Don’t finalize unless speech actually happened (prevents finalizing on noise)
+const T1_MIN_SPEECH_MS = numEnv('STT_MIN_SPEECH_MS_TO_FINALIZE', 180);
+const T1_MIN_SPEECH_BYTES = numEnv('STT_MIN_SPEECH_BYTES_TO_FINALIZE', 3200);
+
+// Optional fallback thresholds for stop/max
+const T1_FALLBACK_MIN_MS = numEnv('STT_FINALIZE_FALLBACK_MIN_MS', 250);
+
+const T1_FALLBACK_MIN_BYTES = numEnv('STT_FINALIZE_FALLBACK_MIN_BYTES', 6400);
+
+// ============================================================================
+// TIER 5: Auto-calibration + late-final watchdog
+// ============================================================================
+
+const T5_NOISE_FLOOR_ENABLED = parseBool(process.env.STT_NOISE_FLOOR_ENABLED, true);
+const T5_NOISE_FLOOR_ALPHA = clampN(numEnv('STT_NOISE_FLOOR_ALPHA', 0.05), 0.01, 1);
+const T5_NOISE_FLOOR_MIN_SAMPLES = numEnv('STT_NOISE_FLOOR_MIN_SAMPLES', 30);
+const T5_ADAPTIVE_RMS_MULT = numEnv('STT_ADAPTIVE_RMS_MULTIPLIER', 2.0);
+const T5_ADAPTIVE_PEAK_MULT = numEnv('STT_ADAPTIVE_PEAK_MULTIPLIER', 2.5);
+const T5_ADAPTIVE_MIN_RMS = numEnv('STT_ADAPTIVE_FLOOR_MIN_RMS', 0.01);
+const T5_ADAPTIVE_MIN_PEAK = numEnv('STT_ADAPTIVE_FLOOR_MIN_PEAK', 0.03);
+
+const T5_LATE_FINAL_WATCHDOG_ENABLED = parseBool(process.env.STT_LATE_FINAL_WATCHDOG_ENABLED, true);
+const T5_LATE_FINAL_WATCHDOG_MS = clampN(numEnv('STT_LATE_FINAL_WATCHDOG_MS', 8000), 3000, 30000);
+
+function t1ComputeDynamicSilenceMs(args: { speechMs: number; avgRms: number; baselineMs: number }): number {
+  const speechMs = Math.max(0, args.speechMs);
+  const avgRms = Math.max(0, args.avgRms);
+  const baselineMs = Math.max(0, args.baselineMs);
+
+  // Length curve: log1p gives short utterances quick finalize, long utterances more tail
+  const lenNorm = Math.log1p(speechMs / 250) * T1_SILENCE_LOG_K; // ~0..?
+  const lenExtra = clampN(lenNorm, 0, 2) * (T1_SILENCE_GROWTH_MS / 2);
+
+
+  // Loudness bonus: louder => reduce required trailing silence
+  const loudRatio = clampN(avgRms / Math.max(1e-6, T1_LOUD_RMS_REF), 0, 2);
+  const loudBonus = loudRatio * (T1_LOUD_BONUS_MS * 0.5);
+
+  // Weak penalty: weak => require more trailing silence
+  const weakPenalty = avgRms < T1_WEAK_RMS_FLOOR ? T1_WEAK_PENALTY_MS : 0;
+
+  const raw = baselineMs + lenExtra + weakPenalty - loudBonus;
+  return clampN(raw, T1_SILENCE_MIN_MS, T1_SILENCE_MAX_MS);
+}
+
+function t1HasEnoughSpeech(args: { speechMs: number; speechBytes: number }): boolean {
+  // Require BOTH time and bytes so we don't finalize on short spikes or weird buffering artifacts.
+  return args.speechMs >= T1_MIN_SPEECH_MS && args.speechBytes >= T1_MIN_SPEECH_BYTES;
+}
+
+
+function t1ShouldFallbackFinalize(args: { totalMs: number; totalBytes: number; sawSpeech: boolean }): boolean {
+  if (!args.sawSpeech) return false;
+  return args.totalMs >= T1_FALLBACK_MIN_MS || args.totalBytes >= T1_FALLBACK_MIN_BYTES;
+}
+
 
 function parseBool(value: string | undefined, def = false): boolean {
   if (value == null) return def;
@@ -210,6 +336,11 @@ function sha1Hex(buf: Buffer): string {
 }
 
 export class ChunkedSTT {
+
+  // ===== Ingest serialization (prevents async VAD/state interleaving) =====
+  private ingestChain: Promise<void> = Promise.resolve();
+  private ingestToken = 0; // bumps on stop/reset to kill queued work
+
   // ===== Optional VAD (Silero ONNX) =====
   private readonly vadEnabled: boolean;
   private readonly vadThreshold: number;
@@ -238,7 +369,7 @@ export class ChunkedSTT {
   private readonly fallbackFrameMs: number;
 
   private readonly minSpeechMs: number;
-  private readonly silenceMinSeconds: number;
+ 
   private readonly finalTailCushionMs: number;
   private readonly finalMinBytes: number;
   private readonly partialMinMs: number;
@@ -248,6 +379,7 @@ export class ChunkedSTT {
   private readonly preRollMaxMs: number;
   private readonly silenceEndMs: number;
   private readonly maxUtteranceMs: number;
+  private readonly noFrameFinalizeMs: number;
 
   private readonly speechRmsFloor: number;
   private readonly speechPeakFloor: number;
@@ -256,28 +388,50 @@ export class ChunkedSTT {
 
   private readonly onTranscript: (text: string, source?: TranscriptSource) => void;
   private readonly onSpeechStart?: (info: SpeechStartInfo) => void;
+  private readonly onUtteranceEnd?: (info: UtteranceEndInfo) => void;
+  private readonly onFinalResult?: (opts: { isEmpty: boolean; textLength: number; utteranceMs: number }) => void;
+  private readonly consumePreRoll?: () => ExternalPreRoll | null;
+
+  // ===== BARGE-IN (NEW) =====
+  private readonly onBargeInDetected?: (info: SpeechStartInfo & { duringPlayback: true }) => void;
+  private bargeInArmed = false;
+  private bargeInSpeechStreak = 0;
+  private bargeInLastStats: { rms: number; peak: number } = { rms: 0, peak: 0 };
+  private bargeInLastFrameMs = 0;
 
   private readonly onSttRequestStart?: (kind: 'partial' | 'final') => void;
   private readonly onSttRequestEnd?: (kind: 'partial' | 'final') => void;
+
 
   private readonly isPlaybackActive?: () => boolean;
   private readonly isListening?: () => boolean;
   private readonly getTrack?: () => string | undefined;
   private readonly getCodec?: () => string | undefined;
+  private readonly isCallActive?: () => boolean;
+  private readonly getPostPlaybackGraceMs?: () => number;
 
   private timer: NodeJS.Timeout | undefined;
+  private noFrameCheckTimer: NodeJS.Timeout | undefined;
 
   // State
   private firstFrameLogged = false;
 
   private inSpeech = false;
   private lastSpeechAt = 0;
+  private lastFrameAtMs = 0;
+
+  private sawSpeech = false;
+  private sawSpeechEver = false; // survives utterance resets; used for call-end drain decisions
+
+
 
   private utteranceMs = 0;
   private utteranceBytes = 0;
 
   private preRollFrames: Array<{ buffer: Buffer; ms: number }> = [];
   private preRollMs = 0;
+  private lastPrependedMs = 0;
+  private lastFrameMs = 0;
 
   private utteranceFrames: Array<{ buffer: Buffer; ms: number }> = [];
 
@@ -303,17 +457,32 @@ export class ChunkedSTT {
   private inFlightAbort?: AbortController;
   private inFlightToken = 0;
 
+  private finalizingStop = false;
+  private finalizingStopAtMs = 0;
+  private finalizingStopSpeechStreak = 0;
+  private finalizingStopIgnoreCount = 0;
+
   // ===== Optional RX replay guard (ENV-gated) =====
   private readonly rxGuardEnabled: boolean;
   private readonly rxDedupeWindow: number;
   private readonly recentRxHashes: string[] = [];
   private rxFramesDropped = 0;
-  private rxFramesKept = 0;
+  private framesSeen = 0;
+
+  // ===== Tier 5: Noise floor estimation (adaptive thresholds) =====
+  private noiseFloorRms = 0;
+  private noiseFloorPeak = 0;
+  private noiseFloorSampleCount = 0;
+  private speechStartAtMs = 0; // used by late-final watchdog
 
   // ===== Playback hard-gate state =====
   private playbackWasActive = false;
   private playbackEndedAtMs = 0;
   private readonly postPlaybackGraceMs = safeNum(process.env.STT_POST_PLAYBACK_GRACE_MS, 650);
+  // ===== Call-end drain window =====
+  // Allow FINAL enqueue briefly after call becomes inactive, to avoid dropping the last user utterance.
+  private readonly callEndDrainMs = safeNum(process.env.STT_CALL_END_DRAIN_MS, 1200);
+  private callInactiveAtMs = 0;
 
   public constructor(opts: ChunkedSTTOptions) {
     this.provider = opts.provider;
@@ -324,14 +493,24 @@ export class ChunkedSTT {
 
     this.onTranscript = opts.onTranscript;
     this.onSpeechStart = opts.onSpeechStart;
+    this.onUtteranceEnd = opts.onUtteranceEnd;
+    this.onFinalResult = opts.onFinalResult;
+    this.consumePreRoll = opts.consumePreRoll;
+
+    // ===== BARGE-IN (NEW) =====
+    this.onBargeInDetected = opts.onBargeInDetected;
 
     this.onSttRequestStart = opts.onSttRequestStart;
     this.onSttRequestEnd = opts.onSttRequestEnd;
+
 
     this.isPlaybackActive = opts.isPlaybackActive;
     this.isListening = opts.isListening;
     this.getTrack = opts.getTrack;
     this.getCodec = opts.getCodec;
+    this.isCallActive = opts.isCallActive;
+    this.getPostPlaybackGraceMs = opts.getPostPlaybackGraceMs;
+
 
     this.inputCodec = opts.inputCodec ?? 'pcmu';
 
@@ -347,8 +526,29 @@ export class ChunkedSTT {
     const minSeconds = safeNum(env.STT_MIN_SECONDS, DEFAULT_MIN_SECONDS);
     this.minSpeechMs = Math.max(0, minSeconds) * 1000;
 
-    const silenceMinSeconds = safeNum(env.STT_SILENCE_MIN_SECONDS, DEFAULT_SILENCE_MIN_SECONDS);
-    this.silenceMinSeconds = silenceMinSeconds > 0 ? silenceMinSeconds : DEFAULT_SILENCE_MIN_SECONDS;
+    // Prefer explicit millisecond silence endpointing.
+    // If not set, fall back to STT_SILENCE_MIN_SECONDS -> ms.
+    // Final fallback is DEFAULT_SILENCE_END_MS.
+    const silenceEndMsRaw = safeNum(env.STT_SILENCE_END_MS, NaN);
+    const silenceEndMsFromSeconds = Math.round(
+      Math.max(0, safeNum(env.STT_SILENCE_MIN_SECONDS, DEFAULT_SILENCE_MIN_SECONDS)) * 1000,
+    );
+
+    const baselineSilenceEndMs =
+      Number.isFinite(silenceEndMsRaw) && silenceEndMsRaw > 0 ? silenceEndMsRaw : silenceEndMsFromSeconds;
+
+    const resolvedBaselineSilenceEndMs =
+      Number.isFinite(baselineSilenceEndMs) && baselineSilenceEndMs > 0 ? baselineSilenceEndMs : DEFAULT_SILENCE_END_MS;
+
+    // opts override ONLY if it's a positive finite number
+    const optSilenceEndMs =
+      typeof opts.silenceEndMs === 'number' && Number.isFinite(opts.silenceEndMs) && opts.silenceEndMs > 0
+        ? opts.silenceEndMs
+        : undefined;
+
+    this.silenceEndMs = clamp(optSilenceEndMs ?? resolvedBaselineSilenceEndMs, 100, 8000);
+
+
 
     const finalTailCushionMs = safeNum(env.FINAL_TAIL_CUSHION_MS, DEFAULT_FINAL_TAIL_CUSHION_MS);
     this.finalTailCushionMs = clamp(finalTailCushionMs, 0, 2000);
@@ -367,16 +567,22 @@ export class ChunkedSTT {
       10000,
     );
 
-    this.preRollMaxMs = clamp(safeNum(opts.preRollMs, env.STT_PRE_ROLL_MS ?? DEFAULT_PRE_ROLL_MS), 0, 2000);
-    this.silenceEndMs = clamp(
-      safeNum(opts.silenceEndMs, env.STT_SILENCE_END_MS ?? DEFAULT_SILENCE_END_MS),
-      100,
-      8000,
+    this.preRollMaxMs = clamp(
+      safeNum(opts.preRollMs, env.STT_PRE_ROLL_MS ?? DEFAULT_PRE_ROLL_MS),
+      0,
+      2000,
     );
+
+
     this.maxUtteranceMs = clamp(
       safeNum(opts.maxUtteranceMs, env.STT_MAX_UTTERANCE_MS ?? DEFAULT_MAX_UTTERANCE_MS),
       2000,
       60000,
+    );
+
+    this.noFrameFinalizeMs = Math.max(
+      400,
+      Math.min(5000, safeNum(process.env.STT_NO_FRAME_FINALIZE_MS, 1000)),
     );
 
     const rmsFloorEnv = env.STT_RMS_FLOOR ?? env.STT_SPEECH_RMS_FLOOR ?? DEFAULT_SPEECH_RMS_FLOOR;
@@ -438,20 +644,96 @@ export class ChunkedSTT {
           rx_guard_enabled: this.rxGuardEnabled,
           rx_dedupe_window: this.rxDedupeWindow,
           post_playback_grace_ms: this.postPlaybackGraceMs,
+          post_playback_grace_dynamic: !!this.getPostPlaybackGraceMs,
+          no_frame_finalize_ms: this.noFrameFinalizeMs,
+          noise_floor_enabled: T5_NOISE_FLOOR_ENABLED,
+          late_final_watchdog_enabled: T5_LATE_FINAL_WATCHDOG_ENABLED,
+          late_final_watchdog_ms: T5_LATE_FINAL_WATCHDOG_MS,
         },
         ...(this.logContext ?? {}),
       },
       'stt tuning',
     );
 
-    // Partial tick only. Finalization happens on silence/max/stop.
-    this.timer = setInterval(() => {
-      try {
-        this.flushIfReady('interval');
-      } catch (err) {
-        log.error({ err, ...(this.logContext ?? {}) }, 'stt interval flush failed');
+    // Partial tick is OPTIONAL now.
+    // With CallSession running a final-only turn policy, partials just add load and can delay finals.
+    // Enable explicitly with: STT_PARTIALS_ENABLED=true
+    const partialsEnabled = parseBool(process.env.STT_PARTIALS_ENABLED, false);
+
+    if (partialsEnabled) {
+      this.timer = setInterval(() => {
+        try {
+          this.flushIfReady('interval');
+        } catch (err) {
+          log.error({ err, ...(this.logContext ?? {}) }, 'stt interval flush failed');
+        }
+      }, this.partialIntervalMs);
+    } else {
+      this.timer = undefined;
+      this.noFrameCheckTimer = setInterval(() => {
+        try {
+          this.checkNoFrameFinalize();
+        } catch (err) {
+          log.error({ err, ...(this.logContext ?? {}) }, 'stt no-frame check failed');
+        }
+      }, 400);
+      log.info(
+        { event: 'stt_partials_disabled', no_frame_finalize_ms: this.noFrameFinalizeMs, ...(this.logContext ?? {}) },
+        'stt partial timer disabled (final-only policy)',
+      );
+    }
+
+  }
+
+  private checkNoFrameFinalize(): void {
+    if (!this.inSpeech || this.utteranceBytes <= 0 || this.playbackGateActive()) return;
+    const now = this.nowMs();
+    const speechMs = Math.max(0, this.utteranceMs - this.lastPrependedMs);
+
+    // Tier 5: Late-final watchdog — speech has been ongoing too long without finalizing
+    if (T5_LATE_FINAL_WATCHDOG_ENABLED && this.speechStartAtMs > 0) {
+      const elapsedSinceSpeechStart = now - this.speechStartAtMs;
+      if (
+        elapsedSinceSpeechStart >= T5_LATE_FINAL_WATCHDOG_MS &&
+        t1HasEnoughSpeech({ speechMs, speechBytes: this.utteranceBytes })
+      ) {
+        this.silenceToFinalizeTimer?.();
+        this.silenceToFinalizeTimer = undefined;
+        log.info(
+          {
+            event: 'stt_late_final_watchdog',
+            reason: 'watchdog',
+            elapsed_since_speech_start_ms: Math.round(elapsedSinceSpeechStart),
+            watchdog_ms: T5_LATE_FINAL_WATCHDOG_MS,
+            speech_ms: Math.round(speechMs),
+            speech_bytes: this.utteranceBytes,
+            ...(this.logContext ?? {}),
+          },
+          'stt late-final watchdog (force final)',
+        );
+        this.finalizeUtterance('silence');
+        return;
       }
-    }, this.partialIntervalMs);
+    }
+
+    // Original: no frames received for noFrameFinalizeMs
+    if (now - this.lastFrameAtMs < this.noFrameFinalizeMs) return;
+    if (!t1HasEnoughSpeech({ speechMs, speechBytes: this.utteranceBytes })) return;
+    this.silenceToFinalizeTimer?.();
+    this.silenceToFinalizeTimer = undefined;
+    log.info(
+      {
+        event: 'stt_no_frame_finalize',
+        reason: 'no_frames',
+        no_frame_ms: Math.round(now - this.lastFrameAtMs),
+        no_frame_finalize_ms: this.noFrameFinalizeMs,
+        speech_ms: Math.round(speechMs),
+        speech_bytes: this.utteranceBytes,
+        ...(this.logContext ?? {}),
+      },
+      'stt finalize (no frames received)',
+    );
+    this.finalizeUtterance('silence');
   }
 
   // Direct PCM16 ingest (already decoded elsewhere).
@@ -495,7 +777,8 @@ export class ChunkedSTT {
       );
     }
 
-    void this.ingestDecodedPcm16(frame, frameMs);
+    this.enqueueIngestDecodedPcm16(frame, frameMs);
+
   }
 
   // Unified ingest for either PCMU or PCM16LE input.
@@ -537,12 +820,51 @@ export class ChunkedSTT {
       framePcm16 = Buffer.from(input);
     }
 
-    void this.ingestDecodedPcm16(framePcm16, frameMs);
+    this.enqueueIngestDecodedPcm16(framePcm16, frameMs);
+
   }
+
+  private enqueueIngestDecodedPcm16(pcm16: Buffer, frameMs: number): void {
+    const token = this.ingestToken;
+
+    this.ingestChain = this.ingestChain
+      .then(async () => {
+        if (token !== this.ingestToken) return;
+        await this.ingestDecodedPcm16(pcm16, frameMs);
+      })
+      .catch((err) => {
+        log.error({ event: 'stt_ingest_chain_error', err, ...(this.logContext ?? {}) }, 'stt ingest chain error');
+      });
+  }
+
+
 
   private nowMs(): number {
     return Date.now();
   }
+
+  private allowFinalDuringCallEndDrain(kind: 'partial' | 'final'): boolean {
+    if (kind !== 'final') return false;
+    if (!this.isCallActive) return false;
+
+    const active = this.isCallActive();
+    const now = this.nowMs();
+
+    if (active) {
+      this.callInactiveAtMs = 0;
+      return true;
+    }
+
+    // call is inactive
+    if (this.callInactiveAtMs === 0) this.callInactiveAtMs = now;
+
+    // Only allow if we actually had speech (prevents garbage finals)
+    if (!this.sawSpeechEver) return false;
+
+
+    return now - this.callInactiveAtMs <= this.callEndDrainMs;
+  }
+
 
   private playbackGateActive(): boolean {
     if (this.disableGates) return false;
@@ -550,9 +872,14 @@ export class ChunkedSTT {
     const active = !!this.isPlaybackActive?.();
     if (active) return true;
 
+    // Once we're actively listening, don't keep gating on post-playback grace.
+    // This prevents speech during the grace window from being swallowed.
+    if (this.isListening?.()) return false;
+
     if (this.playbackEndedAtMs > 0) {
+      const graceMs = this.getPostPlaybackGraceMs?.() ?? this.postPlaybackGraceMs;
       const since = this.nowMs() - this.playbackEndedAtMs;
-      if (since >= 0 && since < this.postPlaybackGraceMs) return true;
+      if (since >= 0 && since < graceMs) return true;
     }
 
     return false;
@@ -563,39 +890,82 @@ export class ChunkedSTT {
 
     const active = !!this.isPlaybackActive?.();
 
-    if (active) {
-      // Playback is active now: abort any in-flight STT and reset utterance state to avoid mixing.
-      if (!this.playbackWasActive) {
-        this.playbackWasActive = true;
+    // PLAYBACK STARTED
+    if (active && !this.playbackWasActive) {
+      this.playbackWasActive = true;
 
-        if (this.inFlight) {
-          this.abortInFlight('finalize');
-        }
+      this.bargeInArmed = false;
+      this.bargeInSpeechStreak = 0;
+      this.bargeInLastStats = { rms: 0, peak: 0 };
+      this.bargeInLastFrameMs = 0;
 
-        if (this.inSpeech) {
-          this.resetUtteranceState();
-        }
-      }
-      return;
-    }
+      this.preRollFrames = [];
+      this.preRollMs = 0;
 
-    if (this.playbackWasActive) {
-      // Playback just ended
-      this.playbackWasActive = false;
-      this.playbackEndedAtMs = this.nowMs();
-      this.playbackSpeechStreak = 0;
+      if (this.inFlight) this.abortInFlight('finalize');
+      if (this.inSpeech) this.resetUtteranceState();
 
-
-      // reset VAD state so we don't carry stale speech state across the boundary
       this.vadSpeechNow = false;
       this.vadSpeechStreak = 0;
       this.vadSilenceStreak = 0;
       if (this.vad) this.vad.reset();
 
-      // if we have RX dedupe, clear it across boundary
       this.recentRxHashes.length = 0;
     }
+
+    // PLAYBACK ENDED
+    if (!active && this.playbackWasActive) {
+      this.playbackWasActive = false;
+      this.playbackEndedAtMs = this.nowMs();
+      this.playbackSpeechStreak = 0;
+
+      this.vadSpeechNow = false;
+      this.vadSpeechStreak = 0;
+      this.vadSilenceStreak = 0;
+      if (this.vad) this.vad.reset();
+
+      this.recentRxHashes.length = 0;
+
+      // ===== BARGE-IN HANDOFF =====
+      if (
+        this.bargeInArmed &&
+        this.bargeInSpeechStreak >= this.speechFramesRequired &&
+        !this.inSpeech &&
+        this.preRollFrames.length > 0
+      ) {
+        const frameMs = this.bargeInLastFrameMs > 0 ? this.bargeInLastFrameMs : this.fallbackFrameMs;
+        const stats =
+          this.bargeInLastStats.rms > 0
+            ? this.bargeInLastStats
+            : { rms: this.rollingRms, peak: this.rollingPeak };
+
+        log.info(
+          {
+            event: 'stt_barge_in_handoff',
+            pre_roll_frames: this.preRollFrames.length,
+            pre_roll_ms: Math.round(this.preRollMs),
+            frame_ms: Math.round(frameMs),
+            rms: Number(stats.rms.toFixed(4)),
+            peak: Number(stats.peak.toFixed(4)),
+            streak: this.bargeInSpeechStreak,
+            ...(this.logContext ?? {}),
+          },
+          'barge-in handoff: entering speech after playback ended',
+        );
+
+        this.speechFrameStreak = this.speechFramesRequired;
+        this.startSpeech(stats, frameMs);
+      }
+
+      // reset barge-in state for next playback segment
+      this.bargeInArmed = false;
+      this.bargeInSpeechStreak = 0;
+      this.bargeInLastStats = { rms: 0, peak: 0 };
+      this.bargeInLastFrameMs = 0;
+    }
   }
+
+
 
   // Optional defensive replay guard: drops identical frames repeated within last N frames.
   private shouldDropRxFrame(pcm16: Buffer): { drop: boolean; sha1_10: string; matchedLag?: number } {
@@ -616,8 +986,15 @@ export class ChunkedSTT {
 
   // Post-decode path (PCM16LE mono @ this.sampleRate)
   private async ingestDecodedPcm16(pcm16: Buffer, frameMs: number): Promise<void> {
+    this.lastFrameAtMs = this.nowMs();
     // Detect playback transitions & enforce boundary resets.
     this.handlePlaybackTransitionIfNeeded();
+    // Keep call-end drain state correct across call lifecycle transitions
+    if (this.isCallActive?.()) {
+      this.callInactiveAtMs = 0;
+    }
+    this.lastFrameMs = frameMs;
+
 
     // ===== HARD GATE during playback (and brief grace after) =====
     // IMPORTANT: We still run VAD/speech detection during playback so barge-in works.
@@ -627,8 +1004,9 @@ export class ChunkedSTT {
 
     // Once grace has elapsed, clear the marker.
     if (!this.disableGates && this.playbackEndedAtMs > 0) {
+      const graceMs = this.getPostPlaybackGraceMs?.() ?? this.postPlaybackGraceMs;
       const since = this.nowMs() - this.playbackEndedAtMs;
-      if (since >= this.postPlaybackGraceMs) this.playbackEndedAtMs = 0;
+      if (since >= graceMs) this.playbackEndedAtMs = 0;
     }
 
     // ===== Replay guard here (before any VAD/state) =====
@@ -651,7 +1029,7 @@ export class ChunkedSTT {
                 matched_lag: guard.matchedLag,
                 sha1_10: guard.sha1_10,
                 dropped: this.rxFramesDropped,
-                kept: this.rxFramesKept,
+                kept: this.framesSeen,
                 rx_dedupe_window: this.rxDedupeWindow,
                 ...(this.logContext ?? {}),
               },
@@ -663,10 +1041,10 @@ export class ChunkedSTT {
         }
 
         // Guard enabled and frame not dropped
-        this.rxFramesKept += 1;
+        this.framesSeen += 1;
       } else {
         // Guard disabled: still advance for log throttling / observability
-        this.rxFramesKept += 1;
+        this.framesSeen += 1;
       }
     }
 
@@ -674,8 +1052,28 @@ export class ChunkedSTT {
     const stats = computeRmsAndPeak(pcm16);
     this.updateRollingStats(stats);
 
-    const gateRms = stats.rms >= this.speechRmsFloor;
-    const gatePeak = stats.peak >= this.speechPeakFloor;
+    // Tier 5: Update noise floor from pre-speech frames (ambient, not gated)
+    if (T5_NOISE_FLOOR_ENABLED && !gatedForPlayback && !this.inSpeech) {
+      const alpha = T5_NOISE_FLOOR_ALPHA;
+      this.noiseFloorSampleCount += 1;
+      if (this.noiseFloorSampleCount >= T5_NOISE_FLOOR_MIN_SAMPLES) {
+        this.noiseFloorRms =
+          this.noiseFloorRms === 0
+            ? stats.rms
+            : this.noiseFloorRms * (1 - alpha) + stats.rms * alpha;
+        this.noiseFloorPeak =
+          this.noiseFloorPeak === 0
+            ? stats.peak
+            : this.noiseFloorPeak * (1 - alpha) + stats.peak * alpha;
+      }
+    }
+
+    // Tier 5: Adaptive floors when noise floor is available
+    const effectiveRmsFloor = this.getEffectiveRmsFloor();
+    const effectivePeakFloor = this.getEffectivePeakFloor();
+
+    const gateRms = stats.rms >= effectiveRmsFloor;
+    const gatePeak = stats.peak >= effectivePeakFloor;
 
     // === VAD: speech decision ===
     if (this.vadEnabled && this.vadReady && this.vad) {
@@ -709,33 +1107,84 @@ export class ChunkedSTT {
     }
 
     const isSpeech = this.disableGates ? true : (vadSpeechDecision ?? (gateRms && gatePeak));
-    // If we're in playback/grace, allow barge-in detection but do not buffer/transcribe.
-    if (gatedForPlayback) {
-      if (isSpeech) {
-        this.playbackSpeechStreak += 1;
 
-        if (this.playbackSpeechStreak >= this.speechFramesRequired) {
-          this.onSpeechStart?.({
+    if (isSpeech && !gatedForPlayback) {
+      this.sawSpeech = true;
+      this.sawSpeechEver = true;
+    }
+
+
+    if (this.finalizingStop && !isSpeech) {
+      this.finalizingStopSpeechStreak = 0;
+    }
+
+    // ===== BARGE-IN ON =====
+    // During playback/grace:
+    // - keep rolling stats
+    // - detect speech and arm barge-in
+    // - once armed, buffer ONLY post-arm frames as pre-roll for handoff
+    if (gatedForPlayback) {
+      // Track stats for potential handoff
+      this.bargeInLastStats = { rms: stats.rms, peak: stats.peak };
+      this.bargeInLastFrameMs = frameMs;
+
+      if (isSpeech) {
+        // build confidence
+        this.bargeInSpeechStreak += 1;
+
+        // Arm once we’ve seen enough consecutive speech frames
+        if (!this.bargeInArmed && this.bargeInSpeechStreak >= this.speechFramesRequired) {
+          this.bargeInArmed = true;
+
+          // IMPORTANT: once armed, start a clean pre-roll buffer (no assistant leakage)
+          this.preRollFrames = [];
+          this.preRollMs = 0;
+
+          log.info(
+            {
+              event: 'stt_barge_in_detected',
+              rms: Number(stats.rms.toFixed(4)),
+              peak: Number(stats.peak.toFixed(4)),
+              frame_ms: Math.round(frameMs),
+              streak: this.bargeInSpeechStreak,
+              ...(this.logContext ?? {}),
+            },
+            'barge-in detected during playback (armed)',
+          );
+
+          this.onBargeInDetected?.({
             rms: stats.rms,
             peak: stats.peak,
             frameMs,
-            streak: this.playbackSpeechStreak,
+            streak: this.bargeInSpeechStreak,
+            duringPlayback: true,
           });
 
-          // Reset so we don't spam onSpeechStart repeatedly.
-          this.playbackSpeechStreak = 0;
+          // Don’t let any in-flight STT “win” during a barge-in
+          if (this.inFlight) this.abortInFlight('barge_in');
+        }
+
+        // Once armed, buffer user lead-in frames (rolling)
+        if (this.bargeInArmed) {
+          this.addPreRollFrame(pcm16, frameMs);
         }
       } else {
-        this.playbackSpeechStreak = 0;
+        // Speech flicker during playback: decay instead of hard reset (more reliable)
+        this.bargeInSpeechStreak = Math.max(0, this.bargeInSpeechStreak - 1);
+
+        // While playback is active and we haven't armed barge-in yet, DO NOT buffer pre-roll
+        // (prevents assistant audio polluting the future handoff)
       }
 
-      // Do not buffer any frames or build utterances during playback/grace.
       return;
     }
 
 
 
-    if (!this.disableGates && (this.rxFramesKept <= 20 || this.rxFramesKept % 100 === 0)) {
+
+
+
+    if (!this.disableGates && (this.framesSeen <= 20 || this.framesSeen % 100 === 0)) {
       log.info(
         {
           event: 'stt_speech_decision',
@@ -759,9 +1208,58 @@ export class ChunkedSTT {
 
     // Barge-in: if final request is in-flight and speech resumes, abort and reset.
     if (this.inFlight && this.inFlightKind === 'final' && isSpeech) {
-      this.abortInFlight('barge_in');
-      this.resetUtteranceState();
-      return;
+      if (this.finalizingStop) {
+        const now = this.nowMs();
+        const elapsed = now - this.finalizingStopAtMs;
+
+        if (elapsed < FINAL_STOP_ABORT_GRACE_MS) {
+          this.finalizingStopIgnoreCount += 1;
+          if (this.finalizingStopIgnoreCount <= 3 || this.finalizingStopIgnoreCount % 50 === 0) {
+            log.info(
+              {
+                event: 'stt_abort_final_ignored_during_stop',
+                reason: 'within_grace',
+                elapsed_ms: Math.round(elapsed),
+                streak: this.finalizingStopSpeechStreak,
+                frames_required: this.speechFramesRequired,
+                ...(this.logContext ?? {}),
+              },
+              'ignoring final abort during stop grace',
+            );
+          }
+        } else {
+          this.finalizingStopSpeechStreak += 1;
+          if (this.finalizingStopSpeechStreak >= this.speechFramesRequired) {
+            this.finalizingStop = false;
+            this.finalizingStopAtMs = 0;
+            this.finalizingStopSpeechStreak = 0;
+            this.finalizingStopIgnoreCount = 0;
+
+            this.abortInFlight('barge_in');
+            this.resetUtteranceState();
+            return;
+          }
+
+          this.finalizingStopIgnoreCount += 1;
+          if (this.finalizingStopIgnoreCount <= 3 || this.finalizingStopIgnoreCount % 50 === 0) {
+            log.info(
+              {
+                event: 'stt_abort_final_ignored_during_stop',
+                reason: 'awaiting_streak',
+                elapsed_ms: Math.round(elapsed),
+                streak: this.finalizingStopSpeechStreak,
+                frames_required: this.speechFramesRequired,
+                ...(this.logContext ?? {}),
+              },
+              'ignoring final abort during stop (waiting for new utterance)',
+            );
+          }
+        }
+      } else {
+        this.abortInFlight('barge_in');
+        this.resetUtteranceState();
+        return;
+      }
     }
 
     // Not in speech yet: build pre-roll and detect start
@@ -778,7 +1276,6 @@ export class ChunkedSTT {
 
       if (isSpeech && this.speechFrameStreak >= this.speechFramesRequired) {
         this.startSpeech(stats, frameMs);
-        this.onSpeechStart?.({ rms: stats.rms, peak: stats.peak, frameMs, streak: this.speechFrameStreak });
       } else if (!this.disableGates) {
         const reason = this.resolveGateClosedReason(gateRms, gatePeak, this.speechFrameStreak);
         if (reason) this.maybeLogGateClosed(reason, stats, frameMs);
@@ -799,10 +1296,48 @@ export class ChunkedSTT {
       }
       this.silenceFrameStreak += 1;
 
-      const silenceFramesNeeded = Math.max(1, Math.ceil(this.silenceEndMs / frameMs));
-      if (this.silenceFrameStreak >= silenceFramesNeeded) {
+      // ============================================================================
+      // TIER_1_DYNAMIC_ENDPOINTING (DROP-IN)
+      // - dynamic trailing-silence requirement based on utterance length + rolling RMS
+      // - prevents truncation and “never finalize” in noisier environments
+      //
+      // Requires these helper functions to exist in this file (top-level):
+      //   - t1ComputeDynamicSilenceMs({ speechMs, avgRms, baselineMs })
+      //   - t1HasEnoughSpeech({ speechMs, speechBytes })
+      // (If you used the earlier helper block, you're good.)
+      // ============================================================================
+      const speechMs = Math.max(0, this.utteranceMs - this.lastPrependedMs);
+      const speechBytes = this.utteranceBytes;
+
+      // utteranceMs includes pre-roll; that's OK (we're only deciding how long to wait after last speech)
+      const avgRms = this.rollingRms; // already updated each frame via updateRollingStats()
+
+      const dynamicSilenceMs = t1ComputeDynamicSilenceMs({ speechMs, avgRms, baselineMs: this.silenceEndMs });
+      const silenceMsSoFar = this.silenceFrameStreak * frameMs;
+
+
+      const okToFinalize = t1HasEnoughSpeech({ speechMs, speechBytes });
+
+      if (okToFinalize && silenceMsSoFar >= dynamicSilenceMs) {
         this.silenceToFinalizeTimer?.();
         this.silenceToFinalizeTimer = undefined;
+
+        log.info(
+          {
+            event: 'stt_dynamic_finalize',
+            reason: 'silence_dynamic',
+            speech_ms: Math.round(speechMs),
+            speech_bytes: speechBytes,
+            silence_ms: Math.round(silenceMsSoFar),
+            dynamic_silence_ms: Math.round(dynamicSilenceMs),
+            rolling_rms: Number(this.rollingRms.toFixed(4)),
+            rolling_peak: Number(this.rollingPeak.toFixed(4)),
+            silence_end_ms: this.silenceEndMs,
+            ...(this.logContext ?? {}),
+          },
+          'stt dynamic finalize (tier1)',
+        );
+
         this.finalizeUtterance('silence');
         return;
       }
@@ -812,19 +1347,75 @@ export class ChunkedSTT {
       this.finalizeUtterance('max');
       return;
     }
-  }
+  } 
 
-  public stop(): void {
+
+  public async stop(options: { allowFinal?: boolean; preserveInFlightFinal?: boolean } = {}): Promise<void> {
+    this.ingestToken += 1;
+
+    const chain = this.ingestChain;
+    this.ingestChain = Promise.resolve();
+
     if (this.timer) clearInterval(this.timer);
     this.timer = undefined;
-    if (this.inSpeech && this.utteranceBytes > 0) this.flushIfReady('stop');
+    if (this.noFrameCheckTimer) {
+      clearInterval(this.noFrameCheckTimer);
+      this.noFrameCheckTimer = undefined;
+    }
+
+    try { await chain; } catch { /* ignore */ }
+
+    const allowFinal = options.allowFinal ?? true;
+    const preserveInFlightFinal = options.preserveInFlightFinal ?? false;
+    let queuedFinal = false;
+
+    if (allowFinal && this.inSpeech && this.utteranceBytes > 0) {
+      // finalizeUtterance('stop') will enqueue a final if it passes fallback checks
+      this.flushIfReady('stop');
+      queuedFinal = true;
+    }
+
+    // If we just queued a final, DO NOT abort it.
+    // Only abort if nothing was queued and we’re just shutting down.
+    if (!queuedFinal) {
+      if (!(preserveInFlightFinal && this.inFlight && this.inFlightKind === 'final')) {
+        this.abortInFlight('finalize');
+      }
+    }
+
+    // If playback/grace gate is active, don't wipe buffered speech here.
+    // finalizeUtterance() will refuse to send during gate; wiping here loses the last utterance.
+    const gated = this.playbackGateActive();
+    if (!gated) {
+      this.resetUtteranceState();
+    }
+
+
+
+    this.bargeInArmed = false;
+    this.bargeInSpeechStreak = 0;
+    this.bargeInLastStats = { rms: 0, peak: 0 };
+    this.bargeInLastFrameMs = 0;
+
+    this.playbackWasActive = false;
+    this.playbackEndedAtMs = 0;
+
   }
 
+
   private flushIfReady(reason: 'interval' | 'silence' | 'stop'): void {
-    if (reason === 'interval') return void this.maybeSendPartial();
+    // Interval is only for partials; finalization still happens via silence/max/stop.
+    if (reason === 'interval') {
+      const partialsEnabled = parseBool(process.env.STT_PARTIALS_ENABLED, false);
+      if (!partialsEnabled) return;
+      return void this.maybeSendPartial();
+    }
+
     if (reason === 'stop') return void this.finalizeUtterance('stop');
+
     this.finalizeUtterance('silence');
   }
+
 
   private addPreRollFrame(pcm16: Buffer, frameMs: number): void {
     if (this.preRollMaxMs <= 0) return;
@@ -843,12 +1434,33 @@ export class ChunkedSTT {
 
   private startSpeech(stats: { rms: number; peak: number }, frameMs: number): void {
     this.inSpeech = true;
+    this.speechStartAtMs = this.nowMs(); // Tier 5: late-final watchdog baseline
+    this.noiseFloorSampleCount = 0; // Tier 5: reset so next utterance re-estimates noise floor
+
+    // ✅ FIX: ensure Tier1 fallback finalize logic knows we truly saw speech
+    // (prevents stop/max from skipping finalize when speech started and ended quickly)
+    this.sawSpeech = true;
+    this.sawSpeechEver = true;
+
+
     this.lastSpeechAt = this.nowMs();
     this.silenceFrameStreak = 0;
     this.silenceToFinalizeTimer = undefined;
 
-    this.utteranceFrames = [...this.preRollFrames];
-    this.utteranceMs = this.preRollMs;
+    let selectedFrames = this.preRollFrames;
+    let selectedMs = this.preRollMs;
+
+    const external = this.consumePreRoll?.();
+    if (external && external.frames.length > 0 && external.sampleRateHz === this.sampleRate) {
+      selectedFrames = external.frames;
+      selectedMs = external.totalMs;
+    }
+    const prependedMs = selectedMs;
+    const prependedFrames = selectedFrames.length;
+    this.lastPrependedMs = prependedMs;
+
+    this.utteranceFrames = [...selectedFrames];
+    this.utteranceMs = selectedMs;
     this.utteranceBytes = this.utteranceFrames.reduce((sum, f) => sum + f.buffer.length, 0);
 
     this.preRollFrames = [];
@@ -862,6 +1474,26 @@ export class ChunkedSTT {
 
     log.info(
       {
+        event: 'stt_utterance_start',
+        prepended_ms: Math.round(prependedMs),
+        preroll_frames: prependedFrames,
+        sample_rate_hz: this.sampleRate,
+        ts: this.nowMs(),
+        ...(this.logContext ?? {}),
+      },
+      'stt utterance start',
+    );
+
+    this.onSpeechStart?.({
+      rms: stats.rms,
+      peak: stats.peak,
+      frameMs,
+      streak: this.speechFrameStreak,
+      prependedMs: Math.round(prependedMs),
+    });
+
+    log.info(
+      {
         event: 'stt_speech_start',
         speech_rms: Number(stats.rms.toFixed(4)),
         speech_peak: Number(stats.peak.toFixed(4)),
@@ -871,6 +1503,7 @@ export class ChunkedSTT {
       'stt speech start',
     );
   }
+
 
   private appendUtterance(pcm16: Buffer, frameMs: number): void {
     const snap = Buffer.from(pcm16);
@@ -926,6 +1559,50 @@ export class ChunkedSTT {
   }
 
   private finalizeUtterance(reason: FinalReason): void {
+  // ============================================================================
+  // TIER_1_DYNAMIC_ENDPOINTING (ANCHOR FALLBACK)
+  // If stop/max happens, only finalize if we have enough real speech.
+  // Otherwise skip finalizing and reset state (prevents garbage finals).
+  // ============================================================================
+  if (reason === 'stop' || reason === 'max') {
+    const totalMs = this.utteranceMs;
+    const totalBytes = this.utteranceBytes;
+
+    const enough = t1ShouldFallbackFinalize({
+      totalMs,
+      totalBytes,
+      sawSpeech: this.sawSpeech,
+    });
+
+    if (!enough) {
+      log.info(
+        {
+          event: 'stt_finalize_fallback_skipped',
+          reason,
+          total_ms: Math.round(totalMs),
+          total_bytes: totalBytes,
+          ...(this.logContext ?? {}),
+        },
+        'stt finalize fallback skipped (tier1)',
+      );
+      this.resetUtteranceState();
+      return;
+    }
+
+    log.info(
+      {
+        event: 'stt_finalize_fallback',
+        reason,
+        total_ms: Math.round(totalMs),
+        total_bytes: totalBytes,
+        ...(this.logContext ?? {}),
+      },
+      'stt finalize fallback (tier1)',
+    );
+  }
+
+
+
     if (!this.inSpeech || this.utteranceBytes === 0) return;
 
     // ✅ NEW: never finalize during playback/grace
@@ -968,6 +1645,22 @@ export class ChunkedSTT {
       'finalizing utterance payload',
     );
 
+    const utteranceTotalMs = Math.max(0, Math.round(this.utteranceMs));
+    const preRollMs = Math.max(0, Math.round(this.lastPrependedMs));
+    const frameMs = this.lastFrameMs > 0 ? this.lastFrameMs : this.fallbackFrameMs;
+    const trailingSilenceMs = Math.max(
+      0,
+      Math.round(Math.min(this.utteranceMs, this.silenceFrameStreak * frameMs)),
+    );
+    const speechMs = Math.max(0, Math.round(this.utteranceMs - preRollMs - trailingSilenceMs));
+
+    this.onUtteranceEnd?.({
+      preRollMs,
+      utteranceMs: utteranceTotalMs,
+      speechMs,
+      trailingSilenceMs,
+    });
+
     this.enqueueTranscription(payload, {
       reason: 'final',
       isFinal: true,
@@ -985,6 +1678,8 @@ export class ChunkedSTT {
   private abortInFlight(reason: 'barge_in' | 'finalize'): void {
     if (!this.inFlight) return;
 
+    const kind = this.inFlightKind;
+
     this.inFlightAbort?.abort();
     this.inFlightAbort = undefined;
 
@@ -993,6 +1688,15 @@ export class ChunkedSTT {
     this.finalizeToResultTimer = undefined;
     this.finalFlushAt = 0;
     this.inFlightToken += 1;
+    if (kind === 'final') {
+      this.finalizingStop = false;
+      this.finalizingStopAtMs = 0;
+      this.finalizingStopSpeechStreak = 0;
+      this.finalizingStopIgnoreCount = 0;
+    }
+
+    // ✅ ensure CallSession always sees the "end"
+    if (kind) this.onSttRequestEnd?.(kind);
 
     if (reason === 'barge_in') {
       this.silenceFrameStreak = 0;
@@ -1000,15 +1704,109 @@ export class ChunkedSTT {
     }
   }
 
+
   private enqueueTranscription(
     payloadPcm16: Buffer,
     meta: { reason: 'partial' | 'final'; isFinal: boolean; finalReason?: FinalReason },
   ): void {
-    if (this.inFlight) return;
+    // ✅ CALL LIFECYCLE GATE: do not enqueue STT if call is already ended/inactive
+    if (this.isCallActive && !this.isCallActive()) {
+      const allow = this.allowFinalDuringCallEndDrain(meta.reason);
 
-    // ✅ NEW: final safety net
+      if (!allow) {
+        log.info(
+          {
+            event: 'stt_skip_transcription_call_inactive',
+            kind: meta.reason,
+            payload_bytes: payloadPcm16.length,
+            saw_speech: this.sawSpeech,
+            drain_ms: this.callEndDrainMs,
+            inactive_at_ms: this.callInactiveAtMs,
+            now_ms: this.nowMs(),
+            ...(this.logContext ?? {}),
+          },
+          'skipping STT enqueue because call is inactive',
+        );
+        return;
+      }
+
+      log.warn(
+        {
+          event: 'stt_call_end_drain_allow',
+          kind: meta.reason,
+          payload_bytes: payloadPcm16.length,
+          saw_speech: this.sawSpeech,
+          drain_ms: this.callEndDrainMs,
+          inactive_at_ms: this.callInactiveAtMs,
+          now_ms: this.nowMs(),
+          ...(this.logContext ?? {}),
+        },
+        'allowing FINAL STT during call-end drain window',
+      );
+    }
+
+
+    // 1) If we’re already sending something, log it (otherwise Whisper will never move)
+    if (this.inFlight) {
+      log.info(
+        {
+          event: 'stt_enqueue_skipped_inflight',
+          kind: meta.reason,
+          payload_bytes: payloadPcm16.length,
+          in_flight_kind: this.inFlightKind,
+          ...(this.logContext ?? {}),
+        },
+        'stt enqueue skipped (already in-flight)',
+      );
+      return;
+    }
+
+    // ✅ safety net
     this.handlePlaybackTransitionIfNeeded();
-    if (this.playbackGateActive()) return;
+
+    // 2) If playback gate is active, log WHY we are blocked
+    if (this.playbackGateActive()) {
+      log.warn(
+        {
+          event: 'stt_enqueue_blocked_by_playback_gate',
+          kind: meta.reason,
+          payload_bytes: payloadPcm16.length,
+          playback_active: !!this.isPlaybackActive?.(),
+          playback_ended_at_ms: this.playbackEndedAtMs,
+          post_playback_grace_ms: this.postPlaybackGraceMs,
+          now_ms: this.nowMs(),
+          ...(this.logContext ?? {}),
+        },
+        'stt enqueue blocked by playback/grace gate (NO WHISPER REQUEST WILL BE SENT)',
+      );
+      return;
+    }
+
+    // Optional but super useful: confirm we’re actually about to send
+    log.info(
+      {
+        event: 'stt_enqueue_start',
+        kind: meta.reason,
+        payload_bytes: payloadPcm16.length,
+        ...(this.logContext ?? {}),
+      },
+      'stt enqueue starting transcription',
+    );
+
+    if (meta.reason === 'final' && meta.finalReason === 'stop') {
+      this.finalizingStop = true;
+      this.finalizingStopAtMs = this.nowMs();
+      this.finalizingStopSpeechStreak = 0;
+      this.finalizingStopIgnoreCount = 0;
+      log.info(
+        {
+          event: 'stt_finalizing_stop_armed',
+          ts: this.finalizingStopAtMs,
+          ...(this.logContext ?? {}),
+        },
+        'finalizing stop armed',
+      );
+    }
 
     this.inFlight = true;
     this.inFlightKind = meta.reason;
@@ -1021,7 +1819,12 @@ export class ChunkedSTT {
     this.onSttRequestStart?.(meta.reason);
 
     void this.transcribePayload(payloadPcm16, meta, token, this.inFlightAbort.signal)
-      .catch((err) => log.error({ err, ...(this.logContext ?? {}) }, 'stt transcription failed'))
+      .catch((err) =>
+        log.error(
+          { event: 'stt_transcribePayload_failed', err, ...(this.logContext ?? {}) },
+          'stt transcription failed',
+        ),
+      )
       .finally(() => {
         if (this.inFlightToken !== token) return;
 
@@ -1031,10 +1834,17 @@ export class ChunkedSTT {
         this.inFlightKind = undefined;
         this.inFlightAbort = undefined;
         this.finalizeToResultTimer = undefined;
+        if (kind === 'final') {
+          this.finalizingStop = false;
+          this.finalizingStopAtMs = 0;
+          this.finalizingStopSpeechStreak = 0;
+          this.finalizingStopIgnoreCount = 0;
+        }
 
         this.onSttRequestEnd?.(kind);
       });
   }
+
 
   private async transcribePayload(
     payloadPcm16: Buffer,
@@ -1045,6 +1855,15 @@ export class ChunkedSTT {
     // ✅ NEW: last safety net before calling provider
     this.handlePlaybackTransitionIfNeeded();
     if (this.playbackGateActive()) return;
+    // ✅ CALL LIFECYCLE GATE: do not call provider if call is ended/inactive
+    if (this.isCallActive && !this.isCallActive()) {
+      if (!this.allowFinalDuringCallEndDrain(meta.reason)) return;
+    }
+
+
+    // ✅ Abort hygiene: never proceed if the signal is already aborted
+    if (signal.aborted) return;
+
 
     const startedAt = this.nowMs();
 
@@ -1084,6 +1903,18 @@ export class ChunkedSTT {
         'stt transcription result',
       );
 
+      // Tier 5: report final result for per-call metrics (including empty)
+      if (meta.reason === 'final') {
+        const utteranceMs = Math.round(
+          (payloadPcm16.length / this.bytesPerSecondPcm16) * 1000,
+        );
+        this.onFinalResult?.({
+          isEmpty: text.length === 0,
+          textLength: text.length,
+          utteranceMs,
+        });
+      }
+
       if (!text) return;
 
       if (meta.reason === 'partial') {
@@ -1109,6 +1940,32 @@ export class ChunkedSTT {
     const alpha = 0.1;
     this.rollingRms = this.rollingRms === 0 ? stats.rms : this.rollingRms * (1 - alpha) + stats.rms * alpha;
     this.rollingPeak = this.rollingPeak === 0 ? stats.peak : this.rollingPeak * (1 - alpha) + stats.peak * alpha;
+  }
+
+  /** Tier 5: Effective RMS floor (noise-adaptive or fixed). */
+  private getEffectiveRmsFloor(): number {
+    if (
+      !T5_NOISE_FLOOR_ENABLED ||
+      this.noiseFloorSampleCount < T5_NOISE_FLOOR_MIN_SAMPLES ||
+      this.noiseFloorRms <= 0
+    ) {
+      return this.speechRmsFloor;
+    }
+    const adaptive = this.noiseFloorRms * T5_ADAPTIVE_RMS_MULT;
+    return Math.max(T5_ADAPTIVE_MIN_RMS, this.speechRmsFloor, adaptive);
+  }
+
+  /** Tier 5: Effective peak floor (noise-adaptive or fixed). */
+  private getEffectivePeakFloor(): number {
+    if (
+      !T5_NOISE_FLOOR_ENABLED ||
+      this.noiseFloorSampleCount < T5_NOISE_FLOOR_MIN_SAMPLES ||
+      this.noiseFloorPeak <= 0
+    ) {
+      return this.speechPeakFloor;
+    }
+    const adaptive = this.noiseFloorPeak * T5_ADAPTIVE_PEAK_MULT;
+    return Math.max(T5_ADAPTIVE_MIN_PEAK, this.speechPeakFloor, adaptive);
   }
 
   private resolveGateClosedReason(
@@ -1163,8 +2020,12 @@ export class ChunkedSTT {
 
   private resetUtteranceState(): void {
     this.inSpeech = false;
+    this.speechStartAtMs = 0; // Tier 5: late-final watchdog
     this.utteranceMs = 0;
     this.utteranceBytes = 0;
+    this.sawSpeech = false;
+    this.lastPrependedMs = 0;
+
     this.utteranceFrames = [];
 
     this.speechFrameStreak = 0;

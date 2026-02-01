@@ -637,6 +637,7 @@ function attachMediaWebSocketServer(server, sessionManager) {
             return;
         }
         sessionManager.registerMediaConnection(callControlId, ws);
+        sessionManager.onMediaWsConnected(callControlId);
         void initTelnyxRawPayloadCapture(callControlId);
         const transportMode = sessionManager.getTransportMode(callControlId) ?? env_1.env.TRANSPORT_MODE;
         const ingest = new mediaIngest_1.MediaIngest({
@@ -731,10 +732,12 @@ function attachMediaWebSocketServer(server, sessionManager) {
             }
         });
         ws.on('close', () => {
+            sessionManager.onMediaWsDisconnected(callControlId);
             sessionManager.unregisterMediaConnection(callControlId, ws);
             ingest.close('ws_close');
         });
         ws.on('error', (error) => {
+            sessionManager.onMediaWsDisconnected(callControlId);
             sessionManager.unregisterMediaConnection(callControlId, ws);
             ingest.close('ws_error');
             log_1.log.error({ err: error, call_control_id: callControlId }, 'media websocket error');

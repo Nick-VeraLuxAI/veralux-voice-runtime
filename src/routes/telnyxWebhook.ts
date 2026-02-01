@@ -182,6 +182,8 @@ export function createTelnyxWebhookRouter(sessionManager: SessionManager): Route
         return 'playback_started';
       case 'call.playback.ended':
         return 'playback_ended';
+      case 'streaming.stopped':
+        return 'streaming_stopped';
       case 'call.hangup':
       case 'call.ended':
         return 'session_torn_down';
@@ -329,6 +331,10 @@ export function createTelnyxWebhookRouter(sessionManager: SessionManager): Route
     } finally {
       try {
         if (!shouldSkipTelnyxAction('hangup', options.callControlId, options.tenantId, options.requestId)) {
+          log.info(
+            { event: 'telnyx_hangup_requested', reason: options.reason, ...context },
+            'telnyx hangup requested (playMessageAndHangup)',
+          );
           await telnyx.hangupCall(options.callControlId);
         }
       } catch (error) {
@@ -504,6 +510,28 @@ export function createTelnyxWebhookRouter(sessionManager: SessionManager): Route
           );
           break;
         }
+        case 'call.answered': {
+          const debugEnabled = mediaDebugEnabled();
+          sessionManager.onAnswered(callControlId, { requestId });
+
+          if (!streamingStarted.has(callControlId)) {
+            if (debugEnabled) {
+              log.info(
+                {
+                  event: 'listen_start',
+                  reason: 'call_answered',
+                  call_control_id: callControlId,
+                  tenant_id: fallbackTenantId,
+                  requestId,
+                },
+                'listen start',
+              );
+            }
+            await startStreamingOnce(callControlId, fallbackTenantId, requestId);
+          }
+
+          break;
+        }
         case 'call.playback.started': {
           if (mediaDebugEnabled()) {
             log.info(
@@ -522,7 +550,11 @@ export function createTelnyxWebhookRouter(sessionManager: SessionManager): Route
             );
           }
 
-          sessionManager.onPlaybackEnded(callControlId, { requestId });
+          // ✅ FIX: this MUST call the PSTN-authoritative Telnyx handler
+          sessionManager.onTelnyxPlaybackEnded(callControlId, {
+            requestId,
+            source: 'telnyx_webhook',
+          });
 
           if (!streamingStarted.has(callControlId)) {
             if (debugEnabled) {
@@ -535,20 +567,58 @@ export function createTelnyxWebhookRouter(sessionManager: SessionManager): Route
           }
           break;
         }
-        case 'call.answered':
-          sessionManager.onAnswered(callControlId, { requestId });
-          await startStreamingOnce(callControlId, fallbackTenantId, requestId);
+
+        case 'streaming.stopped': {
+          log.warn(
+            { event: 'streaming_stopped', call_control_id: callControlId, requestId, tenant_id: fallbackTenantId },
+            'telnyx streaming stopped',
+          );
+          sessionManager.onMediaStreamingStopped(callControlId, { requestId, tenantId: fallbackTenantId });
+          streamingStarted.delete(callControlId);
           break;
+        }
+
         case 'call.hangup':
-        case 'call.ended':
+        case 'call.ended': {
+          const p =
+            payload && typeof payload === 'object'
+              ? payload
+              : payloadEnvelope && typeof payloadEnvelope === 'object'
+                ? (payloadEnvelope as Record<string, unknown>)
+                : undefined;
+
+          // If the fields are nested (common with Telnyx envelopes), try to grab data.payload too.
+          const data = p?.data && typeof p.data === 'object' ? (p.data as Record<string, unknown>) : undefined;
+          const pp =
+            data?.payload && typeof data.payload === 'object'
+              ? (data.payload as Record<string, unknown>)
+              : p;
+
+          log.warn(
+            {
+              event: 'telnyx_hangup_webhook',
+              call_control_id: callControlId,
+              event_type: eventType,
+              requestId,
+              tenant_id: fallbackTenantId,
+              hangup_cause: (pp as any)?.hangup_cause,
+              hangup_source: (pp as any)?.hangup_source,
+              sip_hangup_cause: (pp as any)?.sip_hangup_cause,
+              error_code: (pp as any)?.error_code,
+              error_detail: (pp as any)?.error_detail,
+            },
+            'hangup received',
+          );
+
           sessionManager.onHangup(callControlId, eventType, {
             requestId,
             tenantId: fallbackTenantId,
           });
           streamingStarted.delete(callControlId);
           break;
-        default:
-          break;
+        }
+
+
       }
     } catch (error) {
       log.error(

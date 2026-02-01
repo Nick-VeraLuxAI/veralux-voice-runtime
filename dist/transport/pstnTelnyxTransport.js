@@ -25,6 +25,7 @@ class PstnAudioPlayback {
         this.callControlId = options.callControlId;
         this.logContext = options.logContext;
         this.isActive = options.isActive;
+        this.allowPlaybackWhenInactive = options.allowPlaybackWhenInactive;
     }
     onPlaybackEnd(cb) {
         this.playbackEndCallbacks.push(cb);
@@ -59,6 +60,9 @@ class PstnAudioPlayback {
         if (!this.isActive || this.isActive()) {
             return false;
         }
+        if (action === 'playback_start' && this.allowPlaybackWhenInactive?.()) {
+            return false;
+        }
         const event = action === 'playback_stop' ? 'playback_stop_skipped' : 'telnyx_action_skipped_inactive';
         log_1.log.warn({ event, action, ...this.logContext }, 'skipping telnyx action - call inactive');
         return true;
@@ -78,6 +82,7 @@ class PstnTelnyxTransportSession {
             requestId: options.requestId,
         };
         this.isActive = options.isActive;
+        this.allowPlaybackWhenInactive = options.allowPlaybackWhenInactive;
         this.telnyx = new telnyxClient_1.TelnyxClient(this.logContext);
         this.ingest = new PstnAudioIngest();
         this.playback = new PstnAudioPlayback({
@@ -85,6 +90,7 @@ class PstnTelnyxTransportSession {
             callControlId: options.callControlId,
             logContext: this.logContext,
             isActive: this.isActive,
+            allowPlaybackWhenInactive: this.allowPlaybackWhenInactive,
         });
     }
     async start() {
@@ -98,6 +104,11 @@ class PstnTelnyxTransportSession {
             return;
         }
         try {
+            log_1.log.info({
+                event: 'telnyx_hangup_requested',
+                reason: reason ?? 'unspecified',
+                ...this.logContext,
+            }, 'telnyx hangup requested (transport.stop)');
             await this.telnyx.hangupCall(this.id);
         }
         catch (error) {

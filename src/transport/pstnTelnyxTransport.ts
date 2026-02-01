@@ -28,6 +28,8 @@ class PstnAudioPlayback implements AudioPlayback {
   private readonly callControlId: string;
   private readonly logContext: Record<string, unknown>;
   private readonly isActive?: () => boolean;
+  /** When true, allow playback_start even if call is inactive (e.g. late-final response). */
+  private readonly allowPlaybackWhenInactive?: () => boolean;
   private readonly playbackEndCallbacks: Array<() => void> = [];
 
   constructor(options: {
@@ -35,11 +37,13 @@ class PstnAudioPlayback implements AudioPlayback {
     callControlId: string;
     logContext: Record<string, unknown>;
     isActive?: () => boolean;
+    allowPlaybackWhenInactive?: () => boolean;
   }) {
     this.telnyx = options.telnyx;
     this.callControlId = options.callControlId;
     this.logContext = options.logContext;
     this.isActive = options.isActive;
+    this.allowPlaybackWhenInactive = options.allowPlaybackWhenInactive;
   }
 
   onPlaybackEnd(cb: () => void): void {
@@ -78,6 +82,9 @@ class PstnAudioPlayback implements AudioPlayback {
     if (!this.isActive || this.isActive()) {
       return false;
     }
+    if (action === 'playback_start' && this.allowPlaybackWhenInactive?.()) {
+      return false;
+    }
 
     const event = action === 'playback_stop' ? 'playback_stop_skipped' : 'telnyx_action_skipped_inactive';
     log.warn({ event, action, ...this.logContext }, 'skipping telnyx action - call inactive');
@@ -98,12 +105,14 @@ export class PstnTelnyxTransportSession implements TransportSession {
   private readonly telnyx: TelnyxClient;
   private readonly logContext: Record<string, unknown>;
   private readonly isActive?: () => boolean;
+  private readonly allowPlaybackWhenInactive?: () => boolean;
 
   constructor(options: {
     callControlId: string;
     tenantId?: string;
     requestId?: string;
     isActive?: () => boolean;
+    allowPlaybackWhenInactive?: () => boolean;
   }) {
     this.id = options.callControlId;
     this.logContext = {
@@ -112,6 +121,7 @@ export class PstnTelnyxTransportSession implements TransportSession {
       requestId: options.requestId,
     };
     this.isActive = options.isActive;
+    this.allowPlaybackWhenInactive = options.allowPlaybackWhenInactive;
     this.telnyx = new TelnyxClient(this.logContext);
     this.ingest = new PstnAudioIngest();
     this.playback = new PstnAudioPlayback({
@@ -119,6 +129,7 @@ export class PstnTelnyxTransportSession implements TransportSession {
       callControlId: options.callControlId,
       logContext: this.logContext,
       isActive: this.isActive,
+      allowPlaybackWhenInactive: this.allowPlaybackWhenInactive,
     });
   }
 
@@ -134,6 +145,14 @@ export class PstnTelnyxTransportSession implements TransportSession {
       return;
     }
     try {
+      log.info(
+        {
+          event: 'telnyx_hangup_requested',
+          reason: reason ?? 'unspecified',
+          ...this.logContext,
+        },
+        'telnyx hangup requested (transport.stop)',
+      );
       await this.telnyx.hangupCall(this.id);
     } catch (error) {
       log.error({ err: error, reason, ...this.logContext }, 'telnyx hangup failed');

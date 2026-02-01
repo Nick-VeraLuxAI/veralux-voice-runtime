@@ -1009,11 +1009,12 @@ class MediaIngest {
             return;
         }
         // -------------------- PLAYBACK ECHO GUARD --------------------
-        // If playback is active, drop inbound media so Whisper can't hear our own TTS.
+        // Suppress non-inbound tracks during playback to avoid echoing TTS into STT.
         // Also keep a short grace window after playback ends to avoid jitter-delivered frames.
         const nowMs = Date.now();
         const playbackActive = this.isPlaybackActive?.() === true;
-        if (playbackActive) {
+        const allowInboundDuringPlayback = normalizedTrack === 'inbound';
+        if (playbackActive && !allowInboundDuringPlayback) {
             this.playbackSuppressUntilMs = nowMs + this.playbackGuardMs;
             if (capture && !capture.stopped) {
                 void appendCaptureRecord(capture, {
@@ -1028,7 +1029,7 @@ class MediaIngest {
             // ✅ IMPORTANT: do not commit seq for dropped frames
             return;
         }
-        if (nowMs < this.playbackSuppressUntilMs) {
+        if (!allowInboundDuringPlayback && nowMs < this.playbackSuppressUntilMs) {
             if (capture && !capture.stopped) {
                 void appendCaptureRecord(capture, {
                     ts: new Date().toISOString(),

@@ -145,6 +145,8 @@ function createTelnyxWebhookRouter(sessionManager) {
                 return 'playback_started';
             case 'call.playback.ended':
                 return 'playback_ended';
+            case 'streaming.stopped':
+                return 'streaming_stopped';
             case 'call.hangup':
             case 'call.ended':
                 return 'session_torn_down';
@@ -266,6 +268,7 @@ function createTelnyxWebhookRouter(sessionManager) {
         finally {
             try {
                 if (!shouldSkipTelnyxAction('hangup', options.callControlId, options.tenantId, options.requestId)) {
+                    log_1.log.info({ event: 'telnyx_hangup_requested', reason: options.reason, ...context }, 'telnyx hangup requested (playMessageAndHangup)');
                     await telnyx.hangupCall(options.callControlId);
                 }
             }
@@ -397,6 +400,23 @@ function createTelnyxWebhookRouter(sessionManager) {
                     }, { requestId });
                     break;
                 }
+                case 'call.answered': {
+                    const debugEnabled = mediaDebugEnabled();
+                    sessionManager.onAnswered(callControlId, { requestId });
+                    if (!streamingStarted.has(callControlId)) {
+                        if (debugEnabled) {
+                            log_1.log.info({
+                                event: 'listen_start',
+                                reason: 'call_answered',
+                                call_control_id: callControlId,
+                                tenant_id: fallbackTenantId,
+                                requestId,
+                            }, 'listen start');
+                        }
+                        await startStreamingOnce(callControlId, fallbackTenantId, requestId);
+                    }
+                    break;
+                }
                 case 'call.playback.started': {
                     if (mediaDebugEnabled()) {
                         log_1.log.info({ event: 'playback_started', call_control_id: callControlId, requestId }, 'playback started');
@@ -408,7 +428,11 @@ function createTelnyxWebhookRouter(sessionManager) {
                     if (debugEnabled) {
                         log_1.log.info({ event: 'playback_ended', call_control_id: callControlId, requestId }, 'playback ended');
                     }
-                    sessionManager.onPlaybackEnded(callControlId, { requestId });
+                    // ✅ FIX: this MUST call the PSTN-authoritative Telnyx handler
+                    sessionManager.onTelnyxPlaybackEnded(callControlId, {
+                        requestId,
+                        source: 'telnyx_webhook',
+                    });
                     if (!streamingStarted.has(callControlId)) {
                         if (debugEnabled) {
                             log_1.log.info({ event: 'listen_start', call_control_id: callControlId, tenant_id: fallbackTenantId, requestId }, 'listen start');
@@ -417,20 +441,43 @@ function createTelnyxWebhookRouter(sessionManager) {
                     }
                     break;
                 }
-                case 'call.answered':
-                    sessionManager.onAnswered(callControlId, { requestId });
-                    await startStreamingOnce(callControlId, fallbackTenantId, requestId);
+                case 'streaming.stopped': {
+                    log_1.log.warn({ event: 'streaming_stopped', call_control_id: callControlId, requestId, tenant_id: fallbackTenantId }, 'telnyx streaming stopped');
+                    sessionManager.onMediaStreamingStopped(callControlId, { requestId, tenantId: fallbackTenantId });
+                    streamingStarted.delete(callControlId);
                     break;
+                }
                 case 'call.hangup':
-                case 'call.ended':
+                case 'call.ended': {
+                    const p = payload && typeof payload === 'object'
+                        ? payload
+                        : payloadEnvelope && typeof payloadEnvelope === 'object'
+                            ? payloadEnvelope
+                            : undefined;
+                    // If the fields are nested (common with Telnyx envelopes), try to grab data.payload too.
+                    const data = p?.data && typeof p.data === 'object' ? p.data : undefined;
+                    const pp = data?.payload && typeof data.payload === 'object'
+                        ? data.payload
+                        : p;
+                    log_1.log.warn({
+                        event: 'telnyx_hangup_webhook',
+                        call_control_id: callControlId,
+                        event_type: eventType,
+                        requestId,
+                        tenant_id: fallbackTenantId,
+                        hangup_cause: pp?.hangup_cause,
+                        hangup_source: pp?.hangup_source,
+                        sip_hangup_cause: pp?.sip_hangup_cause,
+                        error_code: pp?.error_code,
+                        error_detail: pp?.error_detail,
+                    }, 'hangup received');
                     sessionManager.onHangup(callControlId, eventType, {
                         requestId,
                         tenantId: fallbackTenantId,
                     });
                     streamingStarted.delete(callControlId);
                     break;
-                default:
-                    break;
+                }
             }
         }
         catch (error) {

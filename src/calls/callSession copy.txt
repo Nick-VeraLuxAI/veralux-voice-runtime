@@ -90,6 +90,7 @@ export class CallSession {
   private endedReason?: string;
   private active = true;
 
+  private sttInFlightCount = 0;
   private isHandlingTranscript = false;
   private hasStarted = false;
   private turnSequence = 0;
@@ -118,6 +119,22 @@ export class CallSession {
   // pick reasonable defaults; you can env-ize later
   private readonly deadAirListeningGraceMs = 1200;  // prevents immediate reprompt right after enter LISTENING
   private readonly deadAirAfterSpeechStartGraceMs = 1500; // prevents reprompt while user has started speaking but transcript not ready
+  // ===== STT in-flight tracking (prevents dead-air reprompt while Whisper HTTP is running) =====
+  private onSttRequestStart(kind: 'partial' | 'final'): void {
+    this.sttInFlightCount += 1;
+    log.info(
+      { event: 'stt_req_start', kind, in_flight: this.sttInFlightCount, ...this.logContext },
+      'stt request started',
+    );
+  }
+
+  private onSttRequestEnd(kind: 'partial' | 'final'): void {
+    this.sttInFlightCount = Math.max(0, this.sttInFlightCount - 1);
+    log.info(
+      { event: 'stt_req_end', kind, in_flight: this.sttInFlightCount, ...this.logContext },
+      'stt request ended',
+    );
+  }
 
 
   constructor(config: CallSessionConfig) {
@@ -193,6 +210,10 @@ export class CallSession {
       onSpeechStart: (info: SpeechStartInfo) => {
         void this.handleSpeechStart(info);
       },
+      // ✅ STT in-flight hooks (ChunkedSTT calls these when provider requests start/end)
+      onSttRequestStart: (kind) => this.onSttRequestStart(kind),
+      onSttRequestEnd: (kind) => this.onSttRequestEnd(kind),
+
       isPlaybackActive: () => this.isPlaybackActive(),
       isListening: () => this.isListening(),
       getTrack: () => env.TELNYX_STREAM_TRACK,
@@ -232,10 +253,18 @@ export class CallSession {
   }
 
   public onAudioFrame(frame: MediaFrame): void {
-    if (!this.active || this.state === 'ENDED') {
+    if (!this.active || this.state === 'ENDED') return;
+
+    // PSTN must feed STT with decoded PCM16 only (via onPcm16Frame)
+    if (this.transport.mode === 'pstn') {
+      log.warn(
+        { event: 'unexpected_audio_frame_on_pstn', ...this.logContext },
+        'PSTN transport should call onPcm16Frame (decoded pcm16) not onAudioFrame',
+      );
       return;
     }
 
+    // Non-PSTN / WebRTC can continue using this path if that's how your transport works.
     this.lastDecodedFrameAtMs = Date.now();
 
     if (this.state === 'INIT' || this.state === 'ANSWERED') {
@@ -245,25 +274,34 @@ export class CallSession {
     }
 
     this.metrics.lastHeardAt = new Date();
-
-    // Never gate STT audio feed on playback state; transcript handling is gated separately.
     incSttFramesFed();
-    this.maybeCaptureRxDump(frame);
+
+    // IMPORTANT: only do rx dump here if you KNOW these bytes are pcm16.
+    // If you don't, remove this line entirely.
+    // this.maybeCaptureRxDump(frame as unknown as Buffer);
+
     this.stt.ingest(frame);
   }
+
 
   public onPcm16Frame(frame: Pcm16Frame): void {
     if (!this.active || this.state === 'ENDED') {
       return;
     }
 
-    this.lastDecodedFrameAtMs = Date.now();
+    const now = Date.now();
 
+    // “We received inbound audio” marker (even if STT is gated during playback)
+    this.lastDecodedFrameAtMs = now;
+    this.metrics.lastHeardAt = new Date();
+
+    // State transitions + dead-air arming must happen for every inbound frame
     if (this.state === 'INIT' || this.state === 'ANSWERED') {
       this.enterListeningState();
-    } 
-
-    this.metrics.lastHeardAt = new Date();
+    } else if (this.state === 'LISTENING') {
+      // ✅ CRITICAL: keep dead-air timer fresh while listening
+      this.scheduleDeadAirTimer();
+    }
 
     if (frame.sampleRateHz !== this.rxSampleRateHz) {
       log.warn(
@@ -278,8 +316,11 @@ export class CallSession {
     }
 
     const pcmBuffer = Buffer.from(frame.pcm16.buffer, frame.pcm16.byteOffset, frame.pcm16.byteLength);
+
     incSttFramesFed();
     this.maybeCaptureRxDump(pcmBuffer);
+
+
     this.stt.ingestPcm16(frame.pcm16, frame.sampleRateHz);
   }
 
@@ -287,8 +328,10 @@ export class CallSession {
     if (!this.active || this.state === 'ENDED') {
       return false;
     }
-    return this.playbackState.active || this.state === 'SPEAKING' || this.ttsSegmentQueueDepth > 0;
+    // ✅ playback is active if the playback flag is set OR streaming segments are queued
+    return this.playbackState.active || this.ttsSegmentQueueDepth > 0;
   }
+
 
   public isListening(): boolean {
     return this.state === 'LISTENING';
@@ -403,32 +446,68 @@ export class CallSession {
   }
 
   public onPlaybackEnded(): void {
-    if (this.playbackState.interrupted) {
-      log.info(
-        { event: 'playback_ended_ignored', reason: 'barge_in', ...this.logContext },
-        'playback ended after barge-in',
-      );
-      return;
-    }
-
     if (!this.playbackState.active) {
       return;
     }
 
-    this.playbackState.active = false;
-    this.playbackState.segmentId = undefined;
-    this.playbackStopSignal = undefined;
-
-    if (this.active && this.state === 'SPEAKING') {
-      this.enterListeningState();
+    // ✅ If streaming segments are still queued, do NOT end playback yet.
+    // The segment queue's .finally() will call onPlaybackEnded() when depth hits 0.
+    if (this.ttsSegmentQueueDepth > 0 && !this.playbackState.interrupted) {
+      return;
     }
 
+    const wasInterrupted = this.playbackState.interrupted;
+
+
+    // ✅ ALWAYS clear playback flags FIRST
+    this.playbackState.active = false;
+    this.playbackState.interrupted = false;
+    this.playbackState.segmentId = undefined;
+
+    // ✅ resolve + clear stop signal (don’t just null it)
+    this.resolvePlaybackStopSignal();
+    this.playbackStopSignal = undefined;
+    
+
+    // ✅ do NOT force queue depth to 0 here.
+    // Queue depth drains naturally; onPlaybackEnded() is called when it reaches 0.
+    // Only clear depth explicitly during barge-in / queue cancel paths.
+
+
+    if (wasInterrupted) {
+      log.info(
+        { event: 'playback_ended_after_barge_in', ...this.logContext },
+        'playback ended after barge-in',
+      );
+
+      // ✅ exit SPEAKING so isPlaybackActive() becomes false
+      if (this.active && this.state !== 'ENDED') {
+        this.enterListeningState(true); // barge-in: arm timer normally
+      }
+
+      this.startRxDumpAfterPlayback();
+      return;
+    }
+
+    // ✅ normal playback end: enter LISTENING but DON'T arm dead-air yet
+    if (this.active && this.state === 'SPEAKING') {
+      this.enterListeningState(false);
+    }
+
+    // ✅ if we have a deferred FINAL, consume it immediately (no reprompt racing)
     if (this.active && this.state === 'LISTENING') {
       this.flushDeferredTranscript();
+
+      // ✅ only arm dead-air if we are still listening and not handling a transcript
+      if (!this.isHandlingTranscript && this.state === 'LISTENING') {
+        this.scheduleDeadAirTimer();
+      }
     }
 
     this.startRxDumpAfterPlayback();
+
   }
+
 
   private createPlaybackStopSignal(): { promise: Promise<void>; resolve: () => void } {
     let resolve: () => void;
@@ -579,8 +658,7 @@ export class CallSession {
     this.lastSpeechStartAtMs = Date.now();
     this.resetTranscriptTracking();
 
-    const playbackActive =
-      this.playbackState.active || this.state === 'SPEAKING' || this.ttsSegmentQueueDepth > 0;
+    const playbackActive = this.isPlaybackActive();
     if (!playbackActive || this.playbackState.interrupted) {
       return;
     }
@@ -599,15 +677,23 @@ export class CallSession {
       'barge in',
     );
 
-    this.playbackState.active = false;
+    // ✅ mark interrupted, but DO NOT clear active here.
+    // onPlaybackEnded() needs active=true to run its cleanup.
     this.playbackState.interrupted = true;
     this.playbackState.segmentId = undefined;
+
     this.resolvePlaybackStopSignal();
+
+    // ✅ Cancel queued segments without double-manipulating the counter
+    // clearTtsQueue() already sets queue depth to 0.
     this.clearTtsQueue();
     this.invalidateTranscriptHandling();
-    this.enterListeningState();
 
+    // ✅ Stop playback first; onPlaybackEnded() will re-enter LISTENING and start rx dump.
+    // Avoid double transitions + weird flush timing.
     void this.stopPlayback();
+
+
   }
 
   private async stopPlayback(): Promise<void> {
@@ -615,18 +701,26 @@ export class CallSession {
       await this.transport.playback.stop();
     } catch (error) {
       log.warn({ err: error, ...this.logContext }, 'playback stop failed');
+    } finally {
+      // ✅ even if stop() fails, ensure we clear speaking/playback state
+      this.onPlaybackEnded();
     }
   }
 
-  private enterListeningState(): void {
+
+  private enterListeningState(armDeadAir: boolean = true): void {
     if (!this.active || this.state === 'ENDED') {
       return;
     }
 
     this.state = 'LISTENING';
     this.listeningSinceAtMs = Date.now();
-    this.scheduleDeadAirTimer();
+
+    if (armDeadAir) {
+      this.scheduleDeadAirTimer();
+    }
   }
+
 
 
   private scheduleDeadAirTimer(): void {
@@ -726,7 +820,13 @@ export class CallSession {
       return;
     }
 
-    // If we're currently processing a transcript, don't reprompt.
+    // If STT is running / request in flight, don't reprompt.
+    // (Stronger than isHandlingTranscript. Keep both if you want.)
+    if (this.sttInFlightCount && this.sttInFlightCount > 0) {
+      this.scheduleDeadAirTimer();
+      return;
+    }
+
     if (this.isHandlingTranscript) {
       this.scheduleDeadAirTimer();
       return;
@@ -734,28 +834,31 @@ export class CallSession {
 
     const now = Date.now();
 
-    // 1) Grace right after we enter LISTENING (prevents greet/playback -> listening race)
+    // 1) Grace right after we enter LISTENING
     if (this.listeningSinceAtMs > 0 && now - this.listeningSinceAtMs < this.deadAirListeningGraceMs) {
       this.scheduleDeadAirTimer();
       return;
     }
 
-    // 2) If we recently detected speech start, assume user is talking and STT is behind.
+    // 2) Grace after speech start (STT might be behind)
     if (this.lastSpeechStartAtMs > 0 && now - this.lastSpeechStartAtMs < this.deadAirAfterSpeechStartGraceMs) {
       this.scheduleDeadAirTimer();
       return;
     }
 
-    // 3) If we are still receiving frames recently, don't reprompt.
-    // If frames are still arriving, do NOT treat this as "no-frames" dead air.
+    // 3) If we recently received frames, don't reprompt
     if (this.lastDecodedFrameAtMs > 0 && now - this.lastDecodedFrameAtMs < this.deadAirNoFramesMs) {
-      // frames are alive; just wait for next deadAirMs tick
       this.scheduleDeadAirTimer();
       return;
     }
 
+    // 3b) If we haven't received any frame since entering LISTENING, don't reprompt
+    if (!this.lastDecodedFrameAtMs || (this.listeningSinceAtMs > 0 && this.lastDecodedFrameAtMs < this.listeningSinceAtMs)) {
+      this.scheduleDeadAirTimer();
+      return;
+    }
 
-    // 4) Extra safety: never reprompt if playback/tts is active (should already be true, but safe)
+    // 4) Never reprompt during playback/tts
     if (this.isPlaybackActive()) {
       this.scheduleDeadAirTimer();
       return;
@@ -768,11 +871,12 @@ export class CallSession {
     } finally {
       this.repromptInFlight = false;
       if (this.state === 'LISTENING') {
-        this.listeningSinceAtMs = Date.now(); // reset grace so it doesn't immediately fire again
+        this.listeningSinceAtMs = Date.now();
         this.scheduleDeadAirTimer();
       }
     }
   }
+
 
 
   private async handleTranscript(
@@ -790,35 +894,61 @@ export class CallSession {
 
     const isPartial = transcriptSource === 'partial_fallback';
     const trigger = isPartial ? 'partial' : 'final';
+
+    // If we've already accepted a transcript for this utterance, ignore anything else.
     if (this.transcriptAcceptedForUtterance) {
       return;
     }
 
-    if (isPartial && !this.firstPartialAt) {
-      this.firstPartialAt = Date.now();
-    }
+    // ===== CHANGE #1 (CORE FIX): partials DO NOT trigger a turn =====
+    // We only buffer partials for debugging/visibility. The agent reply + TTS is final-only.
+    if (isPartial) {
+      if (!this.firstPartialAt) {
+        this.firstPartialAt = Date.now();
+      }
 
-    if (isPartial && !this.shouldTriggerPartialFastPath(trimmed)) {
+      // Keep the latest partial around (useful for debugging and optional future fallback logic)
+      this.deferredTranscript = { text: trimmed, source: 'partial_fallback' };
+
+      const partialPreview =
+        trimmed.length <= this.logPreviewChars
+          ? trimmed
+          : `${trimmed.slice(0, this.logPreviewChars - 3)}...`;
+
+      log.info(
+        {
+          event: 'partial_buffered_no_turn',
+          trigger: 'partial',
+          transcript_length: trimmed.length,
+          transcript_preview: partialPreview,
+          state: this.state,
+          ...this.logContext,
+        },
+        'partial buffered (final-only turn policy)',
+      );
+
+      // IMPORTANT: do not set transcriptAcceptedForUtterance here.
       return;
     }
 
-    const playbackActive = this.playbackState.active || this.ttsSegmentQueueDepth > 0;
+    // ===== From here on: FINAL ONLY =====
+
+    // If playback is active and not interrupted, defer the FINAL until playback ends.
+    const playbackActive = this.isPlaybackActive();
     if (playbackActive && !this.playbackState.interrupted) {
-      const existing = this.deferredTranscript;
-      if (!existing || trigger === 'final' || existing.source !== 'final') {
-        this.deferredTranscript = { text: trimmed, source: transcriptSource };
-      }
+      this.deferredTranscript = { text: trimmed, source: 'final' };
+
       log.info(
         {
           event: 'transcript_deferred_playback',
-          trigger,
+          trigger: 'final',
           transcript_length: trimmed.length,
           state: this.state,
           playback_active: this.playbackState.active,
           tts_queue_depth: this.ttsSegmentQueueDepth,
           ...this.logContext,
         },
-        'transcript deferred during playback',
+        'final transcript deferred during playback',
       );
       return;
     }
@@ -826,47 +956,48 @@ export class CallSession {
     const tenantLabel = this.tenantId ?? 'unknown';
     const responseStartAt = Date.now();
 
-    if (isPartial && this.firstPartialAt) {
+    // timing metric: if we had partials, measure partial->response
+    if (this.firstPartialAt) {
       observeStageDuration(
         'stt_first_partial_to_response_ms',
         tenantLabel,
         responseStartAt - this.firstPartialAt,
       );
-    } else if (!isPartial) {
+    } else {
       observeStageDuration('stt_final_to_response_ms', tenantLabel, 0);
     }
 
     log.info(
       {
         event: 'turn_trigger',
-        trigger,
+        trigger: 'final',
         transcript_length: trimmed.length,
         ...this.logContext,
       },
       'turn trigger',
     );
 
+    // Accept this FINAL as the utterance we will respond to.
     this.transcriptAcceptedForUtterance = true;
     this.isHandlingTranscript = true;
     const handlingToken = (this.transcriptHandlingToken += 1);
     this.clearDeadAirTimer();
 
     try {
-
       const transcriptPreview =
         trimmed.length <= this.logPreviewChars
           ? trimmed
           : `${trimmed.slice(0, this.logPreviewChars - 3)}...`;
-      const transcriptLog: Record<string, unknown> = {
-        event: 'transcript_received',
-        transcript_length: trimmed.length,
-        transcript_preview: transcriptPreview,
-        ...this.logContext,
-      };
-      if (transcriptSource === 'partial_fallback') {
-        transcriptLog.transcript_source = transcriptSource;
-      }
-      log.info(transcriptLog, 'transcript received');
+
+      log.info(
+        {
+          event: 'transcript_received',
+          transcript_length: trimmed.length,
+          transcript_preview: transcriptPreview,
+          ...this.logContext,
+        },
+        'final transcript received',
+      );
 
       this.state = 'THINKING';
       this.appendTranscriptSegment(trimmed);
@@ -875,9 +1006,9 @@ export class CallSession {
       let response = '';
       let replySource = 'unknown';
       let playbackDone: Promise<void> | undefined;
+
       try {
         if (env.BRAIN_STREAMING_ENABLED) {
-          // LLM stage timing for streaming is handled inside streamAssistantReply()
           const streamResult = await this.streamAssistantReply(trimmed, handlingToken);
           response = streamResult.reply.text;
           replySource = streamResult.reply.source;
@@ -892,13 +1023,12 @@ export class CallSession {
               history: this.conversationHistory,
             });
             endLlm();
-
             response = reply.text;
             replySource = reply.source;
           } catch (error) {
             incStageError('llm', tenantLabel);
             endLlm();
-            throw error; // let your existing outer catch handle fallback response/logging
+            throw error;
           }
         }
       } catch (error) {
@@ -924,6 +1054,7 @@ export class CallSession {
         response.length <= this.logPreviewChars
           ? response
           : `${response.slice(0, this.logPreviewChars - 3)}...`;
+
       log.info(
         {
           event: 'assistant_reply_text',
@@ -952,13 +1083,18 @@ export class CallSession {
       log.error({ err: error, ...this.logContext }, 'call session transcript handling failed');
     } finally {
       if (handlingToken === this.transcriptHandlingToken) {
-        // FIX (TS2367): call unconditionally; enterListeningState guards ENDED internally.
-        this.enterListeningState();
+        // ✅ Reset utterance gating so next user turn isn't ignored
+        this.resetTranscriptTracking();
+
+        // reset handling flags and go back to listening
         this.isHandlingTranscript = false;
+        this.listeningSinceAtMs = Date.now();
+        this.enterListeningState(true);
       }
-      
     }
   }
+
+
 
   private async streamAssistantReply(
     transcript: string,
@@ -976,20 +1112,21 @@ export class CallSession {
     const firstAudioMaxMs = env.BRAIN_STREAM_FIRST_AUDIO_MAX_MS;
 
     const queueSegment = (segment: string): void => {
-      if (handlingToken !== this.transcriptHandlingToken) {
-        return;
-      }
+      if (handlingToken !== this.transcriptHandlingToken) return;
+
       const trimmed = segment.trim();
-      if (!trimmed) {
-        return;
-      }
+      if (!trimmed) return;
+
       const resolvedTurnId = baseTurnId ?? `turn-${this.nextTurnId()}`;
       baseTurnId = resolvedTurnId;
+
       segmentIndex += 1;
-      queuedSegments += 1;
+      queuedSegments += 1; // ✅ FIX: count queued segments
+
       const segmentId = `${resolvedTurnId}-${segmentIndex}`;
       this.queueTtsSegment(trimmed, segmentId, handlingToken);
     };
+
 
     const maybeQueueSegments = (force: boolean): void => {
       if (!this.active) {
@@ -1138,7 +1275,13 @@ export class CallSession {
         return;
       }
       this.beginPlayback('greeting');
-      await this.transport.playback.play({ kind: 'url', url: greetingUrl });
+      try {
+        await this.transport.playback.play({ kind: 'url', url: greetingUrl });
+        this.onPlaybackEnded();
+      } catch (error) {
+        this.onPlaybackEnded();
+        throw error;
+      }
 
       log.info(
         { event: 'call_playback_started', audio_url: greetingUrl, ...this.logContext },
@@ -1240,8 +1383,11 @@ export class CallSession {
       }
 
       if (this.transport.mode === 'pstn' && this.shouldSkipTelnyxAction('playback_start')) {
+        // ✅ beginPlayback already ran; do not leave state stuck in SPEAKING
+        this.onPlaybackEnded();
         return;
       }
+
       const playbackStage = this.transport.mode === 'pstn' ? 'telnyx_playback' : 'webrtc_playback_ms';
       const endPlayback = startStageTimer(playbackStage, tenantLabel);
 
@@ -1255,15 +1401,27 @@ export class CallSession {
           };
           probeWav('tx.telnyx.payload', playbackAudio, { ...txMeta, kind: turnId });
         }
+
         markAudioSpan('tx_sent', spanMeta);
         await this.transport.playback.play(playbackInput);
+
+        // ✅ always clear playback state when playback completes (single-turn playback)
+        this.onPlaybackEnded();
       } catch (error) {
         incStageError(playbackStage, tenantLabel);
+
+        // ✅ also clear playback state if playback throws
+        this.onPlaybackEnded();
+
         throw error;
       } finally {
         endPlayback();
       }
+
+
       const playbackDuration = Date.now() - playbackStart;
+
+
 
       if (this.transport.mode === 'pstn') {
         log.info(
@@ -1279,10 +1437,15 @@ export class CallSession {
     } catch (error) {
       log.error({ err: error, ...this.logContext }, 'call session tts playback failed');
     } finally {
-      // FIX (TS2367): call unconditionally; enterListeningState guards ENDED internally.
-      this.enterListeningState();
+      // ✅ Do NOT force LISTENING here.
+      // onPlaybackEnded() is the single source of truth for clearing playback + entering LISTENING.
+      // But if we returned early (e.g. interrupted) and somehow stayed SPEAKING/active, clean up.
+      if (this.playbackState.active || this.state === 'SPEAKING') {
+        this.onPlaybackEnded();
+      }
     }
   }
+
 
   private queueTtsSegment(segmentText: string, segmentId: string, handlingToken?: number): void {
     if (!segmentText.trim()) {
@@ -1295,7 +1458,9 @@ export class CallSession {
       return;
     }
 
-    this.beginPlayback(segmentId);
+    if (!this.playbackState.active) {
+      this.beginPlayback(segmentId);
+    }
     this.ttsSegmentQueueDepth += 1;
     const queueDepth = this.ttsSegmentQueueDepth;
 
@@ -1319,6 +1484,11 @@ export class CallSession {
       })
       .finally(() => {
         this.ttsSegmentQueueDepth = Math.max(0, this.ttsSegmentQueueDepth - 1);
+
+        // ✅ Playback ends ONCE when all queued segments are done
+        if (this.ttsSegmentQueueDepth === 0) {
+          this.onPlaybackEnded();
+        }
       });
   }
 
@@ -1418,7 +1588,9 @@ export class CallSession {
       );
     }
 
-    const playbackStage = this.transport.mode === 'pstn' ? 'telnyx_playback' : 'webrtc_playback_ms';
+    const playbackStage = this.transport.mode === 'pstn'
+      ? 'telnyx_playback'
+      : 'webrtc_playback_ms';
     const endPlayback = startStageTimer(playbackStage, tenantLabel);
 
     const playbackStart = Date.now();
@@ -1431,15 +1603,25 @@ export class CallSession {
         };
         probeWav('tx.telnyx.payload', playbackAudio, { ...txMeta, kind: segmentId });
       }
+
       markAudioSpan('tx_sent', spanMeta);
       await this.transport.playback.play(playbackInput);
+
+      // ✅ IMPORTANT: do NOT call onPlaybackEnded() here.
+      // Streaming playback ends when the segment queue drains.
     } catch (error) {
       incStageError(playbackStage, tenantLabel);
+
+      // ✅ IMPORTANT: do NOT call onPlaybackEnded() here either.
       throw error;
     } finally {
       endPlayback();
     }
+
+
     const playbackDuration = Date.now() - playbackStart;
+
+
 
     if (this.transport.mode === 'pstn') {
       log.info(

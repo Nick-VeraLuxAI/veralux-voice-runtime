@@ -8,10 +8,12 @@ exports.WhisperHttpProvider = void 0;
 const fs_1 = __importDefault(require("fs"));
 const path_1 = __importDefault(require("path"));
 const crypto_1 = __importDefault(require("crypto"));
+const undici_1 = require("undici");
 const env_1 = require("../../env");
 const log_1 = require("../../log");
 const metrics_1 = require("../../metrics");
 const audioProbe_1 = require("../../diagnostics/audioProbe");
+const wavInfo_1 = require("../../audio/wavInfo");
 const wavGuard_1 = require("../wavGuard");
 const preWhisperGate_1 = require("../../audio/preWhisperGate");
 const WAV_SAMPLE_RATE_HZ = 16000;
@@ -63,6 +65,13 @@ function sha1Hex(buf) {
 function sha1_10(buf) {
     return sha1Hex(buf).slice(0, 10);
 }
+function extractCallControlId(logContext) {
+    const value = logContext?.call_control_id;
+    if (typeof value !== 'string')
+        return undefined;
+    const trimmed = value.trim();
+    return trimmed === '' ? undefined : trimmed;
+}
 async function maybeDumpWhisperWav(wavPayload, kind, logContext) {
     if (!whisperDumpEnabled())
         return;
@@ -76,7 +85,24 @@ async function maybeDumpWhisperWav(wavPayload, kind, logContext) {
     try {
         await fs_1.default.promises.mkdir(dir, { recursive: true });
         await fs_1.default.promises.writeFile(filePath, wavPayload);
+        let audioMs = null;
+        try {
+            const info = (0, wavInfo_1.parseWavInfo)(wavPayload);
+            audioMs = Math.round(info.durationMs);
+        }
+        catch {
+            audioMs = null;
+        }
         log_1.log.info({ event: 'stt_whisper_wav_dumped', file_path: filePath, kind, sha1_10: h10, ...(logContext ?? {}) }, 'stt whisper wav dumped');
+        log_1.log.info({
+            event: 'stt_wav_dumped',
+            call_control_id: callControlId,
+            kind,
+            audio_ms: audioMs,
+            sha1_10: h10,
+            file_path: filePath,
+            ...(logContext ?? {}),
+        }, 'stt wav dumped');
     }
     catch (error) {
         log_1.log.warn({ event: 'stt_whisper_wav_dump_failed', file_path: filePath, err: error, ...(logContext ?? {}) }, 'stt whisper wav dump failed');
@@ -162,13 +188,6 @@ function makeWavFromPcm16le8k(pcm16le) {
 function makeWavFromPcm16le(pcm16le, sampleRateHz) {
     const header = wavHeader(pcm16le.length, sampleRateHz, 1);
     return Buffer.concat([header, pcm16le]);
-}
-function extractCallControlId(logContext) {
-    const value = logContext?.call_control_id;
-    if (typeof value !== 'string')
-        return undefined;
-    const trimmed = value.trim();
-    return trimmed === '' ? undefined : trimmed;
 }
 /**
  * Whisper servers vary a lot:
@@ -358,7 +377,12 @@ class WhisperHttpProvider {
             const prepared = prepareWavPayload(audio, baseMeta);
             wavPayload = prepared.wav;
             wavMeta = prepared.meta;
-            audioForMetrics = { audio: wavPayload, sampleRateHz: wavMeta.sampleRateHz ?? audio.sampleRateHz, encoding: 'wav', channels: 1 };
+            audioForMetrics = {
+                audio: wavPayload,
+                sampleRateHz: wavMeta.sampleRateHz ?? audio.sampleRateHz,
+                encoding: 'wav',
+                channels: 1,
+            };
         }
         // Validate + guard
         (0, wavGuard_1.assertLooksLikeWav)(wavPayload, {
@@ -373,7 +397,7 @@ class WhisperHttpProvider {
         if (!isFinal) {
             const prev = lastPartialSha1ByCall.get(safeCallKey);
             if (prev === wavSha1) {
-                if (mediaDebugEnabled() || (shouldTrace(callControlId))) {
+                if (mediaDebugEnabled() || shouldTrace(callControlId)) {
                     log_1.log.info({
                         event: 'stt_whisper_partial_dedup_skipped',
                         call_control_id: callControlId,
@@ -428,64 +452,115 @@ class WhisperHttpProvider {
                 end();
             }
         };
-        const httpStartedAt = Date.now();
+        const httpStartedAtMs = Date.now();
+        // Abort listener needs to be removable in finally (scope-safe)
+        let onAbort;
         try {
-            // Send raw WAV bytes (curl --data-binary). Avoid Blob/multipart.
-            // wavPayload is a Buffer
-            const body = wavPayload.buffer.slice(wavPayload.byteOffset, wavPayload.byteOffset + wavPayload.byteLength);
+            // Send raw WAV bytes (curl --data-binary). Avoid multipart.
             if (shouldTrace(callControlId) || mediaDebugEnabled()) {
                 log_1.log.info({
                     event: 'whisper_body_debug',
                     wav_bytes: wavPayload.length,
-                    body_bytes: body.byteLength,
+                    body_bytes: wavPayload.length,
                     head12: wavPayload.toString('ascii', 0, 12),
                     sha1_10: h10,
                     ...(opts.logContext ?? {}),
                 }, 'whisper body debug');
             }
-            const response = await fetch(whisperUrl, {
+            // Normalize body to a Node Buffer (best compatibility with undici/fetch in Node)
+            const body = Buffer.isBuffer(wavPayload) ? wavPayload : Buffer.from(wavPayload);
+            // ✅ DO NOT SKIP if the signal is already aborted.
+            // In call systems, final STT frequently happens during teardown/hangup.
+            if (opts.signal?.aborted) {
+                log_1.log.warn({
+                    event: 'whisper_signal_already_aborted_but_continuing',
+                    whisperUrl,
+                    bytes: body.length,
+                    sha1_10: h10,
+                    ...(opts.logContext ?? {}),
+                }, 'signal already aborted, but continuing whisper request (not canceling HTTP)');
+            }
+            // If aborted DURING request, DO NOT cancel fetch.
+            // We log abort and may discard response after Whisper returns.
+            onAbort = () => {
+                log_1.log.warn({
+                    event: 'whisper_abort_observed',
+                    whisperUrl,
+                    sha1_10: h10,
+                    ...(opts.logContext ?? {}),
+                }, 'whisper abort observed while request may be in-flight (not canceling HTTP)');
+            };
+            opts.signal?.addEventListener?.('abort', onAbort);
+            log_1.log.info({
+                event: 'whisper_fetch_start',
+                kind: whisperStage,
+                whisperUrl,
+                bytes: body.length,
+                content_type: 'audio/wav',
+                sha1_10: h10,
+                ...(opts.logContext ?? {}),
+            }, 'sending wav to whisper');
+            // IMPORTANT:
+            // ✅ Do NOT pass opts.signal into fetch() (it will cancel the HTTP request).
+            const response = await (0, undici_1.fetch)(whisperUrl, {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'audio/wav',
+                    'Content-Length': String(body.length), // explicit; harmless if ignored
                     Accept: 'application/json, text/plain;q=0.9, */*;q=0.1',
                 },
-                body,
-                signal: opts.signal,
+                body: body,
             });
-            const httpMs = Date.now() - httpStartedAt;
-            safeEnd();
             const contentType = response.headers.get('content-type') ?? '';
-            const respText = await response.text();
-            if (shouldTrace(callControlId)) {
-                log_1.log.info({
-                    event: 'whisper_http_response',
-                    kind: whisperStage,
-                    status: response.status,
-                    content_type: contentType,
+            const respText = await response.text().catch(() => '');
+            const httpMs = Date.now() - httpStartedAtMs;
+            log_1.log.info({
+                event: 'whisper_fetch_done',
+                kind: whisperStage,
+                status: response.status,
+                ok: response.ok,
+                content_type: contentType,
+                elapsed_ms: httpMs,
+                body_preview: respText.slice(0, 500),
+                sha1_10: h10,
+                ...(opts.logContext ?? {}),
+            }, 'whisper responded');
+            // If the call aborted while Whisper was working, discard result (don’t treat as failure)
+            if (opts.signal?.aborted) {
+                log_1.log.warn({
+                    event: 'whisper_result_discarded_aborted',
+                    whisperUrl,
                     elapsed_ms: httpMs,
-                    body_prefix: respText.slice(0, 300),
                     sha1_10: h10,
                     ...(opts.logContext ?? {}),
-                }, 'whisper http response');
+                }, 'discarding whisper result because call aborted during request');
+                return { text: '', isFinal, raw: { discarded: true, reason: 'aborted_after_send' } };
             }
             if (!response.ok) {
                 (0, metrics_1.incStageError)(stageLabel, tenantLabel);
                 const preview = respText.length > 700 ? `${respText.slice(0, 700)}...` : respText;
-                log_1.log.error({ event: 'whisper_error', status: response.status, body_preview: preview, ...(opts.logContext ?? {}) }, 'whisper request failed');
+                log_1.log.error({
+                    event: 'whisper_error',
+                    status: response.status,
+                    kind: whisperStage,
+                    body_preview: preview,
+                    sha1_10: h10,
+                    ...(opts.logContext ?? {}),
+                }, 'whisper request failed');
                 throw new Error(`whisper error ${response.status}: ${preview}`);
             }
+            // --------------------------
             // Parse result (prefer JSON if possible, but handle text/plain)
-            let textOut = '';
+            // --------------------------
             if (contentType.includes('application/json')) {
                 let data;
                 try {
                     data = JSON.parse(respText);
                 }
                 catch {
-                    // sometimes server sets JSON content-type but sends non-json
                     data = { text: '' };
                 }
-                textOut = extractText(data);
+                const textOut = extractText(data);
                 const transcript = {
                     text: textOut,
                     isFinal,
@@ -508,7 +583,7 @@ class WhisperHttpProvider {
                 return transcript;
             }
             // text/plain fallback
-            textOut = respText ?? '';
+            const textOut = respText ?? '';
             if (mediaDebugEnabled() || shouldTrace(callControlId)) {
                 log_1.log.info({
                     event: 'whisper_response',
@@ -523,10 +598,15 @@ class WhisperHttpProvider {
             return { text: textOut, isFinal, raw: textOut };
         }
         catch (error) {
-            safeEnd();
             if (!isAbortError(error))
                 (0, metrics_1.incStageError)(stageLabel, tenantLabel);
             throw error;
+        }
+        finally {
+            // Always clean up listener + stage timer
+            if (onAbort)
+                opts.signal?.removeEventListener?.('abort', onAbort);
+            safeEnd();
         }
     }
 }
